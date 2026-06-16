@@ -1,7 +1,8 @@
 """Router — Trading endpoints /api/trading/* (requires API Key)."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
+from ..config import get_settings
 from ..deps import get_trader_manager
 from ..helpers import _numpy_to_python
 from ..models import (
@@ -18,6 +19,73 @@ from ..models import (
 from ..security import require_api_key
 
 router = APIRouter(prefix="/api/trading", tags=["trading"], dependencies=[Depends(require_api_key)])
+
+
+def _manager_account_id(manager) -> str:
+    """Return the configured funds account id from the runtime manager."""
+    if manager is None:
+        return ""
+    for attr in ("account_id", "trading_account_id"):
+        value = getattr(manager, attr, "")
+        if value:
+            return str(value)
+    account = getattr(manager, "_account", None)
+    for attr in ("account_id", "m_strAccountID", "accountID"):
+        value = getattr(account, attr, "")
+        if value:
+            return str(value)
+    return ""
+
+
+@router.get("/health")
+def trading_health(request: Request):
+    """Return MeCoStock-compatible trading write readiness."""
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    manager = getattr(request.app.state, "trader_manager", None)
+    trading_config_enabled = bool(getattr(settings, "trading_enabled", False))
+    account_id = _manager_account_id(manager) or str(getattr(settings, "trading_account_id", "") or "")
+
+    supports = {
+        "order_stock": manager is not None,
+        "cancel_order_stock": manager is not None,
+        "/api/trading/order": manager is not None,
+        "/api/trading/cancel": manager is not None,
+    }
+    payload = {
+        "status": "ok" if manager is not None else "unavailable",
+        "enabled": trading_config_enabled and manager is not None,
+        "authenticated": manager is not None,
+        "account_authenticated": manager is not None and bool(account_id),
+        "order_supported": manager is not None,
+        "cancel_supported": manager is not None,
+        "write_enabled": False,
+        "write_blockers": [],
+        "mode": "guarded_read_write_routes_registered" if manager is not None else "trading_manager_unavailable",
+        "account_id": account_id,
+        "broker_account_id": account_id,
+        "funds_account_id": account_id,
+        "supports": supports,
+    }
+    if manager is None:
+        payload["code"] = "QMT_TRADING_CONNECT_FAILED" if trading_config_enabled else "QMT_TRADING_MODULE_DISABLED"
+        payload["reason"] = (
+            "QMT trading manager is not connected."
+            if trading_config_enabled
+            else "QMT bridge was started without trading module enabled."
+        )
+        payload["write_blockers"] = (
+            ["xttrader_connect_failed"]
+            if trading_config_enabled
+            else ["qmt_trading_module_disabled"]
+        )
+        return payload
+    if not account_id:
+        payload["code"] = "QMT_TRADING_ACCOUNT_MISSING"
+        payload["reason"] = "QMT trading account id is not configured."
+        payload["write_blockers"] = ["qmt_trading_account_missing"]
+        return payload
+    payload["write_enabled"] = True
+    return payload
 
 
 @router.post("/order")
@@ -88,6 +156,15 @@ def query_asset(
     """Query account asset information."""
     result = manager.query_asset(account_id=account_id)
     return {"data": _numpy_to_python(result)}
+
+
+@router.get("/assets")
+def query_assets(
+    account_id: str = "",
+    manager=Depends(get_trader_manager),
+):
+    """Query account asset information using MeCoStock's plural contract."""
+    return query_asset(account_id=account_id, manager=manager)
 
 
 @router.get("/trades")

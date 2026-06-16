@@ -1,1 +1,1 @@
-__version__ = "2.1.3+mecostock.1"
+__version__ = "2.1.3+mecostock.2"

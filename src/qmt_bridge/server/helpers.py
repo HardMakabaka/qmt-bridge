@@ -4,6 +4,47 @@ import numpy as np
 import pandas as pd
 
 
+_OBJECT_FIELDS = (
+    "account_id",
+    "cash",
+    "frozen_cash",
+    "market_value",
+    "total_asset",
+    "stock_code",
+    "volume",
+    "can_use_volume",
+    "frozen_volume",
+    "open_price",
+    "order_id",
+    "order_sysid",
+    "order_type",
+    "order_volume",
+    "price_type",
+    "price",
+    "traded_id",
+    "traded_time",
+    "traded_volume",
+    "traded_price",
+    "status",
+    "status_msg",
+    "strategy_name",
+    "order_remark",
+    "error_id",
+    "error_msg",
+    "m_strAccountID",
+    "m_strInstrumentID",
+    "m_nVolume",
+    "m_nCanUseVolume",
+    "m_dCash",
+    "m_dAvailable",
+    "m_dFrozenCash",
+    "m_dMarketValue",
+    "m_dTotalAsset",
+    "m_dPrice",
+    "m_dTradedPrice",
+)
+
+
 def _numpy_to_python(obj):
     """Recursively convert numpy types in a nested structure to Python types."""
     if isinstance(obj, dict):
@@ -18,6 +59,13 @@ def _numpy_to_python(obj):
         return float(obj)
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
+    if hasattr(obj, "_asdict"):
+        return _numpy_to_python(obj._asdict())
+    if hasattr(obj, "__dict__"):
+        return {k: _numpy_to_python(v) for k, v in vars(obj).items() if not k.startswith("_")}
+    object_fields = {field: _numpy_to_python(getattr(obj, field)) for field in _OBJECT_FIELDS if hasattr(obj, field)}
+    if object_fields:
+        return object_fields
     return obj
 
 

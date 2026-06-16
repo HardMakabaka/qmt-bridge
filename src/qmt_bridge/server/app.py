@@ -85,6 +85,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="2.0.0",
         lifespan=_lifespan,
     )
+    app.state.settings = settings
 
     # ------------------------------------------------------------------
     # Register data routers (always available)
