@@ -73,7 +73,9 @@ class OrderRequest(BaseModel):
 
 class CancelRequest(BaseModel):
     account_id: str = ""
-    order_id: int
+    order_id: int = 0
+    order_sysid: str = ""
+    market: int | str = ""
 
 
 class QueryOrderRequest(BaseModel):
@@ -207,7 +209,9 @@ class AsyncOrderRequest(BaseModel):
 
 class AsyncCancelRequest(BaseModel):
     account_id: str = ""
-    order_id: int
+    order_id: int = 0
+    order_sysid: str = ""
+    market: int | str = ""
 
 
 # ---------------------------------------------------------------------------

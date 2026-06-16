@@ -78,6 +78,10 @@ class XtTraderManager:
         account = self._resolve_account(account_id)
         return self._trader.cancel_order_stock(account, order_id)
 
+    def cancel_order_sysid(self, order_sysid: str, market, account_id: str = ""):
+        account = self._resolve_account(account_id)
+        return self._trader.cancel_order_stock_sysid(account, market, str(order_sysid))
+
     # ------------------------------------------------------------------
     # Query operations
     # ------------------------------------------------------------------
@@ -273,6 +277,11 @@ class XtTraderManager:
         """Async cancel — result delivered via on_cancel_order_stock_async_response callback."""
         account = self._resolve_account(account_id)
         return self._trader.cancel_order_stock_async(account, order_id)
+
+    def cancel_order_sysid_async(self, order_sysid: str, market, account_id: str = ""):
+        """Async cancel by QMT order_sysid — result delivered via trading callback."""
+        account = self._resolve_account(account_id)
+        return self._trader.cancel_order_stock_sysid_async(account, market, str(order_sysid))
 
     # ------------------------------------------------------------------
     # Single-item queries

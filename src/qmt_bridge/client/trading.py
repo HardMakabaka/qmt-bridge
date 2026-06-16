@@ -41,17 +41,29 @@ class TradingMixin:
             "account_id": account_id,
         })
 
-    def cancel_order(self, order_id: int, account_id: str = "") -> dict:
+    def cancel_order(
+        self,
+        order_id: int = 0,
+        account_id: str = "",
+        order_sysid: str = "",
+        market: int | str = "",
+    ) -> dict:
         """撤销委托。
 
         Args:
             order_id: 要撤销的委托 ID
             account_id: 交易账户 ID（多账户时指定）
+            order_sysid: QMT 柜台合同编号。提供时优先按 order_sysid 撤单。
+            market: QMT 市场代码，按 order_sysid 撤单时需要。
         """
-        return self._post("/api/trading/cancel", {
+        payload = {
             "order_id": order_id,
             "account_id": account_id,
-        })
+        }
+        if order_sysid:
+            payload["order_sysid"] = order_sysid
+            payload["market"] = market
+        return self._post("/api/trading/cancel", payload)
 
     def query_orders(self, account_id: str = "", cancelable_only: bool = False) -> dict:
         """查询当日委托列表。
@@ -127,12 +139,22 @@ class TradingMixin:
             "account_id": account_id,
         })
 
-    def cancel_order_async(self, order_id: int, account_id: str = "") -> dict:
+    def cancel_order_async(
+        self,
+        order_id: int = 0,
+        account_id: str = "",
+        order_sysid: str = "",
+        market: int | str = "",
+    ) -> dict:
         """Cancel an order asynchronously (result via WebSocket callback)."""
-        return self._post("/api/trading/cancel_async", {
+        payload = {
             "order_id": order_id,
             "account_id": account_id,
-        })
+        }
+        if order_sysid:
+            payload["order_sysid"] = order_sysid
+            payload["market"] = market
+        return self._post("/api/trading/cancel_async", payload)
 
     # ------------------------------------------------------------------
     # Single-item queries

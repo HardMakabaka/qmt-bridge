@@ -39,11 +39,24 @@ def place_order(req: OrderRequest, manager=Depends(get_trader_manager)):
 @router.post("/cancel")
 def cancel_order(req: CancelRequest, manager=Depends(get_trader_manager)):
     """Cancel an existing order."""
+    if req.order_sysid:
+        result = manager.cancel_order_sysid(
+            order_sysid=req.order_sysid,
+            market=req.market,
+            account_id=req.account_id,
+        )
+        return {
+            "status": "ok",
+            "data": _numpy_to_python(result),
+            "cancel_method": "order_sysid",
+            "order_sysid": req.order_sysid,
+            "market": req.market,
+        }
     result = manager.cancel_order(
         order_id=req.order_id,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return {"status": "ok", "data": _numpy_to_python(result), "cancel_method": "order_id"}
 
 
 @router.get("/orders")
@@ -122,8 +135,30 @@ def batch_cancel(cancel_requests: list[CancelRequest], manager=Depends(get_trade
     """Cancel multiple orders at once."""
     results = []
     for req in cancel_requests:
-        result = manager.cancel_order(order_id=req.order_id, account_id=req.account_id)
-        results.append({"order_id": req.order_id, "result": _numpy_to_python(result)})
+        if req.order_sysid:
+            result = manager.cancel_order_sysid(
+                order_sysid=req.order_sysid,
+                market=req.market,
+                account_id=req.account_id,
+            )
+            results.append(
+                {
+                    "order_id": req.order_id,
+                    "order_sysid": req.order_sysid,
+                    "market": req.market,
+                    "cancel_method": "order_sysid",
+                    "result": _numpy_to_python(result),
+                }
+            )
+        else:
+            result = manager.cancel_order(order_id=req.order_id, account_id=req.account_id)
+            results.append(
+                {
+                    "order_id": req.order_id,
+                    "cancel_method": "order_id",
+                    "result": _numpy_to_python(result),
+                }
+            )
     return {"data": results}
 
 
@@ -171,11 +206,24 @@ def place_order_async(req: AsyncOrderRequest, manager=Depends(get_trader_manager
 @router.post("/cancel_async")
 def cancel_order_async(req: AsyncCancelRequest, manager=Depends(get_trader_manager)):
     """Cancel an order asynchronously (result via WebSocket callback)."""
+    if req.order_sysid:
+        result = manager.cancel_order_sysid_async(
+            order_sysid=req.order_sysid,
+            market=req.market,
+            account_id=req.account_id,
+        )
+        return {
+            "seq": result,
+            "status": "async_submitted",
+            "cancel_method": "order_sysid",
+            "order_sysid": req.order_sysid,
+            "market": req.market,
+        }
     result = manager.cancel_order_async(
         order_id=req.order_id,
         account_id=req.account_id,
     )
-    return {"seq": result, "status": "async_submitted"}
+    return {"seq": result, "status": "async_submitted", "cancel_method": "order_id"}
 
 
 # ------------------------------------------------------------------
