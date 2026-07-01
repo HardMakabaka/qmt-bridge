@@ -4,31 +4,48 @@
 class DownloadMixin:
     """Client methods for /api/download/* endpoints."""
 
-    def download_batch(
+    def create_history_download_job(
         self,
         stocks: list[str],
         period: str = "1d",
         start_time: str = "",
         end_time: str = "",
+        batch_size: int = 10,
+        max_attempts: int = 2,
     ) -> dict:
-        """触发服务端批量下载历史数据。
+        """Submit a server-side history download job.
 
         Args:
             stocks: 股票代码列表，如 ``["000001.SZ", "600519.SH"]``
             period: K 线周期，如 ``"1d"`` / ``"1m"`` / ``"5m"``
             start_time: 开始时间，格式 ``"20230101"``
             end_time: 结束时间，格式同上
+            batch_size: 每批股票数
+            max_attempts: 单股重试次数
         """
-        return self._post("/api/download/batch", {
+        return self._post("/api/download/jobs", {
             "stocks": stocks,
             "period": period,
             "start_time": start_time,
             "end_time": end_time,
+            "batch_size": batch_size,
+            "max_attempts": max_attempts,
         })
 
-    def download_sector_data(self) -> dict:
+    def get_history_download_job(self, job_id: str) -> dict:
+        """Return a history download job snapshot."""
+        return self._get(f"/api/download/jobs/{job_id}")
+
+    def cancel_history_download_job(self, job_id: str) -> dict:
+        """Request cancellation of a history download job."""
+        return self._post(f"/api/download/jobs/{job_id}/cancel", {})
+
+    def download_sector_data(self, timeout_seconds: float | None = None) -> dict:
         """Trigger sector data download."""
-        return self._post("/api/download/sector_data", {})
+        params = {}
+        if timeout_seconds is not None:
+            params["timeout_seconds"] = timeout_seconds
+        return self._post("/api/download/sector_data", params)
 
     def download_index_weight(self) -> dict:
         """Trigger index weight data download."""

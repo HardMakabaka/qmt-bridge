@@ -14,11 +14,17 @@ class DownloadRequest(BaseModel):
     end: str = ""
 
 
-class BatchDownloadRequest(BaseModel):
+class HistoryDownloadJobRequest(BaseModel):
     stocks: list[str]
     period: str = "1d"
     start_time: str = ""
     end_time: str = ""
+    batch_size: int = 10
+    max_attempts: int = 2
+
+
+class SectorDownloadRequest(BaseModel):
+    timeout_seconds: float | None = None
 
 
 class FinancialDownloadRequest(BaseModel):
