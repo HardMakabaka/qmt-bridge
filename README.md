@@ -38,7 +38,7 @@ QMT Bridge 解决这个问题：Windows 电脑作为数据中转站，运行 QMT
 ### 网络
 
 - Windows 和你的主力机在同一局域网下（连同一个路由器 / WiFi）
-- Windows 防火墙放行本项目使用的端口（默认 8000）
+- Windows 防火墙放行本项目使用的端口（默认 13543）
 
 ## Quick Start
 
@@ -83,7 +83,7 @@ cp .env.example .env
 qmt-server
 
 # 自定义参数
-qmt-server --port 8080 --log-level debug
+qmt-server --port 13543 --log-level debug
 
 # 启用交易模块
 qmt-server --trading --api-key your-secret-key --mini-qmt-path "C:\国金QMT交易端\userdata_mini" --account-id 12345678
@@ -109,13 +109,13 @@ scripts\stop.bat
 在你的 Mac/Linux 浏览器中访问：
 
 ```
-http://<Windows局域网IP>:8000/docs
+http://<Windows局域网IP>:13543/docs
 ```
 
 看到 Swagger 文档页面即表示服务正常。也可以用 curl 检查：
 
 ```bash
-curl http://<Windows局域网IP>:8000/api/meta/health
+curl http://<Windows局域网IP>:13543/api/meta/health
 ```
 
 ## Configuration
@@ -125,9 +125,12 @@ curl http://<Windows局域网IP>:8000/api/meta/health
 | 环境变量 | CLI 参数 | 默认值 | 说明 |
 |---------|---------|-------|------|
 | `QMT_BRIDGE_HOST` | `--host` | `0.0.0.0` | 监听地址（`0.0.0.0` = 允许局域网访问） |
-| `QMT_BRIDGE_PORT` | `--port` | `8000` | 监听端口 |
+| `QMT_BRIDGE_PORT` | `--port` | `13543` | 监听端口 |
 | `QMT_BRIDGE_LOG_LEVEL` | `--log-level` | `info` | 日志级别：critical / error / warning / info / debug |
 | `QMT_BRIDGE_WORKERS` | `--workers` | `1` | Worker 数量（Windows 下建议保持 1） |
+| `QMT_BRIDGE_BINARY_CACHE_ENABLED` | — | `true` | 是否启用历史/基础读取的本地二进制缓存 |
+| `QMT_BRIDGE_BINARY_CACHE_TTL_SECONDS` | — | `86400` | 缓存 TTL 秒数 |
+| `QMT_BRIDGE_BINARY_CACHE_MAX_BYTES` | — | `2147483648` | 缓存最大容量 |
 | `QMT_BRIDGE_API_KEY` | `--api-key` | _(空)_ | API Key，用于保护交易端点 |
 | `QMT_BRIDGE_REQUIRE_AUTH_FOR_DATA` | — | `false` | 数据端点是否也要求认证 |
 | `QMT_BRIDGE_TRADING_ENABLED` | `--trading` | `false` | 是否启用交易模块 |
@@ -261,9 +264,11 @@ curl http://<Windows局域网IP>:8000/api/meta/health
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/download/batch` | 批量下载历史数据 |
+| POST | `/api/download/jobs` | 创建历史数据下载任务 |
+| GET | `/api/download/jobs/{job_id}` | 查询下载任务进度 |
+| POST | `/api/download/jobs/{job_id}/cancel` | 取消下载任务 |
 | POST | `/api/download/financial` | 下载财务数据 |
-| POST | `/api/download/sector_data` | 下载板块数据 |
+| POST | `/api/download/sector_data` | 下载板块数据；支持 `timeout_seconds`，返回 `ok` / `timeout` / `busy` / `error` |
 | POST | `/api/download/index_weight` | 下载指数权重 |
 | POST | `/api/download/etf_info` | 下载 ETF 信息 |
 | POST | `/api/download/cb_data` | 下载可转债数据 |
@@ -307,7 +312,6 @@ curl http://<Windows局域网IP>:8000/api/meta/health
 | `/ws/realtime` | 实时行情推送 |
 | `/ws/whole_quote` | 全市场行情订阅 |
 | `/ws/l2_thousand` | L2 千档行情推送 |
-| `/ws/download_progress` | 下载进度推送 |
 | `/ws/trade` | 交易回报推送 (需要 API Key) |
 
 WebSocket 连接后发送 JSON 订阅请求：
@@ -321,9 +325,6 @@ WebSocket 连接后发送 JSON 订阅请求：
 
 // /ws/l2_thousand
 { "stocks": ["000001.SZ"] }
-
-// /ws/download_progress
-{ "stocks": ["000001.SZ"], "period": "1d", "start_time": "", "end_time": "" }
 ```
 
 ## Python Client
@@ -335,7 +336,7 @@ WebSocket 连接后发送 JSON 订阅请求：
 ```python
 from qmt_bridge import QMTClient
 
-client = QMTClient(host="192.168.1.100", port=8000)
+client = QMTClient(host="192.168.1.100", port=13543)
 
 # 历史 K 线
 df = client.get_history("000001.SZ", period="1d", count=60)
@@ -414,45 +415,48 @@ asyncio.run(client.subscribe_whole_quote(
 
 ```bash
 # 健康检查
-curl http://192.168.1.100:8000/api/meta/health
+curl http://192.168.1.100:13543/api/meta/health
 
 # 平安银行最近 60 根日线
-curl "http://192.168.1.100:8000/api/history?stock=000001.SZ&period=1d&count=60"
+curl "http://192.168.1.100:13543/api/history?stock=000001.SZ&period=1d&count=60"
 
 # 增强版 K 线，前复权
-curl "http://192.168.1.100:8000/api/market/history_ex?stocks=000001.SZ&period=1d&count=5&dividend_type=front"
+curl "http://192.168.1.100:13543/api/market/history_ex?stocks=000001.SZ&period=1d&count=5&dividend_type=front"
 
 # 大盘行情
-curl http://192.168.1.100:8000/api/market/indices
+curl http://192.168.1.100:13543/api/market/indices
 
 # 个股 / 指数快照
-curl "http://192.168.1.100:8000/api/market/snapshot?stocks=000001.SH,000001.SZ"
+curl "http://192.168.1.100:13543/api/market/snapshot?stocks=000001.SH,000001.SZ"
 
 # 板块列表
-curl http://192.168.1.100:8000/api/sector/list
+curl http://192.168.1.100:13543/api/sector/list
 
 # 沪深 A 股成分股
-curl "http://192.168.1.100:8000/api/sector/stocks?sector=沪深A股"
+curl "http://192.168.1.100:13543/api/sector/stocks?sector=沪深A股"
 
 # ETF 代码列表
-curl http://192.168.1.100:8000/api/etf/list
+curl http://192.168.1.100:13543/api/etf/list
 
 # 交易日列表
-curl "http://192.168.1.100:8000/api/calendar/trading_dates?market=SH"
+curl "http://192.168.1.100:13543/api/calendar/trading_dates?market=SH"
 
 # 指数成分股权重
-curl "http://192.168.1.100:8000/api/instrument/index_weight?index_code=000300.SH"
+curl "http://192.168.1.100:13543/api/instrument/index_weight?index_code=000300.SH"
 
 # 财务数据
-curl "http://192.168.1.100:8000/api/financial/data?stocks=000001.SZ&tables=Balance"
+curl "http://192.168.1.100:13543/api/financial/data?stocks=000001.SZ&tables=Balance"
 
-# 批量下载历史数据
-curl -X POST http://192.168.1.100:8000/api/download/batch \
+# 创建历史下载任务
+curl -X POST http://192.168.1.100:13543/api/download/jobs \
   -H "Content-Type: application/json" \
-  -d '{"stocks": ["000001.SZ", "600519.SH"], "period": "1d"}'
+  -d '{"stocks": ["000001.SZ", "600519.SH"], "period": "1d", "batch_size": 10, "max_attempts": 2}'
+
+# 查询历史下载任务
+curl http://192.168.1.100:13543/api/download/jobs/<job_id>
 
 # 下单（需要 API Key）
-curl -X POST http://192.168.1.100:8000/api/trading/order \
+curl -X POST http://192.168.1.100:13543/api/trading/order \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-secret-key" \
   -d '{"stock_code": "000001.SZ", "order_type": 23, "order_volume": 100}'

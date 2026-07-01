@@ -1,7 +1,7 @@
 # REST API 端点速查
 
 !!! tip "交互式文档"
-    服务运行后，访问 `http://<host>:8000/docs` (Swagger UI) 或 `http://<host>:8000/redoc` (ReDoc) 可获得交互式 API 文档，支持在线测试。
+    服务运行后，访问 `http://<host>:13543/docs` (Swagger UI) 或 `http://<host>:13543/redoc` (ReDoc) 可获得交互式 API 文档，支持在线测试。
 
 ## Legacy 端点（向后兼容）
 
@@ -161,10 +161,12 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/download/batch` | 批量下载历史数据 |
+| POST | `/api/download/jobs` | 创建历史数据下载任务 |
+| GET | `/api/download/jobs/{job_id}` | 查询下载任务进度 |
+| POST | `/api/download/jobs/{job_id}/cancel` | 取消下载任务 |
 | POST | `/api/download/financial` | 下载财务数据 |
 | POST | `/api/download/financial2` | 同步下载财务数据（阻塞） |
-| POST | `/api/download/sector_data` | 下载板块数据 |
+| POST | `/api/download/sector_data` | 下载板块数据；支持 `timeout_seconds`，返回 `ok` / `timeout` / `busy` / `error` |
 | POST | `/api/download/index_weight` | 下载指数权重 |
 | POST | `/api/download/etf_info` | 下载 ETF 信息 |
 | POST | `/api/download/cb_data` | 下载可转债数据 |
