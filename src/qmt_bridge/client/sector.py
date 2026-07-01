@@ -20,7 +20,7 @@ class SectorMixin:
         return resp.get("stocks", [])
 
     def get_sector_stocks_v2(
-        self, sector: str, real_timetag: int = -1
+        self, sector: str, real_timetag: int | str = -1
     ) -> list[str]:
         """Fetch stock codes in a sector (supports historical composition)."""
         resp = self._get("/api/sector/stocks", {
@@ -28,6 +28,21 @@ class SectorMixin:
             "real_timetag": real_timetag,
         })
         return resp.get("stocks", [])
+
+    def get_stock_sector_memberships(
+        self,
+        stock: str,
+        *,
+        real_timetag: int | str = -1,
+        keyword: str | None = None,
+    ) -> dict:
+        """Fetch sectors containing one stock, optionally filtered by keyword."""
+        resp = self._get("/api/sector/stock-memberships", {
+            "stock": stock,
+            "real_timetag": real_timetag,
+            "keyword": keyword,
+        })
+        return resp
 
     # ------------------------------------------------------------------
     # Write operations

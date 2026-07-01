@@ -15,6 +15,28 @@ from ..models import (
 router = APIRouter(prefix="/api/sector", tags=["sector"])
 
 
+def _normalize_real_timetag(value: int | str | None) -> int | str:
+    if value in (None, "", "-1", -1):
+        return -1
+    text = str(value).strip()
+    if text.isdigit() and len(text) == 8:
+        return text
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def _stock_matches(candidate: str, target: str) -> bool:
+    candidate_text = str(candidate or "").strip().upper()
+    target_text = str(target or "").strip().upper()
+    if not candidate_text or not target_text:
+        return False
+    if candidate_text == target_text:
+        return True
+    return candidate_text.split(".", 1)[0] == target_text.split(".", 1)[0]
+
+
 @router.get("/list")
 def get_sector_list():
     sectors = xtdata.get_sector_list()
@@ -24,10 +46,77 @@ def get_sector_list():
 @router.get("/stocks")
 def get_sector_stocks(
     sector: str = Query(..., description="板块名称，如 沪深A股 / 上证A股 / 深证A股 / 沪深ETF / 上证50 / 沪深300"),
-    real_timetag: int = Query(-1, description="历史日期时间戳（毫秒），-1 表示最新"),
+    real_timetag: str = Query(
+        "-1",
+        description="历史日期，支持毫秒时间戳或 YYYYMMDD 字符串；-1 表示最新",
+    ),
 ):
-    stock_list = xtdata.get_stock_list_in_sector(sector, real_timetag=real_timetag)
-    return {"sector": sector, "count": len(stock_list), "stocks": stock_list}
+    normalized_real_timetag = _normalize_real_timetag(real_timetag)
+    stock_list = xtdata.get_stock_list_in_sector(
+        sector,
+        real_timetag=normalized_real_timetag,
+    )
+    return {
+        "sector": sector,
+        "real_timetag": normalized_real_timetag,
+        "count": len(stock_list),
+        "stocks": stock_list,
+    }
+
+
+@router.get("/stock-memberships")
+def get_stock_sector_memberships(
+    stock: str = Query(..., description="股票代码，支持 000001 或 000001.SZ"),
+    real_timetag: str = Query(
+        "-1",
+        description="历史日期，支持毫秒时间戳或 YYYYMMDD 字符串；-1 表示最新",
+    ),
+    keyword: str | None = Query(None, description="可选板块名称关键词，如 英伟达 / 算力 / CPO"),
+):
+    normalized_real_timetag = _normalize_real_timetag(real_timetag)
+    sectors = xtdata.get_sector_list() or []
+    keyword_text = str(keyword or "").strip()
+    if keyword_text:
+        sectors = [sector for sector in sectors if keyword_text in str(sector)]
+    if not sectors:
+        reason = "qmt_sector_keyword_no_match" if keyword_text else "qmt_sector_list_empty"
+        return {
+            "status": "unavailable",
+            "reason": reason,
+            "stock": stock,
+            "real_timetag": normalized_real_timetag,
+            "keyword": keyword_text or None,
+            "sector_count": 0,
+            "matched_count": 0,
+            "sectors": [],
+            "failures": [],
+        }
+
+    matched: list[str] = []
+    failures: list[dict[str, str]] = []
+    for sector in sectors:
+        try:
+            stock_list = xtdata.get_stock_list_in_sector(
+                sector,
+                real_timetag=normalized_real_timetag,
+            )
+        except Exception as exc:  # pragma: no cover - xtdata runtime boundary
+            failures.append({"sector": str(sector), "error": str(exc)})
+            continue
+        if any(_stock_matches(item, stock) for item in stock_list or []):
+            matched.append(str(sector))
+
+    status = "partial" if failures else "ok"
+    return {
+        "status": status,
+        "stock": stock,
+        "real_timetag": normalized_real_timetag,
+        "keyword": keyword_text or None,
+        "sector_count": len(sectors),
+        "matched_count": len(matched),
+        "sectors": matched,
+        "failures": failures,
+    }
 
 
 @router.get("/info")
