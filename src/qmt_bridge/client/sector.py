@@ -4,9 +4,17 @@
 class SectorMixin:
     """Client methods for /api/sector/* endpoints."""
 
-    def get_sector_list(self) -> list[str]:
+    def get_sector_list(
+        self,
+        keyword: str | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
         """Fetch all available sector names."""
-        resp = self._get("/api/sector/list")
+        params = {
+            "keyword": keyword,
+            "limit": limit,
+        }
+        resp = self._get("/api/sector/list", params)
         return resp.get("sectors", [])
 
     def get_sector_info(self, sector: str = "") -> dict:

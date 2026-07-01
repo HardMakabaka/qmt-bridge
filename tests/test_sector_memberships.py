@@ -8,6 +8,30 @@ sys.modules.setdefault("xtquant", xtquant_stub)
 from qmt_bridge.server.routers import sector
 
 
+def test_sector_list_filters_keyword_and_limit(monkeypatch):
+    monkeypatch.setattr(
+        sector,
+        "xtdata",
+        SimpleNamespace(
+            get_sector_list=lambda: [
+                "TGN英伟达概念",
+                "TDGN英伟达",
+                "TGN算力租赁",
+                "沪深A股",
+            ]
+        ),
+    )
+
+    payload = sector.get_sector_list(keyword="英伟达", limit=1)
+
+    assert payload["sectors"] == ["TGN英伟达概念"]
+    assert payload["count"] == 1
+    assert payload["total_count"] == 4
+    assert payload["filtered_count"] == 2
+    assert payload["keyword"] == "英伟达"
+    assert payload["truncated"] is True
+
+
 def test_sector_stocks_preserves_yyyymmdd_real_timetag(monkeypatch):
     calls = []
 

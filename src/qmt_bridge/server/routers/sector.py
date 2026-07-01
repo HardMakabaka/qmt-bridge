@@ -38,9 +38,26 @@ def _stock_matches(candidate: str, target: str) -> bool:
 
 
 @router.get("/list")
-def get_sector_list():
-    sectors = xtdata.get_sector_list()
-    return {"sectors": sectors}
+def get_sector_list(
+    keyword: str | None = Query(None, description="可选板块名称关键词，如 英伟达 / 算力 / CPO"),
+    limit: int = Query(0, ge=0, le=10000, description="最多返回条数；0 表示不限制"),
+):
+    sectors = [str(sector) for sector in xtdata.get_sector_list() or []]
+    total_count = len(sectors)
+    keyword_text = str(keyword or "").strip()
+    if keyword_text:
+        sectors = [sector for sector in sectors if keyword_text in sector]
+    filtered_count = len(sectors)
+    if limit:
+        sectors = sectors[:limit]
+    return {
+        "sectors": sectors,
+        "count": len(sectors),
+        "total_count": total_count,
+        "filtered_count": filtered_count,
+        "keyword": keyword_text or None,
+        "truncated": bool(limit and filtered_count > len(sectors)),
+    }
 
 
 @router.get("/stocks")
