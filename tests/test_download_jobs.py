@@ -35,6 +35,7 @@ def test_sector_data_download_completes_with_progress(monkeypatch):
         callback({"finished": 1, "total": 1, "message": "done"})
         return {"sector": "ok"}
 
+    monkeypatch.setattr(download, "SECTOR_DOWNLOAD_USE_SUBPROCESS", False)
     monkeypatch.setattr(
         download,
         "xtdata",
@@ -50,6 +51,8 @@ def test_sector_data_download_completes_with_progress(monkeypatch):
     assert payload["before_sector_count"] == 2
     assert payload["after_sector_count"] == 2
     assert payload["last_progress"] == {"finished": 1, "total": 1, "message": "done"}
+    assert payload["method"] == "xtdata.download_history_data2"
+    assert payload["child_process_isolated"] is False
     assert payload["result"] == {"sector": "ok"}
     assert calls == [([], (2009, 86400000), "", "", None)]
 
@@ -65,6 +68,7 @@ def test_sector_data_download_timeout_stops_xtdata(monkeypatch):
     def stop_supply_history_data2():
         stopped["value"] = True
 
+    monkeypatch.setattr(download, "SECTOR_DOWNLOAD_USE_SUBPROCESS", False)
     monkeypatch.setattr(download, "SECTOR_DOWNLOAD_STOP_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(
         download,
@@ -83,8 +87,44 @@ def test_sector_data_download_timeout_stops_xtdata(monkeypatch):
     assert payload["before_sector_count"] == 1
     assert payload["after_sector_count"] == 1
     assert payload["last_progress"] is None
+    assert payload["child_process_isolated"] is False
     assert payload["thread_alive"] is False
     assert stopped["value"] is True
+
+
+def test_sector_data_download_subprocess_timeout_is_bounded(monkeypatch):
+    def execute_sector_download_process(timeout_seconds):
+        return (
+            "timeout",
+            {
+                "method": "xtdata.download_sector_data",
+                "timeout_seconds": timeout_seconds,
+                "stdout_tail": "before_sector_count=36",
+                "stderr_tail": "",
+                "child_process_isolated": True,
+                "child_process_killed": True,
+            },
+        )
+
+    monkeypatch.setattr(download, "SECTOR_DOWNLOAD_USE_SUBPROCESS", True)
+    monkeypatch.setattr(download, "_execute_sector_download_process", execute_sector_download_process)
+    monkeypatch.setattr(
+        download,
+        "xtdata",
+        SimpleNamespace(get_sector_list=lambda: ["沪深A股"]),
+    )
+
+    payload = download.download_sector_data(timeout_seconds=0.02)
+
+    assert payload["status"] == "timeout"
+    assert payload["reason"] == "qmt_sector_download_timeout"
+    assert payload["before_sector_count"] == 1
+    assert payload["after_sector_count"] == 1
+    assert payload["method"] == "xtdata.download_sector_data"
+    assert payload["child_process_isolated"] is True
+    assert payload["child_process_killed"] is True
+    assert payload["thread_alive"] is False
+    assert payload["stdout_tail"] == "before_sector_count=36"
 
 
 def test_sector_data_download_busy_when_previous_thread_survives_timeout(monkeypatch):
@@ -95,6 +135,7 @@ def test_sector_data_download_busy_when_previous_thread_survives_timeout(monkeyp
             time.sleep(0.005)
         return {}
 
+    monkeypatch.setattr(download, "SECTOR_DOWNLOAD_USE_SUBPROCESS", False)
     monkeypatch.setattr(download, "SECTOR_DOWNLOAD_STOP_GRACE_SECONDS", 0.01)
     monkeypatch.setattr(
         download,

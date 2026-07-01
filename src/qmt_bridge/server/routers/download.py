@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import logging
+import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -31,6 +35,8 @@ DOWNLOAD_STOP_GRACE_SECONDS = 5.0
 SECTOR_DOWNLOAD_TIMEOUT_SECONDS = 60.0
 SECTOR_DOWNLOAD_STOP_GRACE_SECONDS = 5.0
 SECTOR_DOWNLOAD_PERIOD = (2009, 86400000)
+SECTOR_DOWNLOAD_USE_SUBPROCESS = True
+SECTOR_DOWNLOAD_METHOD = "xtdata.download_sector_data"
 
 
 class _DownloadCallTimeout(RuntimeError):
@@ -484,9 +490,11 @@ _download_jobs = _DownloadJobManager()
 _sector_download_lock = threading.RLock()
 _sector_download_active: dict[str, object] = {
     "thread": None,
+    "running": False,
     "started_at": None,
     "timeout_seconds": None,
     "last_progress": None,
+    "method": None,
 }
 
 
@@ -496,9 +504,11 @@ def reset_download_job_manager_for_tests() -> None:
         _sector_download_active.update(
             {
                 "thread": None,
+                "running": False,
                 "started_at": None,
                 "timeout_seconds": None,
                 "last_progress": None,
+                "method": None,
             }
         )
 
@@ -511,11 +521,164 @@ def _safe_sector_count() -> int | None:
         return None
 
 
+def _tail_text(value: str | bytes | None, limit: int = 4000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return value[-limit:]
+
+
+def _sector_download_child_code() -> str:
+    return r"""
+import json
+import time
+import traceback
+
+from xtquant import xtdata
+
+
+def _json_default(value):
+    try:
+        return str(value)
+    except Exception:
+        return repr(value)
+
+
+started = time.time()
+payload = {
+    "status": "ok",
+    "method": "xtdata.download_sector_data",
+    "elapsed_seconds": 0.0,
+    "result": None,
+}
+try:
+    payload["result"] = xtdata.download_sector_data()
+except Exception as exc:
+    payload.update(
+        {
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(limit=5),
+        }
+    )
+finally:
+    payload["elapsed_seconds"] = round(time.time() - started, 3)
+    print(json.dumps(payload, ensure_ascii=False, default=_json_default), flush=True)
+"""
+
+
+def _sector_download_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    current_pythonpath = env.get("PYTHONPATH", "")
+    path_entries = [entry for entry in sys.path if entry]
+    if current_pythonpath:
+        path_entries.append(current_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(path_entries))
+    return env
+
+
+def _parse_sector_download_payload(stdout: str) -> dict | None:
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _execute_sector_download_process(timeout_seconds: float) -> tuple[str, dict]:
+    started = time.time()
+    command = [sys.executable, "-u", "-c", _sector_download_child_code()]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_sector_download_env(),
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return (
+            "timeout",
+            {
+                "method": SECTOR_DOWNLOAD_METHOD,
+                "elapsed_seconds": round(time.time() - started, 3),
+                "timeout_seconds": timeout_seconds,
+                "stdout_tail": _tail_text(exc.stdout),
+                "stderr_tail": _tail_text(exc.stderr),
+                "child_process_isolated": True,
+                "child_process_killed": True,
+            },
+        )
+
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    payload = _parse_sector_download_payload(stdout) or {
+        "method": SECTOR_DOWNLOAD_METHOD,
+        "result": None,
+    }
+    payload.setdefault("method", SECTOR_DOWNLOAD_METHOD)
+    payload["returncode"] = completed.returncode
+    payload["stdout_tail"] = _tail_text(stdout)
+    payload["stderr_tail"] = _tail_text(stderr)
+    payload["child_process_isolated"] = True
+    payload["child_process_killed"] = False
+    payload.setdefault("elapsed_seconds", round(time.time() - started, 3))
+    if completed.returncode != 0:
+        payload.setdefault("error", f"sector download child exited with {completed.returncode}")
+        return "error", payload
+    status = str(payload.get("status") or "ok")
+    if status == "ok":
+        return "ok", payload
+    if status == "timeout":
+        return "timeout", payload
+    return "error", payload
+
+
+def _execute_sector_download_in_process(on_progress) -> dict:
+    downloader = getattr(xtdata, "download_history_data2", None)
+    if callable(downloader):
+        result = downloader([], SECTOR_DOWNLOAD_PERIOD, callback=on_progress)
+        return {
+            "method": "xtdata.download_history_data2",
+            "result": result,
+            "child_process_isolated": False,
+        }
+    return {
+        "method": "xtdata.download_sector_data",
+        "result": xtdata.download_sector_data(),
+        "child_process_isolated": False,
+    }
+
+
 def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECONDS) -> dict:
     started = time.time()
     timeout = min(600.0, max(0.1, float(timeout_seconds or SECTOR_DOWNLOAD_TIMEOUT_SECONDS)))
     with _sector_download_lock:
         active_thread = _sector_download_active.get("thread")
+        if bool(_sector_download_active.get("running")):
+            active_started = float(_sector_download_active.get("started_at") or started)
+            return {
+                "status": "busy",
+                "reason": "qmt_sector_download_already_running",
+                "elapsed_seconds": round(time.time() - active_started, 3),
+                "timeout_seconds": _sector_download_active.get("timeout_seconds"),
+                "last_progress": _sector_download_active.get("last_progress"),
+                "method": _sector_download_active.get("method"),
+                "thread_alive": isinstance(active_thread, threading.Thread)
+                and active_thread.is_alive(),
+            }
         if isinstance(active_thread, threading.Thread):
             if active_thread.is_alive():
                 active_started = float(_sector_download_active.get("started_at") or started)
@@ -525,14 +688,17 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
                     "elapsed_seconds": round(time.time() - active_started, 3),
                     "timeout_seconds": _sector_download_active.get("timeout_seconds"),
                     "last_progress": _sector_download_active.get("last_progress"),
+                    "method": _sector_download_active.get("method"),
                     "thread_alive": True,
                 }
             _sector_download_active.update(
                 {
                     "thread": None,
+                    "running": False,
                     "started_at": None,
                     "timeout_seconds": None,
                     "last_progress": None,
+                    "method": None,
                 }
             )
 
@@ -549,14 +715,21 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
 
     def target() -> None:
         try:
-            downloader = getattr(xtdata, "download_history_data2", None)
-            if callable(downloader):
-                result = downloader([], SECTOR_DOWNLOAD_PERIOD, callback=on_progress)
+            if SECTOR_DOWNLOAD_USE_SUBPROCESS:
+                status, payload = _execute_sector_download_process(timeout)
+                result_queue.put((status, payload))
             else:
-                result = xtdata.download_sector_data()
-            result_queue.put(("ok", result))
+                result_queue.put(("ok", _execute_sector_download_in_process(on_progress)))
         except Exception as exc:
             result_queue.put(("error", exc))
+        finally:
+            with _sector_download_lock:
+                if _sector_download_active.get("thread") is thread:
+                    _sector_download_active.update(
+                        {
+                            "running": False,
+                        }
+                    )
 
     thread = threading.Thread(
         target=target,
@@ -568,29 +741,39 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
         _sector_download_active.update(
             {
                 "thread": thread,
+                "running": True,
                 "started_at": started,
                 "timeout_seconds": timeout,
                 "last_progress": None,
+                "method": SECTOR_DOWNLOAD_METHOD
+                if SECTOR_DOWNLOAD_USE_SUBPROCESS
+                else "xtdata.download_history_data2",
             }
         )
     thread.start()
 
     while thread.is_alive():
         elapsed = time.time() - started
-        if elapsed > timeout:
+        guard_timeout = timeout
+        if SECTOR_DOWNLOAD_USE_SUBPROCESS:
+            guard_timeout += SECTOR_DOWNLOAD_STOP_GRACE_SECONDS
+        if elapsed > guard_timeout:
             _DownloadJobManager._stop_xtdata_download()
             thread.join(SECTOR_DOWNLOAD_STOP_GRACE_SECONDS)
             after_count = _safe_sector_count()
             thread_alive = thread.is_alive()
+            active_method = _sector_download_active.get("method")
             if not thread_alive:
                 with _sector_download_lock:
                     if _sector_download_active.get("thread") is thread:
                         _sector_download_active.update(
                             {
                                 "thread": None,
+                                "running": False,
                                 "started_at": None,
                                 "timeout_seconds": None,
                                 "last_progress": None,
+                                "method": None,
                             }
                         )
             return {
@@ -601,6 +784,9 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
                 "before_sector_count": before_count,
                 "after_sector_count": after_count,
                 "last_progress": progress["last"],
+                "method": active_method,
+                "child_process_isolated": SECTOR_DOWNLOAD_USE_SUBPROCESS,
+                "child_process_killed": False,
                 "thread_alive": thread_alive,
             }
         thread.join(0.1)
@@ -613,20 +799,49 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
             _sector_download_active.update(
                 {
                     "thread": None,
+                    "running": False,
                     "started_at": None,
                     "timeout_seconds": None,
                     "last_progress": None,
+                    "method": None,
                 }
             )
     if status == "ok":
+        method = payload.get("method") if isinstance(payload, dict) else None
+        result = payload.get("result") if isinstance(payload, dict) else payload
         return {
             "status": "ok",
             "elapsed_seconds": elapsed,
             "before_sector_count": before_count,
             "after_sector_count": after_count,
             "last_progress": progress["last"],
-            "result": _numpy_to_python(payload),
+            "method": method,
+            "child_process_isolated": bool(
+                isinstance(payload, dict) and payload.get("child_process_isolated")
+            ),
+            "child_process_killed": bool(
+                isinstance(payload, dict) and payload.get("child_process_killed")
+            ),
+            "result": _numpy_to_python(result),
         }
+    if status == "timeout":
+        payload_dict = payload if isinstance(payload, dict) else {"error": str(payload)}
+        return {
+            "status": "timeout",
+            "reason": "qmt_sector_download_timeout",
+            "elapsed_seconds": elapsed,
+            "timeout_seconds": timeout,
+            "before_sector_count": before_count,
+            "after_sector_count": after_count,
+            "last_progress": progress["last"],
+            "method": payload_dict.get("method"),
+            "child_process_isolated": bool(payload_dict.get("child_process_isolated")),
+            "child_process_killed": bool(payload_dict.get("child_process_killed")),
+            "stdout_tail": payload_dict.get("stdout_tail", ""),
+            "stderr_tail": payload_dict.get("stderr_tail", ""),
+            "thread_alive": thread.is_alive(),
+        }
+    payload_dict = payload if isinstance(payload, dict) else {"error": str(payload)}
     return {
         "status": "error",
         "reason": "qmt_sector_download_error",
@@ -634,7 +849,12 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
         "before_sector_count": before_count,
         "after_sector_count": after_count,
         "last_progress": progress["last"],
-        "error": str(payload),
+        "method": payload_dict.get("method"),
+        "child_process_isolated": bool(payload_dict.get("child_process_isolated")),
+        "child_process_killed": bool(payload_dict.get("child_process_killed")),
+        "stdout_tail": payload_dict.get("stdout_tail", ""),
+        "stderr_tail": payload_dict.get("stderr_tail", ""),
+        "error": str(payload_dict.get("error", payload)),
     }
 
 
