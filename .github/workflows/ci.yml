@@ -17,17 +17,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
 
-      - name: Install package
-        run: pip install -e ".[server,ws]"
+      - name: Install locked environment
+        run: uv sync --frozen --group dev --extra server --extra ws
 
       - name: Verify import
-        run: python -c "from qmt_bridge import QMTClient; print('import OK')"
+        run: uv run --frozen python -c "from qmt_bridge import QMTClient; print('import OK')"
+
+      - name: Check critical Python diagnostics
+        run: uv run --frozen ruff check src tests
+
+      - name: Check typed contract modules
+        run: uv run --frozen basedpyright
+
+      - name: Check Big QMT embedded Python 3.6 syntax
+        run: uv run --frozen python scripts/check-embedded-py36.py
 
       - name: Run tests
-        run: python -m pytest tests/ -v
+        run: uv run --frozen python -m pytest tests/ -v
         if: hashFiles('tests/') != ''
+
+      - name: Build distributions
+        run: uv run --frozen python -m build
