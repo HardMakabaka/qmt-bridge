@@ -124,7 +124,15 @@ Get-CimInstance Win32_Process |
             pid,
         )
         stop = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    f"Stop-Process -Id {pid} -Force; "
+                    f"Wait-Process -Id {pid} -Timeout 10 -ErrorAction SilentlyContinue"
+                ),
+            ],
             check=False,
             capture_output=True,
             text=True,

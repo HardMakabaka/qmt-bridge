@@ -566,7 +566,10 @@ def test_singleton_does_not_stop_current_wrapper_parent(monkeypatch):
 
     assert [item["pid"] for item in stopped] == [20]
     assert len(stopped_commands) == 1
-    assert stopped_commands[0][-1] == "Stop-Process -Id 20 -Force"
+    assert stopped_commands[0][-1] == (
+        "Stop-Process -Id 20 -Force; "
+        "Wait-Process -Id 20 -Timeout 10 -ErrorAction SilentlyContinue"
+    )
 
 
 def test_trader_manager_uses_current_credit_query_names():
