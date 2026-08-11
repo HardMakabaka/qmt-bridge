@@ -14,9 +14,17 @@ from queue import Queue
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
-from xtquant import xtdata
+from ..bigqmt import xtdata
 
-from ..helpers import _numpy_to_python
+from ..helpers import (
+    XtdataCallCancelledError,
+    XtdataTransportStuckError,
+    _call_xtdata_serialized,
+    _call_xtdata_serialized_cancellable,
+    _mark_xtdata_transport_stuck,
+    _numpy_to_python,
+    _reset_xtdata_transport_for_tests,
+)
 from ..models import (
     FinancialDownload2Request,
     FinancialDownloadRequest,
@@ -29,9 +37,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/download", tags=["download"])
 
 DOWNLOAD_JOB_TTL_SECONDS = 24 * 60 * 60
+DOWNLOAD_MAX_BATCH_SIZE = 100
+DOWNLOAD_MAX_ATTEMPTS = 5
 DOWNLOAD_BATCH_TIMEOUT_SECONDS = 120.0
 DOWNLOAD_NO_PROGRESS_TIMEOUT_SECONDS = 60.0
 DOWNLOAD_STOP_GRACE_SECONDS = 5.0
+DOWNLOAD_HISTORY_VISIBILITY_ATTEMPTS = 10
+DOWNLOAD_HISTORY_VISIBILITY_INTERVAL_SECONDS = 0.1
 SECTOR_DOWNLOAD_TIMEOUT_SECONDS = 60.0
 SECTOR_DOWNLOAD_STOP_GRACE_SECONDS = 5.0
 SECTOR_DOWNLOAD_PERIOD = (2009, 86400000)
@@ -70,8 +82,8 @@ class _DownloadJobManager:
         stocks = [stock.strip() for stock in req.stocks if str(stock).strip()]
         if not stocks:
             raise HTTPException(status_code=400, detail="stocks must not be empty")
-        batch_size = max(1, int(req.batch_size or 10))
-        max_attempts = max(1, int(req.max_attempts or 2))
+        batch_size = min(DOWNLOAD_MAX_BATCH_SIZE, max(1, int(req.batch_size or 10)))
+        max_attempts = min(DOWNLOAD_MAX_ATTEMPTS, max(1, int(req.max_attempts or 2)))
         job_id = uuid4().hex
         now = time.time()
         job = {
@@ -203,33 +215,77 @@ class _DownloadJobManager:
             if batch_status == "target_missing":
                 self._mark_symbols(job_id, batch, status=batch_status, error=batch_error)
                 continue
+            if batch_status == "transport_stuck":
+                self._mark_slow(job_id, batch, batch_error)
+                self._mark_symbols(
+                    job_id,
+                    stocks[offset:],
+                    status=batch_status,
+                    error=batch_error,
+                )
+                break
             if self._is_stop_requested(job_id):
                 self._mark_canceled(job_id)
                 return
 
             self._mark_slow(job_id, batch, batch_error)
             if len(batch) == 1:
-                self._retry_symbol(
+                retry_status, retry_error = self._retry_symbol(
                     job_id,
                     batch[0],
                     first_status=batch_status,
                     first_error=batch_error,
                     next_attempt=2,
                 )
+                if retry_status == "transport_stuck":
+                    self._mark_symbols(
+                        job_id,
+                        stocks[offset + 1 :],
+                        status=retry_status,
+                        error=retry_error,
+                    )
+                    break
                 continue
 
-            for stock in batch:
+            transport_stuck = False
+            for stock_offset, stock in enumerate(batch):
                 if self._is_stop_requested(job_id):
                     self._mark_canceled(job_id)
                     return
-                self._retry_symbol(job_id, stock)
+                retry_status, retry_error = self._retry_symbol(
+                    job_id,
+                    stock,
+                    first_status=batch_status,
+                    first_error=batch_error,
+                    next_attempt=2,
+                )
+                if retry_status == "transport_stuck":
+                    self._mark_symbols(
+                        job_id,
+                        stocks[offset + stock_offset + 1 :],
+                        status=retry_status,
+                        error=retry_error,
+                    )
+                    transport_stuck = True
+                    break
+            if transport_stuck:
+                break
 
         with self._condition:
             job = self._jobs[job_id]
             job["current_batch"] = []
             failed_count = len(job.get("failed_symbols") or [])
             total = int(job.get("total") or 0)
-            if total > 0 and failed_count >= total:
+            transport_failures = [
+                result
+                for result in job["symbol_results"].values()
+                if result.get("status") == "transport_stuck"
+            ]
+            if transport_failures:
+                reason = transport_failures[0].get("error") or "xtdata transport stuck"
+                job["error"] = f"xtdata transport unavailable: {reason}"
+                final_status = "failed"
+            elif total > 0 and failed_count >= total:
                 job["error"] = "all requested symbols failed history download validation"
                 final_status = "failed"
             else:
@@ -253,7 +309,7 @@ class _DownloadJobManager:
         first_status: str = "error",
         first_error: str = "",
         next_attempt: int = 1,
-    ) -> None:
+    ) -> tuple[str, str]:
         max_attempts = int(self.get(job_id)["max_attempts"])
         last_status = first_status
         last_error = first_error
@@ -262,15 +318,20 @@ class _DownloadJobManager:
             last_status, last_error = status, error
             if status == "ok":
                 self._mark_symbols(job_id, [stock], status="ok", error="")
-                return
+                return status, error
+            if status == "transport_stuck":
+                self._mark_symbols(job_id, [stock], status=status, error=error)
+                return status, error
             if self._is_stop_requested(job_id):
-                return
+                return status, error
         self._mark_symbols(job_id, [stock], status=last_status, error=last_error)
+        return last_status, last_error
 
     def _run_batch(self, job_id: str, batch: list[str], *, attempt: int) -> tuple[str, str]:
         started = time.time()
         last_progress_at = started
         result_queue: Queue = Queue(maxsize=1)
+        cancel_call = threading.Event()
 
         def on_progress(data):
             nonlocal last_progress_at
@@ -284,7 +345,9 @@ class _DownloadJobManager:
 
         def target() -> None:
             try:
-                result = xtdata.download_history_data2(
+                result = _call_xtdata_serialized_cancellable(
+                    cancel_call,
+                    xtdata.download_history_data2,
                     batch,
                     period=self.get(job_id)["period"],
                     start_time=self.get(job_id)["start_time"],
@@ -292,6 +355,10 @@ class _DownloadJobManager:
                     callback=on_progress,
                 )
                 result_queue.put(("ok", result))
+            except XtdataTransportStuckError as exc:
+                result_queue.put(("transport_stuck", exc))
+            except XtdataCallCancelledError as exc:
+                result_queue.put(("call_canceled", exc))
             except Exception as exc:
                 result_queue.put(("error", exc))
 
@@ -305,17 +372,20 @@ class _DownloadJobManager:
         try:
             while thread.is_alive():
                 if self._is_stop_requested(job_id):
+                    cancel_call.set()
                     self._stop_xtdata_download()
                     thread.join(DOWNLOAD_STOP_GRACE_SECONDS)
                     raise _DownloadCallTimeout("download canceled")
                 now = time.time()
                 if now - started > DOWNLOAD_BATCH_TIMEOUT_SECONDS:
+                    cancel_call.set()
                     self._stop_xtdata_download()
                     thread.join(DOWNLOAD_STOP_GRACE_SECONDS)
                     raise _DownloadCallTimeout(
                         f"batch timeout after {DOWNLOAD_BATCH_TIMEOUT_SECONDS:.0f}s"
                     )
                 if now - last_progress_at > DOWNLOAD_NO_PROGRESS_TIMEOUT_SECONDS:
+                    cancel_call.set()
                     self._stop_xtdata_download()
                     thread.join(DOWNLOAD_STOP_GRACE_SECONDS)
                     raise _DownloadCallTimeout(
@@ -323,6 +393,7 @@ class _DownloadJobManager:
                     )
                 thread.join(0.1)
         except _DownloadCallTimeout as exc:
+            thread_alive = thread.is_alive()
             logger.warning(
                 "History download batch timed out: job_id=%s stocks=%s attempt=%s error=%s",
                 job_id,
@@ -330,12 +401,25 @@ class _DownloadJobManager:
                 attempt,
                 exc,
             )
+            if thread_alive:
+                reason = f"{exc}; xtdata transport thread is still active"
+                _mark_xtdata_transport_stuck(reason)
+                return "transport_stuck", reason
             return "download_timeout", str(exc)
 
         status, payload = result_queue.get() if not result_queue.empty() else ("ok", None)
         elapsed = time.time() - started
+        if status == "transport_stuck":
+            return status, str(payload)
+        if status == "call_canceled":
+            return "download_timeout", str(payload)
         if status == "ok":
-            missing_symbols = self._missing_downloaded_symbols(job_id, batch)
+            for validation_attempt in range(DOWNLOAD_HISTORY_VISIBILITY_ATTEMPTS):
+                missing_symbols = self._missing_downloaded_symbols(job_id, batch)
+                if not missing_symbols:
+                    break
+                if validation_attempt + 1 < DOWNLOAD_HISTORY_VISIBILITY_ATTEMPTS:
+                    time.sleep(DOWNLOAD_HISTORY_VISIBILITY_INTERVAL_SECONDS)
             if missing_symbols:
                 message = (
                     "download completed but target history rows are missing for "
@@ -372,7 +456,8 @@ class _DownloadJobManager:
             return []
         job = self.get(job_id)
         try:
-            raw = getter(
+            raw = _call_xtdata_serialized(
+                getter,
                 field_list=[],
                 stock_list=stocks,
                 period=job.get("period") or "1d",
@@ -470,6 +555,8 @@ class _DownloadJobManager:
 
     @staticmethod
     def _stop_xtdata_download() -> None:
+        # Cancellation must be able to interrupt the call that currently owns
+        # the serialization lock, so these control calls deliberately bypass it.
         try:
             client = xtdata.get_client()
             stop = getattr(client, "stop_supply_history_data2", None)
@@ -499,6 +586,7 @@ _sector_download_active: dict[str, object] = {
 
 
 def reset_download_job_manager_for_tests() -> None:
+    _reset_xtdata_transport_for_tests()
     _download_jobs.reset_for_tests()
     with _sector_download_lock:
         _sector_download_active.update(
@@ -515,7 +603,7 @@ def reset_download_job_manager_for_tests() -> None:
 
 def _safe_sector_count() -> int | None:
     try:
-        return len(xtdata.get_sector_list() or [])
+        return len(_call_xtdata_serialized(xtdata.get_sector_list) or [])
     except Exception:
         logger.debug("Unable to read QMT sector list during sector download", exc_info=True)
         return None
@@ -535,7 +623,7 @@ import json
 import time
 import traceback
 
-from xtquant import xtdata
+from ..bigqmt import xtdata
 
 
 def _json_default(value):
@@ -649,7 +737,12 @@ def _execute_sector_download_process(timeout_seconds: float) -> tuple[str, dict]
 def _execute_sector_download_in_process(on_progress) -> dict:
     downloader = getattr(xtdata, "download_history_data2", None)
     if callable(downloader):
-        result = downloader([], SECTOR_DOWNLOAD_PERIOD, callback=on_progress)
+        result = _call_xtdata_serialized(
+            downloader,
+            [],
+            SECTOR_DOWNLOAD_PERIOD,
+            callback=on_progress,
+        )
         return {
             "method": "xtdata.download_history_data2",
             "result": result,
@@ -657,7 +750,7 @@ def _execute_sector_download_in_process(on_progress) -> dict:
         }
     return {
         "method": "xtdata.download_sector_data",
-        "result": xtdata.download_sector_data(),
+        "result": _call_xtdata_serialized(xtdata.download_sector_data),
         "child_process_isolated": False,
     }
 
@@ -716,7 +809,10 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
     def target() -> None:
         try:
             if SECTOR_DOWNLOAD_USE_SUBPROCESS:
-                status, payload = _execute_sector_download_process(timeout)
+                status, payload = _call_xtdata_serialized(
+                    _execute_sector_download_process,
+                    timeout,
+                )
                 result_queue.put((status, payload))
             else:
                 result_queue.put(("ok", _execute_sector_download_in_process(on_progress)))
@@ -760,8 +856,12 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
         if elapsed > guard_timeout:
             _DownloadJobManager._stop_xtdata_download()
             thread.join(SECTOR_DOWNLOAD_STOP_GRACE_SECONDS)
-            after_count = _safe_sector_count()
             thread_alive = thread.is_alive()
+            if thread_alive:
+                _mark_xtdata_transport_stuck(
+                    "sector download timeout; xtdata transport thread is still active"
+                )
+            after_count = None if thread_alive else _safe_sector_count()
             active_method = _sector_download_active.get("method")
             if not thread_alive:
                 with _sector_download_lock:
@@ -875,7 +975,8 @@ def cancel_history_download_job(job_id: str):
 
 @router.post("/financial")
 def download_financial(req: FinancialDownloadRequest):
-    xtdata.download_financial_data(
+    _call_xtdata_serialized(
+        xtdata.download_financial_data,
         req.stocks,
         table_list=req.tables,
         start_time=req.start_time,
@@ -899,46 +1000,47 @@ def download_sector_data(
 
 @router.post("/index_weight")
 def download_index_weight():
-    xtdata.download_index_weight()
+    _call_xtdata_serialized(xtdata.download_index_weight)
     return {"status": "ok"}
 
 
 @router.post("/etf_info")
 def download_etf_info():
-    xtdata.download_etf_info()
+    _call_xtdata_serialized(xtdata.download_etf_info)
     return {"status": "ok"}
 
 
 @router.post("/cb_data")
 def download_cb_data():
-    xtdata.download_cb_data()
+    _call_xtdata_serialized(xtdata.download_cb_data)
     return {"status": "ok"}
 
 
 @router.post("/history_contracts")
 def download_history_contracts():
-    xtdata.download_history_contracts()
+    _call_xtdata_serialized(xtdata.download_history_contracts)
     return {"status": "ok"}
 
 
 @router.post("/ipo_data")
 def download_ipo_data():
     """Trigger IPO data download."""
-    xtdata.download_ipo_data()
+    _call_xtdata_serialized(xtdata.download_ipo_data)
     return {"status": "ok"}
 
 
 @router.post("/option_data")
 def download_option_data():
     """Trigger option data download."""
-    xtdata.download_option_data()
+    _call_xtdata_serialized(xtdata.download_option_data)
     return {"status": "ok"}
 
 
 @router.post("/financial2")
 def download_financial_data2(req: FinancialDownload2Request):
     """Synchronous financial data download (blocks until complete)."""
-    xtdata.download_financial_data2(
+    _call_xtdata_serialized(
+        xtdata.download_financial_data2,
         req.stocks,
         table_list=req.tables,
     )
@@ -948,5 +1050,5 @@ def download_financial_data2(req: FinancialDownload2Request):
 @router.post("/holiday")
 def download_holiday_data():
     """Download holiday calendar data."""
-    xtdata.download_holiday_data()
+    _call_xtdata_serialized(xtdata.download_holiday_data)
     return {"status": "ok"}

@@ -1,9 +1,9 @@
 """Router — Tabular data endpoints /api/tabular/*."""
 
 from fastapi import APIRouter, Query
-from xtquant import xtdata
+from ..bigqmt import xtdata
 
-from ..helpers import _numpy_to_python
+from ..helpers import _call_xtdata_serialized, _numpy_to_python
 
 router = APIRouter(prefix="/api/tabular", tags=["tabular"])
 
@@ -17,7 +17,13 @@ def get_tabular_data(
 ):
     """Get data from a named tabular data source."""
     stock_list = [s.strip() for s in stocks.split(",") if s.strip()] if stocks else []
-    raw = xtdata.get_financial_data(stock_list, table_list=[table_name], start_time=start_time, end_time=end_time)
+    raw = _call_xtdata_serialized(
+        xtdata.get_financial_data,
+        stock_list,
+        table_list=[table_name],
+        start_time=start_time,
+        end_time=end_time,
+    )
     return {"table": table_name, "data": _numpy_to_python(raw)}
 
 
@@ -25,7 +31,7 @@ def get_tabular_data(
 def list_tables():
     """List available tabular data tables."""
     try:
-        tables = xtdata.get_financial_table_list()
+        tables = _call_xtdata_serialized(xtdata.get_financial_table_list)
         return {"tables": _numpy_to_python(tables)}
     except Exception:
         return {"tables": []}

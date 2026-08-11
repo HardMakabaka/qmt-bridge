@@ -17,7 +17,7 @@ pip install "qmt-bridge[client]"
 ```python
 from qmt_bridge import QMTClient
 
-client = QMTClient(host="192.168.1.100", port=8000)
+client = QMTClient(host="192.168.1.100", port=13543)
 
 # 历史 K 线
 df = client.get_history("000001.SZ", period="1d", count=60)
@@ -27,7 +27,12 @@ snapshot = client.get_market_snapshot(["000001.SZ", "600519.SH"])
 
 # 交易（需要 API Key）
 client = QMTClient(host="192.168.1.100", api_key="your-secret-key")
-order_id = client.place_order("000001.SZ", order_type=23, order_volume=100)
+order_id = client.place_order(
+    "000001.SZ",
+    order_type=23,
+    order_volume=100,
+    client_submit_id="manual-20260719-0001",
+)
 ```
 
 ## 功能模块
@@ -47,7 +52,7 @@ order_id = client.place_order("000001.SZ", order_type=23, order_volume=100)
 | [港股通](hk.md) | 港股通标的 | `get_hk_stock_list` |
 | [表格数据](tabular.md) | 通用表格 | `get_tabular_data` |
 | [工具方法](utility.md) | 股票名称、搜索 | `get_stock_name`, `search_stocks` |
-| [数据下载](download.md) | 触发下载任务 | `download_batch`, `download_financial` |
+| [数据下载](download.md) | 触发下载任务 | `create_history_download_job`, `get_history_download_job` |
 | [系统元数据](meta.md) | 版本、状态 | `health_check`, `get_markets` |
 | [交易](trading.md) | 下单、撤单、查询 | `place_order`, `cancel_order`, `query_positions` |
 | [融资融券](credit.md) | 信用交易 | `credit_order`, `query_credit_positions` |

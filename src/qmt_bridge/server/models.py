@@ -1,6 +1,6 @@
 """QMT Bridge — Pydantic request/response models."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +75,7 @@ class OrderRequest(BaseModel):
     price: float = 0.0
     strategy_name: str = ""
     order_remark: str = ""
+    client_submit_id: str = Field(min_length=1, max_length=24)
 
 
 class CancelRequest(BaseModel):
@@ -87,6 +88,7 @@ class CancelRequest(BaseModel):
 class QueryOrderRequest(BaseModel):
     account_id: str = ""
     cancelable_only: bool = False
+    client_submit_id: str = Field(default="", max_length=24)
 
 
 class QueryPositionRequest(BaseModel):

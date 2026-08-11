@@ -14,6 +14,15 @@ if exist "%PID_FILE%" (
 echo [QMT Bridge] 启动服务 (前台模式)...
 echo [QMT Bridge] 按 Ctrl+C 停止
 
+set "HTTP_PROXY="
+set "HTTPS_PROXY="
+set "ALL_PROXY="
+set "http_proxy="
+set "https_proxy="
+set "all_proxy="
+set "NO_PROXY=*"
+set "no_proxy=*"
+
 qmt-server %*
 goto :eof
 

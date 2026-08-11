@@ -1,4 +1,4 @@
-"""数据下载 — 批量下载、快捷下载。"""
+"""数据下载 — 历史下载任务、快捷下载。"""
 
 import sys
 from pathlib import Path
@@ -13,10 +13,10 @@ st.title("数据下载")
 
 client = require_client()
 
-# ── 批量下载 ──────────────────────────────────────────────────────
+# ── 历史下载任务 ──────────────────────────────────────────────────
 
-st.header("批量下载")
-st.caption("触发服务端下载历史 K 线数据到本地缓存，下载完成后可通过 get_local_data 快速读取。")
+st.header("历史下载任务")
+st.caption("提交服务端历史 K 线下载任务，下载完成后可通过 get_local_data 快速读取。")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -30,24 +30,47 @@ with col2:
     dl_period = st.selectbox("K 线周期", ["1d", "1w", "1m", "5m", "15m", "30m", "60m"], key="dl_period")
     dl_start = st.text_input("开始日期 (YYYYMMDD)", value="", key="dl_start")
     dl_end = st.text_input("结束日期 (YYYYMMDD)", value="", key="dl_end")
+    dl_batch_size = st.number_input("每批股票数", min_value=1, max_value=100, value=10, step=1, key="dl_batch_size")
+    dl_max_attempts = st.number_input("单股最大尝试次数", min_value=1, max_value=5, value=2, step=1, key="dl_max_attempts")
 
-if st.button("开始批量下载", key="btn_batch_download", type="primary"):
+if st.button("提交历史下载任务", key="btn_history_download_job", type="primary"):
     codes = [c.strip() for line in dl_stocks.split("\n") for c in line.split(",") if c.strip()]
     if not codes:
         st.warning("请输入至少一个股票代码。")
     else:
         try:
-            with st.spinner(f"正在下载 {len(codes)} 只股票的 {dl_period} 数据..."):
-                result = client.download_batch(
+            with st.spinner(f"正在提交 {len(codes)} 只股票的 {dl_period} 下载任务..."):
+                result = client.create_history_download_job(
                     codes,
                     period=dl_period,
                     start_time=dl_start,
                     end_time=dl_end,
+                    batch_size=int(dl_batch_size),
+                    max_attempts=int(dl_max_attempts),
                 )
-            st.success("下载完成")
+            st.success(f"任务已提交: {result.get('job_id')}")
             st.json(result)
         except Exception as e:
-            st.error(f"下载失败: {e}")
+            st.error(f"提交失败: {e}")
+
+job_id = st.text_input("查询历史下载任务 ID", value="", key="download_job_id")
+if st.button("查询任务状态", key="btn_get_download_job"):
+    if not job_id.strip():
+        st.warning("请输入任务 ID。")
+    else:
+        try:
+            st.json(client.get_history_download_job(job_id.strip()))
+        except Exception as e:
+            st.error(f"查询失败: {e}")
+
+if st.button("取消任务", key="btn_cancel_download_job"):
+    if not job_id.strip():
+        st.warning("请输入任务 ID。")
+    else:
+        try:
+            st.json(client.cancel_history_download_job(job_id.strip()))
+        except Exception as e:
+            st.error(f"取消失败: {e}")
 
 st.markdown("---")
 

@@ -1,22 +1,24 @@
 """Router — System metadata endpoints /api/meta/*."""
 
-from fastapi import APIRouter, Query
-from xtquant import xtdata
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse
 
-from ..helpers import _numpy_to_python
+from ..bigqmt import BIGQMT_UPSTREAM_SHA, BIGQMT_UPSTREAM_VERSION, xtdata
+from ..binary_cache import get_binary_cache
+from ..helpers import _call_xtdata_serialized, _numpy_to_python
 
 router = APIRouter(prefix="/api/meta", tags=["meta"])
 
 
 @router.get("/markets")
 def get_markets():
-    raw = xtdata.get_markets()
+    raw = _call_xtdata_serialized(xtdata.get_markets)
     return {"markets": _numpy_to_python(raw)}
 
 
 @router.get("/periods")
 def get_periods():
-    raw = xtdata.get_period_list()
+    raw = _call_xtdata_serialized(xtdata.get_period_list)
     return {"periods": _numpy_to_python(raw)}
 
 
@@ -27,7 +29,10 @@ def get_stock_list(
         description="证券类别，如 沪深A股 / 上证A股 / 深证A股 / 北证A股 / 沪深ETF / 沪深指数",
     ),
 ):
-    stock_list = xtdata.get_stock_list_in_sector(category)
+    stock_list = _call_xtdata_serialized(
+        xtdata.get_stock_list_in_sector,
+        category,
+    )
     return {"category": category, "count": len(stock_list), "stocks": stock_list}
 
 
@@ -35,7 +40,7 @@ def get_stock_list(
 def get_last_trade_date(
     market: str = Query(..., description="市场代码，如 SH / SZ"),
 ):
-    date = xtdata.get_market_last_trade_date(market)
+    date = _call_xtdata_serialized(xtdata.get_market_last_trade_date, market)
     return {"market": market, "last_trade_date": date}
 
 
@@ -54,36 +59,94 @@ def get_server_version():
 
 @router.get("/xtdata_version")
 def get_xtdata_version():
-    """Get xtquant/xtdata library version."""
-    try:
-        import xtquant
-        version = getattr(xtquant, "__version__", "unknown")
-    except Exception:
-        version = "unknown"
-    return {"xtdata_version": version}
+    return {
+        "xtdata_version": BIGQMT_UPSTREAM_VERSION,
+        "runtime": "bigqmt",
+        "upstream_sha": BIGQMT_UPSTREAM_SHA,
+    }
 
 
 @router.get("/connection_status")
-def get_connection_status():
-    """Check xtdata connection status."""
+def get_connection_status(request: Request):
+    runtime = getattr(request.app.state, "bigqmt_runtime", None)
+    if runtime is None:
+        return {
+            "connected": False,
+            "error": getattr(request.app.state, "bigqmt_runtime_error", None),
+        }
     try:
-        status = xtdata.get_client().get_connect_status()
-        return {"connected": status}
+        runtime.probe()
+        return {"connected": True, **runtime.readiness()}
     except Exception as e:
         return {"connected": False, "error": str(e)}
 
 
 @router.get("/health")
-def health_check():
+def health_check(request: Request):
     """Simple health check endpoint."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "runtime": "bigqmt",
+        "runtime_initialized": getattr(
+            request.app.state, "bigqmt_runtime", None
+        )
+        is not None,
+    }
+
+
+@router.get("/readiness")
+def readiness_check(request: Request):
+    runtime = getattr(request.app.state, "bigqmt_runtime", None)
+    if runtime is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unavailable",
+                "ready": False,
+                "runtime": "bigqmt",
+                "error": getattr(
+                    request.app.state, "bigqmt_runtime_error", None
+                ),
+            },
+        )
+    try:
+        runtime.probe()
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unavailable",
+                "ready": False,
+                **runtime.readiness(),
+                "error": f"{exc.__class__.__name__}: {exc}",
+            },
+        )
+    manager = getattr(request.app.state, "trader_manager", None)
+    payload = {
+        "status": "ready",
+        **runtime.readiness(),
+        "account_queries_enabled": manager is not None,
+        "order_writes_enabled": bool(
+            getattr(manager, "writes_enabled", False)
+        ),
+        "write_blockers": list(
+            getattr(manager, "write_blockers", ["account_manager_unavailable"])
+        ),
+    }
+    return payload
+
+
+@router.get("/binary_cache")
+def get_binary_cache_stats():
+    """Return local binary cache configuration and size counters."""
+    return get_binary_cache().stats()
 
 
 @router.get("/quote_server_status")
 def get_quote_server_status():
     """Get detailed quote server connection status."""
     try:
-        status = xtdata.get_quote_server_status()
-        return {"data": _numpy_to_python(status)}
+        status = _call_xtdata_serialized(xtdata.get_markets)
+        return {"status": "ok", "data": _numpy_to_python(status)}
     except Exception as e:
         return {"error": str(e)}

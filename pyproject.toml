@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "qmt-bridge"
 dynamic = ["version"]
-description = "HTTP/WebSocket bridge for miniQMT (xtquant) — market data & trading API"
+description = "HTTP/WebSocket bridge for Big QMT ZMQ market data and guarded account APIs"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -34,6 +34,7 @@ server = [
     "uvicorn[standard]>=0.20",
     "pandas>=1.5",
     "numpy>=1.23",
+    "pyzmq>=25.0.0",
 ]
 pandas = ["pandas>=1.5"]
 ws = ["websockets>=11.0"]
@@ -65,7 +66,20 @@ Repository = "https://github.com/atompilot/qmt-bridge"
 path = "src/qmt_bridge/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/qmt_bridge"]
+packages = ["src/qmt_bridge", "src/bigqmt_signal_trader"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/qmt_bridge", "tests", "README.md", "LICENSE", "pyproject.toml"]
+include = [
+    "src/qmt_bridge",
+    "src/bigqmt_signal_trader",
+    "src/bigqmt_signal_trader_strategy.py",
+    "src/bigqmt_signal_trader_redis_rpc_runtime.py",
+    "src/BIGQMT_REDIS_DRYRUN.py",
+    "src/MECOSTOCK_BIGQMT_ZMQ.py",
+    "third_party/xtquant_big_convert.UPSTREAM.json",
+    "scripts/install-bigqmt-runtime.ps1",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]

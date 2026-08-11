@@ -4,6 +4,8 @@ import json
 import urllib.request
 from typing import Optional
 
+from qmt_bridge.no_proxy import urlopen_direct
+
 
 class BaseClient:
     """Lightweight HTTP/WebSocket client for QMT Bridge server.
@@ -12,12 +14,12 @@ class BaseClient:
     and ``_headers`` helpers.
     """
 
-    def __init__(self, host: str, port: int = 8000, *, api_key: str = ""):
+    def __init__(self, host: str, port: int = 13543, *, api_key: str = ""):
         """初始化客户端连接。
 
         Args:
             host: QMT Bridge 服务端 IP 地址或主机名，如 ``"192.168.1.100"``
-            port: 服务端口，默认 8000
+            port: 服务端口，默认 13543
             api_key: API Key，交易端点需要认证时必填
         """
         self.base_url = f"http://{host}:{port}"
@@ -47,7 +49,7 @@ class BaseClient:
         else:
             url = f"{self.base_url}{path}"
         req = urllib.request.Request(url, headers=self._headers())
-        with urllib.request.urlopen(req) as resp:
+        with urlopen_direct(req) as resp:
             return json.loads(resp.read().decode())
 
     def _post(self, path: str, body: dict) -> dict:
@@ -56,7 +58,7 @@ class BaseClient:
         data = json.dumps(body).encode()
         headers = {"Content-Type": "application/json", **self._headers()}
         req = urllib.request.Request(url, data=data, headers=headers)
-        with urllib.request.urlopen(req) as resp:
+        with urlopen_direct(req) as resp:
             return json.loads(resp.read().decode())
 
     def _delete(self, path: str, params: Optional[dict] = None) -> dict:
@@ -71,7 +73,7 @@ class BaseClient:
         else:
             url = f"{self.base_url}{path}"
         req = urllib.request.Request(url, method="DELETE", headers=self._headers())
-        with urllib.request.urlopen(req) as resp:
+        with urlopen_direct(req) as resp:
             return json.loads(resp.read().decode())
 
     def _to_dataframes(self, data: dict) -> dict:

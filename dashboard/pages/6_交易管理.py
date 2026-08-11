@@ -44,7 +44,12 @@ with tab1:
             key="price_type",
         )
         price = st.number_input("委托价格（限价时填写）", value=0.0, step=0.01, key="order_price")
-        order_remark = st.text_input("备注（可选）", value="", key="order_remark")
+        client_submit_id = st.text_input(
+            "稳定提交标识（必填，最多 24 个字符）",
+            value="",
+            max_chars=24,
+            key="client_submit_id",
+        )
 
     # 两步确认：先勾选确认框，再点击提交
     order_confirm = st.checkbox("我确认提交此委托", value=False, key="order_confirm")
@@ -52,6 +57,8 @@ with tab1:
     if st.button("提交委托", key="btn_order", type="primary"):
         if not order_stock:
             st.warning("请输入股票代码。")
+        elif not client_submit_id.strip():
+            st.warning("请输入稳定提交标识；同一逻辑委托重试时必须复用该标识。")
         elif not order_confirm:
             direction = "买入" if order_type == 23 else "卖出"
             st.warning(f"即将 **{direction} {order_stock}**，数量 **{order_volume}** 股。请先勾选确认框。")
@@ -62,9 +69,9 @@ with tab1:
                         stock_code=order_stock,
                         order_type=order_type,
                         order_volume=order_volume,
+                        client_submit_id=client_submit_id.strip(),
                         price_type=price_type,
                         price=price,
-                        order_remark=order_remark,
                     )
                 st.success("委托已提交")
                 st.json(result)

@@ -4,9 +4,9 @@ import asyncio
 import json
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from xtquant import xtdata
+from ..bigqmt import xtdata
 
-from ..helpers import _numpy_to_python
+from ..helpers import _call_xtdata_serialized, _numpy_to_python
 
 router = APIRouter()
 
@@ -14,31 +14,40 @@ router = APIRouter()
 @router.websocket("/ws/whole_quote")
 async def ws_whole_quote(ws: WebSocket):
     await ws.accept()
-    seq_id = None
-    loop = asyncio.get_event_loop()
-
     try:
         msg = await ws.receive_text()
         payload = json.loads(msg)
         code_list: list[str] = payload.get("codes", [])
-
-        async def _send(data):
-            try:
-                await ws.send_json(data)
-            except Exception:
-                pass
-
-        def on_data(data):
-            clean = _numpy_to_python(data)
-            asyncio.run_coroutine_threadsafe(_send(clean), loop)
-
-        seq_id = xtdata.subscribe_whole_quote(code_list, callback=on_data)
-
+        interval = min(max(float(payload.get("interval_seconds", 3.0)), 3.0), 60.0)
+        if not code_list:
+            await ws.send_json(
+                {"status": "error", "reason": "codes_required"}
+            )
+            await ws.close(code=1008)
+            return
         while True:
-            await ws.receive_text()
-
+            data = await asyncio.to_thread(
+                _call_xtdata_serialized,
+                xtdata.get_full_tick,
+                code_list=code_list,
+            )
+            await ws.send_json(
+                {
+                    "type": "snapshot",
+                    "mode": "bigqmt_polling",
+                    "data": _numpy_to_python(data),
+                }
+            )
+            try:
+                control = await asyncio.wait_for(
+                    ws.receive_text(), timeout=interval
+                )
+            except asyncio.TimeoutError:
+                continue
+            if control:
+                message = json.loads(control)
+                if message.get("action") in {"close", "unsubscribe"}:
+                    await ws.close()
+                    return
     except WebSocketDisconnect:
         pass
-    finally:
-        if seq_id is not None:
-            xtdata.unsubscribe_quote(seq_id)

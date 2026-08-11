@@ -4,9 +4,9 @@ import asyncio
 import json
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from xtquant import xtdata
+from ..bigqmt import xtdata
 
-from ..helpers import _numpy_to_python
+from ..helpers import _call_xtdata_serialized, _numpy_to_python
 
 router = APIRouter()
 
@@ -14,42 +14,42 @@ router = APIRouter()
 @router.websocket("/ws/realtime")
 async def ws_realtime(ws: WebSocket):
     await ws.accept()
-    seq_ids: list[int] = []
-    loop = asyncio.get_event_loop()
-
     try:
-        # Wait for subscription request
         msg = await ws.receive_text()
         payload = json.loads(msg)
         stocks: list[str] = payload.get("stocks", [])
         period: str = payload.get("period", "tick")
-
-        async def _send(data):
-            try:
-                await ws.send_json(data)
-            except Exception:
-                pass
-
-        def on_data(data):
-            """Callback invoked by xtdata in its own thread."""
-            clean = _numpy_to_python(data)
-            asyncio.run_coroutine_threadsafe(_send(clean), loop)
-
-        # Subscribe each stock
-        for stock in stocks:
-            seq = xtdata.subscribe_quote(
-                stock_code=stock,
-                period=period,
-                callback=on_data,
+        interval = min(max(float(payload.get("interval_seconds", 1.0)), 0.2), 60.0)
+        if not stocks:
+            await ws.send_json(
+                {"status": "error", "reason": "stocks_required"}
             )
-            seq_ids.append(seq)
-
-        # Keep connection alive until client disconnects
+            await ws.close(code=1008)
+            return
         while True:
-            await ws.receive_text()
-
+            data = await asyncio.to_thread(
+                _call_xtdata_serialized,
+                xtdata.get_full_tick,
+                code_list=stocks,
+            )
+            await ws.send_json(
+                {
+                    "type": "snapshot",
+                    "mode": "bigqmt_polling",
+                    "period": period,
+                    "data": _numpy_to_python(data),
+                }
+            )
+            try:
+                control = await asyncio.wait_for(
+                    ws.receive_text(), timeout=interval
+                )
+            except asyncio.TimeoutError:
+                continue
+            if control:
+                message = json.loads(control)
+                if message.get("action") in {"close", "unsubscribe"}:
+                    await ws.close()
+                    return
     except WebSocketDisconnect:
         pass
-    finally:
-        for seq in seq_ids:
-            xtdata.unsubscribe_quote(seq)

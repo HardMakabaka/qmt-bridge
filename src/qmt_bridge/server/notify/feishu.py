@@ -34,7 +34,7 @@ class FeishuWebhookBackend(NotifierBackend):
     async def start(self) -> None:
         import httpx
 
-        self._client = httpx.AsyncClient(timeout=10.0)
+        self._client = httpx.AsyncClient(timeout=10.0, trust_env=False)
 
     async def stop(self) -> None:
         if self._client is not None:

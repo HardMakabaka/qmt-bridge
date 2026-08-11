@@ -17,6 +17,15 @@ if exist "%PID_FILE%" (
 
 echo [QMT Bridge] 启动服务 (后台模式)...
 
+set "HTTP_PROXY="
+set "HTTPS_PROXY="
+set "ALL_PROXY="
+set "http_proxy="
+set "https_proxy="
+set "all_proxy="
+set "NO_PROXY=*"
+set "no_proxy=*"
+
 REM 使用 PowerShell 以隐藏窗口方式启动进程
 powershell -NoProfile -Command ^
   "$p = Start-Process -FilePath qmt-server -ArgumentList '%*' ^

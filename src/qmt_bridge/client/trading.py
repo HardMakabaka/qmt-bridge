@@ -14,6 +14,8 @@ class TradingMixin:
         strategy_name: str = "",
         order_remark: str = "",
         account_id: str = "",
+        *,
+        client_submit_id: str,
     ) -> dict:
         """委托下单。
 
@@ -21,6 +23,7 @@ class TradingMixin:
             stock_code: 股票代码，如 ``"000001.SZ"``
             order_type: 委托类型，23=买入, 24=卖出
             order_volume: 委托数量（股）
+            client_submit_id: 调用方稳定委托标识，最长 24 个字符
             price_type: 报价类型，5=最新价, 11=限价等
             price: 委托价格（限价时必填）
             strategy_name: 策略名称（可选）
@@ -37,8 +40,9 @@ class TradingMixin:
             "price_type": price_type,
             "price": price,
             "strategy_name": strategy_name,
-            "order_remark": order_remark,
+            "order_remark": client_submit_id or order_remark,
             "account_id": account_id,
+            "client_submit_id": client_submit_id,
         })
 
     def cancel_order(
@@ -65,7 +69,12 @@ class TradingMixin:
             payload["market"] = market
         return self._post("/api/trading/cancel", payload)
 
-    def query_orders(self, account_id: str = "", cancelable_only: bool = False) -> dict:
+    def query_orders(
+        self,
+        account_id: str = "",
+        cancelable_only: bool = False,
+        client_submit_id: str = "",
+    ) -> dict:
         """查询当日委托列表。
 
         Args:
@@ -75,6 +84,7 @@ class TradingMixin:
         return self._get("/api/trading/orders", {
             "account_id": account_id,
             "cancelable_only": cancelable_only,
+            "client_submit_id": client_submit_id,
         })
 
     def query_positions(self, account_id: str = "") -> dict:

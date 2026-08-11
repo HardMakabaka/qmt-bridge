@@ -1,5 +1,8 @@
 """QMT Bridge — data conversion helpers."""
 
+import math
+import threading
+
 import numpy as np
 import pandas as pd
 
@@ -44,9 +47,79 @@ _OBJECT_FIELDS = (
     "m_dTradedPrice",
 )
 
+_XTDATA_LOCK_POLL_SECONDS = 0.005
+
+
+class XtdataCallCancelledError(RuntimeError):
+    pass
+
+
+class XtdataTransportStuckError(RuntimeError):
+    pass
+
+
+class _XtdataTransportCoordinator:
+    def __init__(self) -> None:
+        self._call_lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._stuck_reason: str | None = None
+
+    def call(self, cancel_event, function, *args, **kwargs):
+        while True:
+            self._raise_if_unavailable(cancel_event)
+            if self._call_lock.acquire(timeout=_XTDATA_LOCK_POLL_SECONDS):
+                break
+        try:
+            self._raise_if_unavailable(cancel_event)
+            return function(*args, **kwargs)
+        finally:
+            self._call_lock.release()
+
+    def mark_stuck(self, reason: str) -> None:
+        with self._state_lock:
+            if self._stuck_reason is None:
+                self._stuck_reason = reason
+
+    def reset_for_tests(self) -> None:
+        with self._state_lock:
+            self._stuck_reason = None
+
+    def _raise_if_unavailable(self, cancel_event) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise XtdataCallCancelledError(
+                "xtdata call canceled before transport entry"
+            )
+        with self._state_lock:
+            stuck_reason = self._stuck_reason
+        if stuck_reason is not None:
+            raise XtdataTransportStuckError(
+                f"xtdata transport unavailable until bridge restart: {stuck_reason}"
+            )
+
+
+_XTDATA_TRANSPORT = _XtdataTransportCoordinator()
+
+
+def _call_xtdata_serialized(function, *args, **kwargs):
+    return _XTDATA_TRANSPORT.call(None, function, *args, **kwargs)
+
+
+def _call_xtdata_serialized_cancellable(cancel_event, function, *args, **kwargs):
+    return _XTDATA_TRANSPORT.call(cancel_event, function, *args, **kwargs)
+
+
+def _mark_xtdata_transport_stuck(reason: str) -> None:
+    _XTDATA_TRANSPORT.mark_stuck(reason)
+
+
+def _reset_xtdata_transport_for_tests() -> None:
+    _XTDATA_TRANSPORT.reset_for_tests()
+
 
 def _numpy_to_python(obj):
     """Recursively convert numpy types in a nested structure to Python types."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
     if isinstance(obj, dict):
         return {k: _numpy_to_python(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -56,7 +129,8 @@ def _numpy_to_python(obj):
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
-        return float(obj)
+        value = float(obj)
+        return value if math.isfinite(value) else None
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
     if hasattr(obj, "_asdict"):
@@ -67,6 +141,72 @@ def _numpy_to_python(obj):
     if object_fields:
         return object_fields
     return obj
+
+
+def _exception_status(exc: Exception) -> str:
+    message = str(exc)
+    if (
+        isinstance(exc, AttributeError)
+        or "function not realize" in message
+        or "未支持此功能" in message
+    ):
+        return "unsupported"
+    return "error"
+
+
+def _status_payload(
+    status: str,
+    *,
+    data=None,
+    reason: str = "",
+    function: str = "",
+    **extra,
+):
+    """Build a stable JSON payload for optional QMT functions."""
+    payload = {
+        "status": status,
+        "data": _numpy_to_python(data),
+    }
+    if reason:
+        payload["reason"] = reason
+    if function:
+        payload["function"] = function
+    payload.update(extra)
+    return payload
+
+
+def _call_xtdata_optional(
+    xtdata_module,
+    function_name: str,
+    *args,
+    missing_reason: str | None = None,
+    unavailable_when_none: bool = False,
+    **kwargs,
+):
+    """Call an optional xtdata function and never disguise support gaps as data."""
+    func = getattr(xtdata_module, function_name, None)
+    if not callable(func):
+        return _status_payload(
+            "unsupported",
+            reason=missing_reason or f"xtdata_{function_name}_missing",
+            function=function_name,
+        )
+    try:
+        raw = _call_xtdata_serialized(func, *args, **kwargs)
+    except Exception as exc:
+        return _status_payload(
+            _exception_status(exc),
+            reason=str(exc),
+            function=function_name,
+            error_type=exc.__class__.__name__,
+        )
+    if raw is None and unavailable_when_none:
+        return _status_payload(
+            "unavailable",
+            reason=f"xtdata_{function_name}_returned_none",
+            function=function_name,
+        )
+    return _status_payload("ok", data=raw, function=function_name)
 
 
 def _market_data_to_records(
@@ -87,8 +227,9 @@ def _market_data_to_records(
             if stock in df.index:
                 for date, value in df.loc[stock].items():
                     entry = rows.setdefault(str(date), {"date": str(date)})
-                    entry[field] = value.item() if hasattr(value, "item") else value
-        result[stock] = list(rows.values())
+                    raw_value = value.item() if hasattr(value, "item") else value
+                    entry[field] = _numpy_to_python(raw_value)
+        result[stock] = [_numpy_to_python(row) for row in rows.values()]
     return result
 
 

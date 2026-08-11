@@ -1,5 +1,7 @@
 """Router — Trading endpoints /api/trading/* (requires API Key)."""
 
+import logging
+
 from fastapi import APIRouter, Depends, Request
 
 from ..config import get_settings
@@ -19,6 +21,59 @@ from ..models import (
 from ..security import require_api_key
 
 router = APIRouter(prefix="/api/trading", tags=["trading"], dependencies=[Depends(require_api_key)])
+logger = logging.getLogger("qmt_bridge.trading")
+
+
+def _broker_order_receipt(value) -> str | None:
+    normalized = str(value or "").strip()
+    if normalized.lower() in {"", "-1", "0", "none", "null", "nan"}:
+        return None
+    return normalized
+
+
+def _place_order_payload(req: OrderRequest, manager) -> dict:
+    logger.info("QMT order submit request client_submit_id=%s", req.client_submit_id)
+    try:
+        result = manager.order(
+            stock_code=req.stock_code,
+            order_type=req.order_type,
+            order_volume=req.order_volume,
+            price_type=req.price_type,
+            price=req.price,
+            strategy_name=req.strategy_name,
+            order_remark=req.client_submit_id,
+            account_id=req.account_id,
+        )
+    except Exception:
+        logger.warning(
+            "QMT order response unknown client_submit_id=%s",
+            req.client_submit_id,
+            exc_info=True,
+        )
+        raise
+    broker_order_id = _broker_order_receipt(result)
+    if broker_order_id is None:
+        payload = {
+            "client_submit_id": req.client_submit_id,
+            "order_remark": req.client_submit_id,
+            "status": "submit_unknown",
+            "reason": "broker_receipt_missing",
+        }
+    else:
+        payload = {
+            "client_submit_id": req.client_submit_id,
+            "order_remark": req.client_submit_id,
+            "broker_order_id": result,
+            "order_id": result,
+            "status": "submitted",
+        }
+    logger.info(
+        "QMT order submit result client_submit_id=%s broker_order_id=%s status=%s",
+        req.client_submit_id,
+        broker_order_id,
+        payload["status"],
+    )
+    return payload
 
 
 def _manager_account_id(manager) -> str:
@@ -42,7 +97,7 @@ def trading_health(request: Request):
     """Return MeCoStock-compatible trading write readiness."""
     settings = getattr(request.app.state, "settings", None) or get_settings()
     manager = getattr(request.app.state, "trader_manager", None)
-    trading_config_enabled = bool(getattr(settings, "trading_enabled", False))
+    account_config_enabled = bool(getattr(settings, "account_enabled", False))
     account_id = _manager_account_id(manager) or str(getattr(settings, "trading_account_id", "") or "")
 
     supports = {
@@ -53,29 +108,29 @@ def trading_health(request: Request):
     }
     payload = {
         "status": "ok" if manager is not None else "unavailable",
-        "enabled": trading_config_enabled and manager is not None,
+        "enabled": account_config_enabled and manager is not None,
         "authenticated": manager is not None,
         "account_authenticated": manager is not None and bool(account_id),
         "order_supported": manager is not None,
         "cancel_supported": manager is not None,
         "write_enabled": False,
         "write_blockers": [],
-        "mode": "guarded_read_write_routes_registered" if manager is not None else "trading_manager_unavailable",
+        "mode": "bigqmt_account_query_guarded_writes" if manager is not None else "bigqmt_account_unavailable",
         "account_id": account_id,
         "broker_account_id": account_id,
         "funds_account_id": account_id,
         "supports": supports,
     }
     if manager is None:
-        payload["code"] = "QMT_TRADING_CONNECT_FAILED" if trading_config_enabled else "QMT_TRADING_MODULE_DISABLED"
+        payload["code"] = "QMT_TRADING_CONNECT_FAILED" if account_config_enabled else "QMT_TRADING_MODULE_DISABLED"
         payload["reason"] = (
-            "QMT trading manager is not connected."
-            if trading_config_enabled
-            else "QMT bridge was started without trading module enabled."
+            "Big QMT account manager is not connected."
+            if account_config_enabled
+            else "QMT bridge was started without account query routes enabled."
         )
         payload["write_blockers"] = (
-            ["xttrader_connect_failed"]
-            if trading_config_enabled
+            ["bigqmt_rpc_connect_failed"]
+            if account_config_enabled
             else ["qmt_trading_module_disabled"]
         )
         return payload
@@ -84,24 +139,32 @@ def trading_health(request: Request):
         payload["reason"] = "QMT trading account id is not configured."
         payload["write_blockers"] = ["qmt_trading_account_missing"]
         return payload
-    payload["write_enabled"] = True
+    payload["write_enabled"] = bool(getattr(manager, "writes_enabled", False))
+    payload["write_blockers"] = list(
+        getattr(manager, "write_blockers", ["bridge_order_writes_disabled"])
+    )
+    runtime = getattr(manager, "runtime", None)
+    if runtime is not None:
+        payload["rpc_revision"] = runtime.ping_payload.get("rpc_revision")
+        payload["qmt_trade_mode"] = str(
+            runtime.ping_payload.get("qmt_trade_mode") or "unknown"
+        )
+        payload["terminal_real_mode"] = (
+            runtime.ping_payload.get("terminal_real_mode") is True
+        )
+        payload["terminal_mode_source"] = runtime.ping_payload.get(
+            "terminal_mode_source"
+        )
+        payload["upstream_order_writes_enabled"] = bool(
+            runtime.ping_payload.get("allow_order_methods", False)
+        )
     return payload
 
 
 @router.post("/order")
 def place_order(req: OrderRequest, manager=Depends(get_trader_manager)):
     """Place a new order."""
-    result = manager.order(
-        stock_code=req.stock_code,
-        order_type=req.order_type,
-        order_volume=req.order_volume,
-        price_type=req.price_type,
-        price=req.price,
-        strategy_name=req.strategy_name,
-        order_remark=req.order_remark,
-        account_id=req.account_id,
-    )
-    return {"order_id": result, "status": "submitted"}
+    return _place_order_payload(req, manager)
 
 
 @router.post("/cancel")
@@ -131,11 +194,22 @@ def cancel_order(req: CancelRequest, manager=Depends(get_trader_manager)):
 def query_orders(
     account_id: str = "",
     cancelable_only: bool = False,
+    client_submit_id: str = "",
     manager=Depends(get_trader_manager),
 ):
     """Query current orders."""
-    result = manager.query_orders(account_id=account_id, cancelable_only=cancelable_only)
-    return {"data": _numpy_to_python(result)}
+    result = manager.query_orders(
+        account_id=account_id,
+        cancelable_only=cancelable_only,
+        client_submit_id=client_submit_id,
+    )
+    if client_submit_id:
+        logger.info(
+            "QMT order reconcile query client_submit_id=%s match_count=%s",
+            client_submit_id,
+            len(result or []),
+        )
+    return {"client_submit_id": client_submit_id or None, "data": _numpy_to_python(result)}
 
 
 @router.get("/positions")
@@ -193,18 +267,23 @@ def batch_order(orders: list[OrderRequest], manager=Depends(get_trader_manager))
     """Place multiple orders at once."""
     results = []
     for req in orders:
-        result = manager.order(
-            stock_code=req.stock_code,
-            order_type=req.order_type,
-            order_volume=req.order_volume,
-            price_type=req.price_type,
-            price=req.price,
-            strategy_name=req.strategy_name,
-            order_remark=req.order_remark,
-            account_id=req.account_id,
-        )
-        results.append({"stock_code": req.stock_code, "order_id": result})
-    return {"data": results}
+        try:
+            results.append(_place_order_payload(req, manager))
+        except Exception as exc:
+            results.append(
+                {
+                    "stock_code": req.stock_code,
+                    "client_submit_id": req.client_submit_id,
+                    "order_remark": req.client_submit_id,
+                    "status": "submit_unknown",
+                    "reason": str(exc),
+                }
+            )
+    statuses = {item["status"] for item in results}
+    return {
+        "status": "completed" if statuses == {"submitted"} else "partial",
+        "results": results,
+    }
 
 
 @router.post("/batch_cancel")
@@ -434,11 +513,20 @@ def export_data(req: ExportDataRequest, manager=Depends(get_trader_manager)):
 @router.get("/query_data")
 def query_data(
     data_type: str = "orders",
+    result_path: str = "",
+    start_time: str | None = None,
+    end_time: str | None = None,
     account_id: str = "",
     manager=Depends(get_trader_manager),
 ):
     """Query exported trading data."""
-    result = manager.query_data(data_type=data_type, account_id=account_id)
+    result = manager.query_data(
+        data_type=data_type,
+        result_path=result_path,
+        start_time=start_time,
+        end_time=end_time,
+        account_id=account_id,
+    )
     return {"data": _numpy_to_python(result)}
 
 

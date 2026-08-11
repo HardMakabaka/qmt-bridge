@@ -1,9 +1,9 @@
 """Router — Tick & L2 data endpoints /api/tick/*."""
 
 from fastapi import APIRouter, Query
-from xtquant import xtdata
+from ..bigqmt import xtdata
 
-from ..helpers import _numpy_to_python
+from ..helpers import _call_xtdata_serialized, _numpy_to_python
 
 router = APIRouter(prefix="/api/tick", tags=["tick"])
 
@@ -15,7 +15,8 @@ def get_l2_quote(
     end_time: str = Query("", description="结束时间"),
     count: int = Query(-1, description="返回条数"),
 ):
-    raw = xtdata.get_l2_quote(
+    raw = _call_xtdata_serialized(
+        xtdata.get_l2_quote,
         field_list=[],
         stock_code=stock,
         start_time=start_time,
@@ -32,7 +33,8 @@ def get_l2_order(
     end_time: str = Query("", description="结束时间"),
     count: int = Query(-1, description="返回条数"),
 ):
-    raw = xtdata.get_l2_order(
+    raw = _call_xtdata_serialized(
+        xtdata.get_l2_order,
         field_list=[],
         stock_code=stock,
         start_time=start_time,
@@ -49,7 +51,8 @@ def get_l2_transaction(
     end_time: str = Query("", description="结束时间"),
     count: int = Query(-1, description="返回条数"),
 ):
-    raw = xtdata.get_l2_transaction(
+    raw = _call_xtdata_serialized(
+        xtdata.get_l2_transaction,
         field_list=[],
         stock_code=stock,
         start_time=start_time,
@@ -72,7 +75,8 @@ def get_l2_thousand_quote(
     count: int = Query(-1, description="返回条数"),
 ):
     """Get L2 thousand-level quote (千档行情)."""
-    raw = xtdata.get_l2_thousand_quote(
+    raw = _call_xtdata_serialized(
+        xtdata.get_l2_thousand_quote,
         field_list=[],
         stock_code=stock,
         start_time=start_time,
@@ -90,7 +94,8 @@ def get_l2_thousand_orderbook(
     count: int = Query(-1, description="返回条数"),
 ):
     """Get L2 thousand-level order book."""
-    raw = xtdata.get_l2_thousand_orderbook(
+    raw = _call_xtdata_serialized(
+        xtdata.get_l2_thousand_orderbook,
         field_list=[],
         stock_code=stock,
         start_time=start_time,
@@ -108,7 +113,8 @@ def get_l2_thousand_trade(
     count: int = Query(-1, description="返回条数"),
 ):
     """Get L2 thousand-level trade data."""
-    raw = xtdata.get_l2_thousand_trade(
+    raw = _call_xtdata_serialized(
+        xtdata.get_l2_thousand_trade,
         field_list=[],
         stock_code=stock,
         start_time=start_time,

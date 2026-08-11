@@ -5,13 +5,14 @@
 ### Windows 端（服务端）
 
 - **Python** 3.10+
-- **QMT 客户端** — 已安装并获得券商账号密码（需联系客户经理开通 miniQMT 权限）
-- **xtquant** — 通常随 QMT 客户端安装，或 `pip install xtquant`
+- **Big QMT 客户端** — 已安装并获得模型运行权限；账户查询时需登录交易账户
+- **Big QMT 内嵌 Python** — 由安装器部署固定版本的 ZMQ 运行时
+- 外部 Python 环境不安装原生 `xtquant`
 
 ### 网络
 
 - Windows 和你的主力机在同一局域网下（连同一个路由器 / WiFi）
-- Windows 防火墙放行本项目使用的端口（默认 8000）
+- Windows 防火墙放行本项目使用的端口（默认 13543）
 
 ## 1. 安装
 
@@ -36,6 +37,20 @@ pip install -e .
 pip install -e ".[client]"
 ```
 
+QMT 关闭时安装终端内运行时：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-bigqmt-runtime.ps1 `
+  -QmtRoot "C:\国金证券QMT交易端" `
+  -AccountId "12345678"
+```
+
+首次输出 `compiled_model_ready=false` 时，在 QMT 中创建
+`MECOSTOCK_BIGQMT_ZMQ` Python 策略，粘贴 `src/MECOSTOCK_BIGQMT_ZMQ.py`，
+取消勾选“启动本地python”并编译。关闭 QMT 后重新运行安装器，确认
+`compiled_model_ready=true` 和 `embedded_python_mode=true`。终端启动自动
+运行由 QMT 自己的策略运行设置管理，不要把 `simpleRun` 当作自动运行开关。
+
 ## 2. 配置
 
 ```bash
@@ -47,7 +62,7 @@ cp .env.example .env
 
 ## 3. 启动 QMT 客户端
 
-打开 QMT，勾选 **"独立交易"** 模式登录，保持窗口运行（可最小化）。
+打开 Big QMT 并登录交易账户。需要真实委托能力时，把 `MECOSTOCK_BIGQMT_ZMQ` 的运行模式设为“实盘”并确认状态为“运行中”。API 会将模型返回的当前 request id 与 `userdata/log/XtClient_*.log` 匹配；日志不能证明 `m_bTrade=1` 时写请求会被拒绝。
 
 ## 4. 启动 API 服务
 
@@ -58,10 +73,11 @@ qmt-server
 # 自定义参数
 qmt-server --port 8080 --log-level debug
 
-# 启用交易模块
-qmt-server --trading --api-key your-secret-key \
-    --mini-qmt-path "C:\国金QMT交易端\userdata_mini" \
-    --account-id 12345678
+# Big QMT ZMQ + 账户查询；写能力默认开启，真实委托还需终端实盘证明
+qmt-server --qmt-root "C:\国金证券QMT交易端" \
+    --zmq-endpoint tcp://127.0.0.1:15560 \
+    --account-enabled --account-id 12345678 \
+    --api-key your-secret-key
 ```
 
 也可以使用脚本：
@@ -84,13 +100,13 @@ scripts\stop.bat
 在你的 Mac/Linux 浏览器中访问：
 
 ```
-http://<Windows局域网IP>:8000/docs
+http://<Windows局域网IP>:13543/docs
 ```
 
-看到 Swagger 文档页面即表示服务正常。也可以用 curl 检查：
+Swagger 只证明 HTTP 进程存活。运行验收必须检查 readiness：
 
 ```bash
-curl http://<Windows局域网IP>:8000/api/meta/health
+curl http://<Windows局域网IP>:13543/api/meta/readiness
 ```
 
 ## Python 客户端用法
@@ -98,7 +114,7 @@ curl http://<Windows局域网IP>:8000/api/meta/health
 ```python
 from qmt_bridge import QMTClient
 
-client = QMTClient(host="192.168.1.100", port=8000)
+client = QMTClient(host="192.168.1.100", port=13543)
 
 # 历史 K 线
 df = client.get_history("000001.SZ", period="1d", count=60)
@@ -144,11 +160,12 @@ order_id = client.place_order(
     stock_code="000001.SZ",
     order_type=23,        # 买入
     order_volume=100,
+    client_submit_id="manual-20260719-0001",
     price_type=5,         # 最新价
 )
 
 # 查询
-orders = client.query_orders()
+orders = client.query_orders(client_submit_id="manual-20260719-0001")
 positions = client.query_positions()
 asset = client.query_asset()
 

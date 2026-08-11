@@ -1,4 +1,5 @@
 import sys
+import threading
 import time
 from types import ModuleType, SimpleNamespace
 
@@ -267,6 +268,291 @@ def test_single_symbol_failure_is_recorded_without_blocking(monkeypatch):
     assert job["symbol_results"]["600599.SH"]["status"] == "error"
 
 
+def test_failed_batch_counts_as_first_attempt_before_symbol_retries(monkeypatch):
+    calls = []
+
+    def download_history_data2(stocks, *, period, start_time, end_time, callback):
+        calls.append(tuple(stocks))
+        raise RuntimeError("persistent provider failure")
+
+    monkeypatch.setattr(
+        download,
+        "xtdata",
+        SimpleNamespace(download_history_data2=download_history_data2),
+    )
+
+    created = download.create_history_download_job(
+        HistoryDownloadJobRequest(
+            stocks=["000001.SZ", "600000.SH"],
+            batch_size=2,
+            max_attempts=2,
+        )
+    )
+    job = _wait_job(created["job_id"])
+
+    assert job["status"] == "failed"
+    assert calls == [
+        ("000001.SZ", "600000.SH"),
+        ("000001.SZ",),
+        ("600000.SH",),
+    ]
+
+
+def test_history_download_job_clamps_untrusted_retry_limits(monkeypatch):
+    def download_history_data2(stocks, *, period, start_time, end_time, callback):
+        callback({"finished": len(stocks), "total": len(stocks)})
+        return {}
+
+    monkeypatch.setattr(
+        download,
+        "xtdata",
+        SimpleNamespace(download_history_data2=download_history_data2),
+    )
+
+    created = download.create_history_download_job(
+        HistoryDownloadJobRequest(
+            stocks=["000001.SZ"],
+            batch_size=10_000,
+            max_attempts=10_000,
+        )
+    )
+    job = _wait_job(created["job_id"])
+
+    assert job["status"] == "completed"
+    assert job["batch_size"] == 100
+    assert job["max_attempts"] == 5
+
+
+def test_history_download_does_not_split_while_timed_out_transport_is_still_active(
+    monkeypatch,
+):
+    release = threading.Event()
+    calls = []
+
+    def download_history_data2(stocks, *, period, start_time, end_time, callback):
+        calls.append(tuple(stocks))
+        release.wait(2)
+        return {}
+
+    monkeypatch.setattr(download, "DOWNLOAD_BATCH_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(download, "DOWNLOAD_NO_PROGRESS_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(download, "DOWNLOAD_STOP_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(
+        download,
+        "xtdata",
+        SimpleNamespace(
+            download_history_data2=download_history_data2,
+            get_client=lambda: SimpleNamespace(stop_supply_history_data2=lambda: None),
+        ),
+    )
+
+    created = download.create_history_download_job(
+        HistoryDownloadJobRequest(
+            stocks=["000001.SZ", "600000.SH"],
+            batch_size=2,
+            max_attempts=2,
+        )
+    )
+    worker_name = f"qmt-history-download-{created['job_id'][:8]}"
+    try:
+        job = _wait_job(created["job_id"])
+        active_workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == worker_name and thread.is_alive()
+        ]
+
+        assert job["status"] == "failed"
+        assert calls == [("000001.SZ", "600000.SH")]
+        assert len(active_workers) == 1
+        assert {
+            result["status"] for result in job["symbol_results"].values()
+        } == {"transport_stuck"}
+    finally:
+        release.set()
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            if not any(
+                thread.name == worker_name and thread.is_alive()
+                for thread in threading.enumerate()
+            ):
+                break
+            time.sleep(0.01)
+    assert not any(
+        thread.name == worker_name and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+def test_history_download_stops_after_split_retry_leaves_transport_active(monkeypatch):
+    release = threading.Event()
+    calls = []
+
+    def download_history_data2(stocks, *, period, start_time, end_time, callback):
+        calls.append(tuple(stocks))
+        if len(stocks) > 1:
+            raise RuntimeError("split this batch")
+        release.wait(2)
+        return {}
+
+    monkeypatch.setattr(download, "DOWNLOAD_BATCH_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(download, "DOWNLOAD_NO_PROGRESS_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(download, "DOWNLOAD_STOP_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(
+        download,
+        "xtdata",
+        SimpleNamespace(
+            download_history_data2=download_history_data2,
+            get_client=lambda: SimpleNamespace(stop_supply_history_data2=lambda: None),
+        ),
+    )
+
+    created = download.create_history_download_job(
+        HistoryDownloadJobRequest(
+            stocks=["000001.SZ", "600000.SH"],
+            batch_size=2,
+            max_attempts=3,
+        )
+    )
+    worker_name = f"qmt-history-download-{created['job_id'][:8]}"
+    try:
+        job = _wait_job(created["job_id"])
+        active_workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == worker_name and thread.is_alive()
+        ]
+
+        assert job["status"] == "failed"
+        assert calls == [
+            ("000001.SZ", "600000.SH"),
+            ("000001.SZ",),
+        ]
+        assert len(active_workers) == 1
+        assert {
+            result["status"] for result in job["symbol_results"].values()
+        } == {"transport_stuck"}
+    finally:
+        release.set()
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            if not any(
+                thread.name == worker_name and thread.is_alive()
+                for thread in threading.enumerate()
+            ):
+                break
+            time.sleep(0.01)
+    assert not any(
+        thread.name == worker_name and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+def test_queued_history_job_never_calls_xtdata_after_transport_is_stuck(monkeypatch):
+    release_first_call = threading.Event()
+    first_call_started = threading.Event()
+    calls = []
+
+    def download_history_data2(stocks, *, period, start_time, end_time, callback):
+        calls.append(tuple(stocks))
+        if stocks == ["000001.SZ"]:
+            first_call_started.set()
+            release_first_call.wait(2)
+        return {}
+
+    monkeypatch.setattr(download, "DOWNLOAD_BATCH_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(download, "DOWNLOAD_NO_PROGRESS_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(download, "DOWNLOAD_STOP_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(
+        download,
+        "xtdata",
+        SimpleNamespace(
+            download_history_data2=download_history_data2,
+            get_client=lambda: SimpleNamespace(stop_supply_history_data2=lambda: None),
+        ),
+    )
+
+    first = download.create_history_download_job(
+        HistoryDownloadJobRequest(
+            stocks=["000001.SZ"],
+            batch_size=1,
+            max_attempts=1,
+        )
+    )
+    assert first_call_started.wait(1)
+    queued = download.create_history_download_job(
+        HistoryDownloadJobRequest(
+            stocks=["600000.SH"],
+            batch_size=1,
+            max_attempts=1,
+        )
+    )
+
+    try:
+        first_job = _wait_job(first["job_id"])
+        queued_job = _wait_job(queued["job_id"])
+
+        assert first_job["status"] == "failed"
+        assert queued_job["status"] == "failed"
+        assert queued_job["symbol_results"]["600000.SH"]["status"] == "transport_stuck"
+        assert calls == [("000001.SZ",)]
+    finally:
+        release_first_call.set()
+
+    deadline = time.time() + 1
+    while time.time() < deadline:
+        if not any(
+            thread.name.startswith("qmt-history-download-") and thread.is_alive()
+            for thread in threading.enumerate()
+        ):
+            break
+        time.sleep(0.01)
+    assert calls == [("000001.SZ",)]
+
+
+def test_history_download_job_fails_after_success_when_transport_becomes_stuck(
+    monkeypatch,
+):
+    release_stuck_call = threading.Event()
+    calls = []
+
+    def download_history_data2(stocks, *, period, start_time, end_time, callback):
+        calls.append(tuple(stocks))
+        if stocks == ["600000.SH"]:
+            release_stuck_call.wait(2)
+        return {}
+
+    monkeypatch.setattr(download, "DOWNLOAD_BATCH_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(download, "DOWNLOAD_NO_PROGRESS_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(download, "DOWNLOAD_STOP_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(
+        download,
+        "xtdata",
+        SimpleNamespace(
+            download_history_data2=download_history_data2,
+            get_client=lambda: SimpleNamespace(stop_supply_history_data2=lambda: None),
+        ),
+    )
+
+    created = download.create_history_download_job(
+        HistoryDownloadJobRequest(
+            stocks=["000001.SZ", "600000.SH", "300750.SZ"],
+            batch_size=1,
+            max_attempts=1,
+        )
+    )
+    try:
+        job = _wait_job(created["job_id"])
+
+        assert job["status"] == "failed"
+        assert job["error"]
+        assert job["symbol_results"]["000001.SZ"]["status"] == "ok"
+        assert job["symbol_results"]["600000.SH"]["status"] == "transport_stuck"
+        assert job["symbol_results"]["300750.SZ"]["status"] == "transport_stuck"
+    finally:
+        release_stuck_call.set()
+
+
 def test_history_download_job_fails_when_validation_has_no_rows(monkeypatch):
     def download_history_data2(stocks, *, period, start_time, end_time, callback):
         callback({"finished": len(stocks), "total": len(stocks)})
@@ -339,6 +625,51 @@ def test_history_download_job_accepts_verified_nonempty_rows(monkeypatch):
     assert job["status"] == "completed"
     assert job["failed_symbols"] == []
     assert job["symbol_results"]["000001.SZ"]["status"] == "ok"
+
+
+def test_history_download_job_waits_for_rows_to_become_visible(monkeypatch):
+    validation_reads = 0
+
+    def download_history_data2(stocks, *, period, start_time, end_time, callback):
+        callback({"finished": len(stocks), "total": len(stocks)})
+        return {stock: {"ok": True} for stock in stocks}
+
+    def get_market_data_ex(**kwargs):
+        nonlocal validation_reads
+        validation_reads += 1
+        if validation_reads == 1:
+            return {stock: pd.DataFrame() for stock in kwargs["stock_list"]}
+        return {
+            stock: pd.DataFrame(
+                [{"open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1}]
+            )
+            for stock in kwargs["stock_list"]
+        }
+
+    monkeypatch.setattr(
+        download,
+        "xtdata",
+        SimpleNamespace(
+            download_history_data2=download_history_data2,
+            get_market_data_ex=get_market_data_ex,
+        ),
+    )
+
+    created = download.create_history_download_job(
+        HistoryDownloadJobRequest(
+            stocks=["000001.SZ"],
+            period="1d",
+            start_time="20260714",
+            end_time="20260718",
+            batch_size=1,
+            max_attempts=1,
+        )
+    )
+    job = _wait_job(created["job_id"])
+
+    assert job["status"] == "completed"
+    assert job["failed_symbols"] == []
+    assert validation_reads == 2
 
 
 def test_history_download_jobs_are_fifo(monkeypatch):

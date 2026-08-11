@@ -147,7 +147,8 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/meta/health` | 健康检查 |
+| GET | `/api/meta/health` | HTTP 进程存活检查 |
+| GET | `/api/meta/readiness` | Big QMT ZMQ、账户与固定上游版本运行就绪检查 |
 | GET | `/api/meta/version` | 服务版本 |
 | GET | `/api/meta/xtdata_version` | xtquant 版本 |
 | GET | `/api/meta/connection_status` | xtdata 连接状态 |
@@ -178,7 +179,7 @@
 ## Trading — 交易 `/api/trading/*` :material-lock:
 
 !!! note "需要认证"
-    交易端点需要通过 `X-API-Key` 请求头进行认证，且服务端需启用交易模块 (`--trading`)。
+    账户查询需要 `--account-enabled`、账户 ID 和 `X-API-Key`。下单/撤单还必须同时启用 API 层 `QMT_BRIDGE_ORDER_WRITES_ENABLED` 与终端层 `rpc_allow_order_methods`，并由 QMT 原生日志证明当前模型 request id 的 `m_bTrade=1`；两层写开关默认开启，但模拟模式、缺失证明或任一显式关闭都会冻结写入。`GET /api/trading/health` 返回 `qmt_trade_mode`、`terminal_real_mode`、`terminal_mode_source` 和 `write_blockers`。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|

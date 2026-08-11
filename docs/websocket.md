@@ -1,6 +1,7 @@
 # WebSocket 使用指南
 
-QMT Bridge 提供 5 个 WebSocket 端点，用于实时数据推送。
+QMT Bridge 提供 WebSocket 端点用于实时数据推送。历史下载进度通过
+`GET /api/download/jobs/{job_id}` 查询，不再提供下载进度 WebSocket。
 
 ## 端点列表
 
@@ -9,7 +10,6 @@ QMT Bridge 提供 5 个 WebSocket 端点，用于实时数据推送。
 | `/ws/realtime` | 实时行情推送 | 无 |
 | `/ws/whole_quote` | 全市场行情订阅 | 无 |
 | `/ws/l2_thousand` | L2 千档行情推送 | 无 |
-| `/ws/download_progress` | 下载进度推送 | 无 |
 | `/ws/formula` | 公式/指标实时推送 | 无 |
 | `/ws/trade` | 交易回报推送 | 需要 API Key |
 
@@ -75,22 +75,6 @@ asyncio.run(client.subscribe_l2_thousand(
 ))
 ```
 
-## 下载进度 `/ws/download_progress`
-
-监控数据下载进度。
-
-```jsonc
-// 订阅请求
-{
-    "stocks": ["000001.SZ"],
-    "period": "1d",
-    "start_time": "",
-    "end_time": ""
-}
-```
-
-下载完成后服务端发送 `{"status": "done"}`。
-
 ## 公式/指标 `/ws/formula`
 
 实时订阅公式计算结果。
@@ -114,7 +98,7 @@ asyncio.run(client.subscribe_l2_thousand(
 ## 交易回报 `/ws/trade`
 
 !!! note "需要认证"
-    交易回报 WebSocket 需要通过查询参数传递 API Key：`ws://<host>:8000/ws/trade?api_key=your-secret-key`
+    交易回报 WebSocket 需要通过查询参数传递 API Key：`ws://<host>:13543/ws/trade?api_key=your-secret-key`
 
 推送交易事件（委托回报、成交回报、错误信息等）。
 
@@ -132,7 +116,7 @@ asyncio.run(client.subscribe_trade_events(callback=on_trade_event))
 ## JavaScript / 浏览器使用
 
 ```javascript
-const ws = new WebSocket("ws://192.168.1.100:8000/ws/realtime");
+const ws = new WebSocket("ws://192.168.1.100:13543/ws/realtime");
 
 ws.onopen = () => {
     ws.send(JSON.stringify({

@@ -1,29 +1,30 @@
 # QMT Bridge
 
-> 将 miniQMT 的行情与交易能力通过 HTTP/WebSocket 接口暴露给局域网内的任意设备，让你在 Mac/Linux 上也能自由使用 A 股实时行情、历史数据和程序化交易。
+> 通过 Big QMT 内嵌策略与本机 ZMQ RPC，将行情、账户和受控委托能力暴露为 HTTP/WebSocket；委托写能力默认开启。
 
-**QMT Bridge** is a lightweight API server that wraps [xtquant](https://dict.thinktrader.net/nativeApi/start_now.html) (the Python library behind miniQMT) and exposes market data & trading as standard HTTP/WebSocket endpoints. It runs on your Windows machine alongside the QMT client, allowing any device on your local network — Mac, Linux, or mobile — to access real-time quotes, historical K-lines, sector data, trading, and more.
+**QMT Bridge** 由两个进程组成：Big QMT 终端内的 Python 模型运行固定版本的 ZMQ RPC，外部 Python 3.10+ FastAPI 服务将其转换为稳定的 HTTP/WebSocket 合同。外部服务不安装或导入原生 `xtquant`；委托端点始终要求 API Key、已连接资金账户、双层写能力，以及当前模型确实运行在“实盘”模式的终端日志证明。
 
 ```
 Mac / Linux (主力机)                    Windows (中转站)
 ┌──────────────────────┐                ┌─────────────────────────┐
-│  你的分析 / 交易代码    │   HTTP/WS     │  miniQMT 客户端 (登录中)  │
-│  本地数据库            │ ◄───────────► │  QMT Bridge (FastAPI)    │
-│  可视化仪表盘          │   局域网       │  xtquant                 │
+│  你的分析 / 交易代码    │   HTTP/WS     │  Big QMT 客户端 (登录中)   │
+│  本地数据库            │ ◄───────────► │  ZMQ 模型 + FastAPI       │
+│  可视化仪表盘          │   局域网       │  127.0.0.1:15560         │
 └──────────────────────┘                └─────────────────────────┘
 ```
 
 ## Why
 
-miniQMT / xtquant 只能在 Windows 上运行，且必须依赖 QMT 客户端保持登录。如果你的主力开发机是 Mac 或 Linux，就无法直接调用 xtquant。
+Big QMT 的模型 API 只能在 Windows 终端进程内运行。分析服务直接依赖终端 Python 或原生 `xtquant`，会把部署、版本和进程生命周期绑死在 QMT 上。
 
-QMT Bridge 解决这个问题：Windows 电脑作为数据中转站，运行 QMT 客户端 + 本项目的 API 服务；你的 Mac/Linux 通过局域网 HTTP/WebSocket 请求获取所有数据，也可以远程下单。核心代码、数据库、分析逻辑全部在你自己的主力机上运行。
+QMT Bridge 把终端内能力收敛到只监听回环地址的 ZMQ 边界，再由 Windows 主机上的 API 服务向可信网络提供统一接口。交易账户查询可独立启用；下单和撤单同时受 API 层 `QMT_BRIDGE_ORDER_WRITES_ENABLED`、终端层 `rpc_allow_order_methods` 和 QMT 当前 request id 对应的 `m_bTrade=1` 日志证明约束，任一不满足都拒绝写入。
 
 ## Features
 
 - **100+ REST API 端点** — 历史 K 线、实时行情、L2 逐笔、板块管理、财务数据、指数权重、期权链、可转债、ETF、港股通、期货主力合约等
 - **5 个 WebSocket 端点** — 实时行情推送、全市场行情、L2 千档、下载进度、交易回报
-- **程序化交易** (可选) — 下单、撤单、批量委托、融资融券、银证转账、智能交易
+- **账户只读查询** — 资产、持仓、当日委托和成交；不需要开启委托写入
+- **受控委托边界** — 下单和撤单默认具备写能力，仍需 API Key、资金账户、两层写门禁和 QMT 实盘模式证明
 - **零依赖客户端** — Python 客户端基于 stdlib，无需安装 xtquant 即可在任意平台使用
 - **API Key 认证** — 可选的 API Key 保护，交易端点强制认证
 
@@ -32,8 +33,9 @@ QMT Bridge 解决这个问题：Windows 电脑作为数据中转站，运行 QMT
 ### Windows 端 (服务端)
 
 - **Python** 3.10+
-- **QMT 客户端** — 已安装并获得券商账号密码（需联系客户经理开通 miniQMT 权限）
-- **xtquant** — 通常随 QMT 客户端安装，或 `pip install xtquant`
+- **Big QMT 客户端** — 已安装并获得模型运行权限，账户查询时需登录交易账户
+- **Big QMT 内嵌 Python** — 安装器部署固定提交的 ZMQ 模型运行时
+- 外部 Python 环境不安装原生 `xtquant`
 
 ### 网络
 
@@ -65,6 +67,22 @@ pip install -e .
 pip install -e ".[client]"
 ```
 
+在 QMT 关闭时，将固定提交 `40f7275b15843bd167b7ad424a51d3d547be88df`
+的内嵌运行时安装到终端：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-bigqmt-runtime.ps1 `
+  -QmtRoot "C:\国金证券QMT交易端" `
+  -AccountId "12345678"
+```
+
+首次安装若输出 `compiled_model_ready=false`，在 QMT 中新建名为
+`MECOSTOCK_BIGQMT_ZMQ` 的 Python 策略，粘贴
+`src/MECOSTOCK_BIGQMT_ZMQ.py`，取消勾选“启动本地python”并编译一次。关闭
+QMT 后重新运行安装器，确认 `compiled_model_ready=true` 和
+`embedded_python_mode=true`。终端启动自动运行由 QMT 自己的策略运行设置
+管理，不是安装器中的 `simpleRun` 字段；不要勾选“启动本地python”。
+
 ### 2. 配置
 
 ```bash
@@ -74,7 +92,7 @@ cp .env.example .env
 
 ### 3. 启动 QMT 客户端
 
-打开 QMT，勾选 **"独立交易"** 模式登录，保持窗口运行（可最小化）。
+打开 Big QMT 并登录交易账户。需要真实委托能力时，把 `MECOSTOCK_BIGQMT_ZMQ` 的运行模式设为“实盘”并确认状态为“运行中”；只读或模拟验收可保留“模拟”。API 会用模型返回的当前 request id 匹配 `userdata/log/XtClient_*.log` 中的 `m_bTrade`，无法证明“实盘”时 fail closed。
 
 ### 4. 启动 API 服务
 
@@ -85,8 +103,11 @@ qmt-server
 # 自定义参数
 qmt-server --port 13543 --log-level debug
 
-# 启用交易模块
-qmt-server --trading --api-key your-secret-key --mini-qmt-path "C:\国金QMT交易端\userdata_mini" --account-id 12345678
+# Big QMT ZMQ + 账户查询；写能力默认开启，实际放行仍需终端实盘证明
+qmt-server --qmt-root "C:\国金证券QMT交易端" \
+  --zmq-endpoint tcp://127.0.0.1:15560 \
+  --account-enabled --account-id 12345678 \
+  --api-key your-secret-key
 ```
 
 也可以使用脚本：
@@ -112,10 +133,10 @@ scripts\stop.bat
 http://<Windows局域网IP>:13543/docs
 ```
 
-看到 Swagger 文档页面即表示服务正常。也可以用 curl 检查：
+Swagger 只证明 HTTP 进程存活。运行验收必须检查 readiness：
 
 ```bash
-curl http://<Windows局域网IP>:13543/api/meta/health
+curl http://<Windows局域网IP>:13543/api/meta/readiness
 ```
 
 ## Configuration
@@ -133,9 +154,13 @@ curl http://<Windows局域网IP>:13543/api/meta/health
 | `QMT_BRIDGE_BINARY_CACHE_MAX_BYTES` | — | `2147483648` | 缓存最大容量 |
 | `QMT_BRIDGE_API_KEY` | `--api-key` | _(空)_ | API Key，用于保护交易端点 |
 | `QMT_BRIDGE_REQUIRE_AUTH_FOR_DATA` | — | `false` | 数据端点是否也要求认证 |
-| `QMT_BRIDGE_TRADING_ENABLED` | `--trading` | `false` | 是否启用交易模块 |
-| `QMT_BRIDGE_MINI_QMT_PATH` | `--mini-qmt-path` | _(空)_ | miniQMT 安装路径（交易模块需要） |
+| `QMT_BRIDGE_RUNTIME` | — | `bigqmt` | 固定 Big QMT 运行时 |
+| `QMT_BRIDGE_QMT_ROOT` | `--qmt-root` | _(空)_ | Big QMT 终端根目录；委托写入用它读取终端日志并证明当前模型为实盘模式 |
+| `QMT_BRIDGE_RPC_TRANSPORT` | — | `zmq` | 固定 ZMQ RPC |
+| `QMT_BRIDGE_ZMQ_ENDPOINT` | `--zmq-endpoint` | `tcp://127.0.0.1:15560` | 仅允许回环地址 |
+| `QMT_BRIDGE_ACCOUNT_ENABLED` | `--account-enabled` | `false` | 启用账户只读查询 |
 | `QMT_BRIDGE_TRADING_ACCOUNT_ID` | `--account-id` | _(空)_ | 交易账户 ID |
+| `QMT_BRIDGE_ORDER_WRITES_ENABLED` | `--order-writes-enabled` | `true` | API 层委托写入门禁；可显式设为 `false` 冻结写入，终端层门禁仍需同时开启 |
 
 ## API Reference
 
@@ -251,7 +276,8 @@ curl http://<Windows局域网IP>:13543/api/meta/health
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/meta/health` | 健康检查 |
+| GET | `/api/meta/health` | HTTP 进程存活检查 |
+| GET | `/api/meta/readiness` | Big QMT ZMQ、账户和固定上游版本运行就绪检查 |
 | GET | `/api/meta/version` | 服务版本 |
 | GET | `/api/meta/xtdata_version` | xtquant 版本 |
 | GET | `/api/meta/connection_status` | xtdata 连接状态 |
@@ -378,11 +404,12 @@ order_id = client.place_order(
     stock_code="000001.SZ",
     order_type=23,        # 买入
     order_volume=100,
+    client_submit_id="manual-20260719-0001",
     price_type=5,         # 最新价
 )
 
 # 查询
-orders = client.query_orders()
+orders = client.query_orders(client_submit_id="manual-20260719-0001")
 positions = client.query_positions()
 asset = client.query_asset()
 
@@ -414,8 +441,8 @@ asyncio.run(client.subscribe_whole_quote(
 ## Examples
 
 ```bash
-# 健康检查
-curl http://192.168.1.100:13543/api/meta/health
+# 运行就绪检查
+curl http://192.168.1.100:13543/api/meta/readiness
 
 # 平安银行最近 60 根日线
 curl "http://192.168.1.100:13543/api/history?stock=000001.SZ&period=1d&count=60"
@@ -511,11 +538,13 @@ QMT Bridge 支持可选的 API Key 认证机制：
 
 **Q: QMT 客户端必须一直开着吗？**
 
-是的。xtquant 通过 QMT 客户端获取行情数据，客户端关闭后 API 服务将无法返回实时数据。历史数据如果已下载到本地缓存，在脱机模式下仍可通过 `/api/market/local_data` 访问。
+是的。ZMQ 模型运行在 Big QMT 进程内；终端关闭、未登录或模型未运行时 `/api/meta/readiness` 会失败，API 不会把 HTTP 存活误报为通道可用。
 
 **Q: 支持自动下单吗？**
 
-v2.0 起支持。启用交易模块后 (`--trading`)，可通过 `/api/trading/*` 端点进行下单、撤单、批量委托等操作。交易端点强制要求 API Key 认证。
+默认具备受控写入能力。账户查询与委托写入仍然分离；只有 API 层
+`QMT_BRIDGE_ORDER_WRITES_ENABLED=true`、终端层
+`rpc_allow_order_methods=True`、API Key、资金账户，以及当前 request id 在 QMT 原生日志中对应 `m_bTrade=1` 同时满足时，下单/撤单端点才可能放行。切到“模拟”、缺失日志证明或任一写门禁显式为 false 都会立即冻结新写入。
 
 **Q: 非交易时间能用吗？**
 

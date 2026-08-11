@@ -8,7 +8,7 @@ def render_sidebar():
     st.sidebar.title("QMT Bridge")
     host = st.sidebar.text_input("服务地址", value="127.0.0.1", key="_sb_host")
     port = st.sidebar.number_input(
-        "端口", value=8000, min_value=1, max_value=65535, step=1, key="_sb_port"
+        "端口", value=13543, min_value=1, max_value=65535, step=1, key="_sb_port"
     )
     api_key = st.sidebar.text_input(
         "API Key（交易功能需要）", type="password", key="_sb_api_key"

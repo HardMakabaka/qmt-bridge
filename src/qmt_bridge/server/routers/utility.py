@@ -1,9 +1,13 @@
 """Router — Utility endpoints /api/utility/*."""
 
 from fastapi import APIRouter, Query
-from xtquant import xtdata
+from ..bigqmt import xtdata
 
-from ..helpers import _numpy_to_python
+from ..helpers import (
+    _call_xtdata_optional,
+    _call_xtdata_serialized,
+    _numpy_to_python,
+)
 
 router = APIRouter(prefix="/api/utility", tags=["utility"])
 
@@ -13,7 +17,7 @@ def get_stock_name(
     stock: str = Query(..., description="股票代码"),
 ):
     """Get the Chinese name for a stock code."""
-    detail = xtdata.get_instrument_detail(stock)
+    detail = _call_xtdata_serialized(xtdata.get_instrument_detail, stock)
     name = detail.get("InstrumentName", "") if isinstance(detail, dict) else ""
     return {"stock": stock, "name": name}
 
@@ -24,7 +28,11 @@ def get_batch_stock_name(
 ):
     """Get Chinese names for multiple stock codes."""
     stock_list = [s.strip() for s in stocks.split(",")]
-    raw = xtdata.get_instrument_detail_list(stock_list, iscomplete=False)
+    raw = _call_xtdata_serialized(
+        xtdata.get_instrument_detail_list,
+        stock_list,
+        iscomplete=False,
+    )
     result = {}
     data = _numpy_to_python(raw)
     if isinstance(data, dict):
@@ -38,7 +46,7 @@ def code_to_market(
     stock: str = Query(..., description="股票代码"),
 ):
     """Determine which market a stock code belongs to."""
-    instrument_type = xtdata.get_instrument_type(stock)
+    instrument_type = _call_xtdata_serialized(xtdata.get_instrument_type, stock)
     market = stock.split(".")[-1] if "." in stock else ""
     return {"stock": stock, "market": market, "type": instrument_type}
 
@@ -50,7 +58,40 @@ def search_stocks(
     limit: int = Query(20, description="返回条数上限"),
 ):
     """Search stocks by keyword (code prefix or name)."""
-    all_stocks = xtdata.get_stock_list_in_sector(category)
+    all_stocks = _call_xtdata_serialized(
+        xtdata.get_stock_list_in_sector,
+        category,
+    )
     keyword_upper = keyword.upper()
     matches = [s for s in all_stocks if keyword_upper in s.upper()]
     return {"keyword": keyword, "count": len(matches[:limit]), "stocks": matches[:limit]}
+
+
+@router.get("/industry_name")
+def get_industry_name(
+    stock: str = Query(..., description="股票代码"),
+    industry_type: str = Query("SW2", description="行业类型，如 SW1/SW2/CSRC1"),
+):
+    payload = _call_xtdata_optional(
+        xtdata,
+        "get_industry_name_of_stock",
+        industry_type,
+        stock,
+    )
+    if payload["status"] == "ok":
+        return {"status": "ok", "stock": stock, "industry_type": industry_type, "data": payload["data"]}
+    return payload
+
+
+@router.get("/market_time")
+def get_market_time(
+    market: str = Query(..., description="市场代码，如 SH / SZ"),
+):
+    return _call_xtdata_optional(xtdata, "get_market_time", market)
+
+
+@router.get("/basket")
+def get_basket(
+    basket_name: str = Query(..., description="篮子名称"),
+):
+    return _call_xtdata_optional(xtdata, "get_basket", basket_name)

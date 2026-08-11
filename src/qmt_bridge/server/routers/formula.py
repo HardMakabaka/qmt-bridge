@@ -1,9 +1,9 @@
 """Router — Formula/Model API endpoints /api/formula/*."""
 
 from fastapi import APIRouter
-from xtquant import xtdata
+from ..bigqmt import xtdata
 
-from ..helpers import _numpy_to_python
+from ..helpers import _call_xtdata_serialized, _numpy_to_python
 from ..models import (
     CallFormulaBatchRequest,
     CallFormulaRequest,
@@ -16,7 +16,8 @@ router = APIRouter(prefix="/api/formula", tags=["formula"])
 @router.post("/call")
 def call_formula(req: CallFormulaRequest):
     """Call a formula/indicator on a single stock."""
-    result = xtdata.call_formula(
+    result = _call_xtdata_serialized(
+        xtdata.call_formula,
         req.formula_name,
         req.stock_code,
         req.period,
@@ -32,7 +33,8 @@ def call_formula(req: CallFormulaRequest):
 @router.post("/call_batch")
 def call_formula_batch(req: CallFormulaBatchRequest):
     """Call a formula/indicator on multiple stocks."""
-    result = xtdata.call_formula_batch(
+    result = _call_xtdata_serialized(
+        xtdata.call_formula_batch,
         req.formula_name,
         req.stock_codes,
         req.period,
@@ -48,7 +50,8 @@ def call_formula_batch(req: CallFormulaBatchRequest):
 @router.post("/generate_index")
 def generate_index_data(req: GenerateIndexDataRequest):
     """Generate custom index data from stocks and weights."""
-    result = xtdata.generate_index_data(
+    result = _call_xtdata_serialized(
+        xtdata.generate_index_data,
         req.index_code,
         req.stocks,
         req.weights,

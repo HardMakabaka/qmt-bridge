@@ -20,7 +20,7 @@
 | 历史1分钟K线 | `client.get_history_ex(stocks, period="1m", start_time=..., end_time=...)` | 返回 DataFrame |
 | 历史日线 | `client.get_history_ex(stocks, period="1d", ...)` | 同上 |
 | 实时快照（单次查询） | `client.get_market_snapshot(["518880.SH", "AU2506.SHFE"])` | REST 轮询备用方案 |
-| 数据预下载 | `client.download_batch(stocks, period="1m", start_time=..., end_time=...)` | 服务端缓存，后续读取更快 |
+| 数据预下载 | `client.create_history_download_job(stocks, period="1m", start_time=..., end_time=...)` | 服务端缓存，后续通过 job id 查询进度 |
 | 过期合约下载 | `client.download_history_contracts()` | 主力合约映射等 |
 
 ### 交易执行能力
@@ -851,8 +851,10 @@ st_autorefresh(interval=10_000, key="dashboard_refresh")  # 每10秒
 Step 1  下载数据
         ├── client.download_history_contracts()          # 过期合约/主力合约映射
         ├── main = client.get_main_contract("AU.SHFE") # 主力合约代码
-        ├── client.download_batch([main], period="1m", start_time="20250801")
-        ├── client.download_batch(["518880.SH"], period="1m", start_time="20250801")
+        ├── main_job = client.create_history_download_job([main], period="1m", start_time="20250801")
+        ├── etf_job = client.create_history_download_job(["518880.SH"], period="1m", start_time="20250801")
+        ├── client.get_history_download_job(main_job["job_id"])
+        ├── client.get_history_download_job(etf_job["job_id"])
         ├── au_df = client.get_history_ex([main], period="1m", start_time="20250801")
         ├── etf_df = client.get_history_ex(["518880.SH"], period="1m", start_time="20250801")
         └── 存为 Parquet，检查数据质量（缺值、时间对齐）
@@ -1038,7 +1040,13 @@ client.get_main_contract("AU.SHFE")
 
 # 下载历史数据（服务端缓存）
 client.download_history_contracts()
-client.download_batch(["518880.SH"], period="1m", start_time="20250801", end_time="20260211")
+job = client.create_history_download_job(
+    ["518880.SH"],
+    period="1m",
+    start_time="20250801",
+    end_time="20260211",
+)
+client.get_history_download_job(job["job_id"])
 
 # 读取历史K线（返回 {stock: DataFrame}）
 client.get_history_ex(["518880.SH"], period="1m", start_time="20250801")

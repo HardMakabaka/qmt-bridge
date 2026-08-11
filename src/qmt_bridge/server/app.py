@@ -4,31 +4,43 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
+from .bigqmt import initialize_bigqmt_runtime, reset_bigqmt_runtime
 from .config import Settings, get_settings
+from .trading.manager import TradingWriteDisabled
 
 logger = logging.getLogger("qmt_bridge")
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Manage application lifecycle — init/cleanup xttrader if enabled."""
-    settings: Settings = get_settings()
+    settings: Settings = app.state.settings
 
-    # Initialize trading module if enabled
-    if settings.trading_enabled:
+    try:
+        runtime = initialize_bigqmt_runtime(settings)
+        app.state.bigqmt_runtime = runtime
+        app.state.bigqmt_runtime_error = None
+        logger.info("Big QMT runtime initialized via %s", settings.zmq_endpoint)
+    except Exception as exc:
+        logger.exception("Failed to initialize Big QMT runtime")
+        app.state.bigqmt_runtime = None
+        app.state.bigqmt_runtime_error = f"{exc.__class__.__name__}: {exc}"
+
+    if settings.account_enabled and app.state.bigqmt_runtime is not None:
         try:
             from .trading.manager import XtTraderManager
 
             manager = XtTraderManager(
-                mini_qmt_path=settings.mini_qmt_path,
+                runtime=app.state.bigqmt_runtime,
                 account_id=settings.trading_account_id,
+                order_writes_enabled=settings.order_writes_enabled,
             )
             manager.connect()
             app.state.trader_manager = manager
-            logger.info("Trading module initialized")
+            logger.info("Big QMT account query module initialized")
         except Exception:
-            logger.exception("Failed to initialize trading module")
+            logger.exception("Failed to initialize Big QMT account query module")
             app.state.trader_manager = None
     else:
         app.state.trader_manager = None
@@ -69,9 +81,11 @@ async def _lifespan(app: FastAPI):
     if manager is not None:
         try:
             manager.disconnect()
-            logger.info("Trading module disconnected")
+            logger.info("Big QMT account query module disconnected")
         except Exception:
-            logger.exception("Error disconnecting trading module")
+            logger.exception("Error disconnecting Big QMT account query module")
+
+    reset_bigqmt_runtime()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -81,11 +95,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="QMT Bridge",
-        description="miniQMT market data & trading API bridge",
-        version="2.0.0",
+        description="Big QMT ZMQ market data and guarded account API bridge",
+        version="3.0.0",
         lifespan=_lifespan,
     )
     app.state.settings = settings
+
+    @app.exception_handler(TradingWriteDisabled)
+    async def trading_write_disabled_handler(_request, exc: TradingWriteDisabled):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": {
+                    "code": "QMT_ORDER_WRITES_DISABLED",
+                    "blocker": exc.blocker,
+                }
+            },
+        )
 
     # ------------------------------------------------------------------
     # Register data routers (always available)
@@ -117,6 +143,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(instrument.router)
     app.include_router(option.router)
     app.include_router(etf.etf_router)
+    app.include_router(etf.fund_data_router)
     app.include_router(etf.cb_router)
     app.include_router(futures.router)
     app.include_router(meta.router)
@@ -130,12 +157,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ------------------------------------------------------------------
     # Register WebSocket endpoints
     # ------------------------------------------------------------------
-    from .ws import download_progress, formula as formula_ws, realtime, whole_quote
+    from .ws import formula as formula_ws, l2_thousand, realtime, whole_quote
 
     app.include_router(realtime.router)
     app.include_router(whole_quote.router)
-    app.include_router(download_progress.router)
     app.include_router(formula_ws.router)
+    app.include_router(l2_thousand.router)
 
     # ------------------------------------------------------------------
     # Register notification router (conditional)
@@ -148,7 +175,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ------------------------------------------------------------------
     # Register trading routers (conditional)
     # ------------------------------------------------------------------
-    if settings.trading_enabled:
+    if settings.account_enabled:
         from .routers import bank, credit, fund, smt, trading
 
         app.include_router(trading.router)

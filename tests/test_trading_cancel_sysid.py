@@ -1,15 +1,17 @@
 from types import SimpleNamespace
 
 from qmt_bridge.server.config import Settings
-from qmt_bridge.server.helpers import _numpy_to_python
+from qmt_bridge.server.helpers import _market_data_to_records, _numpy_to_python
 from qmt_bridge.server.models import AsyncCancelRequest, CancelRequest
 from qmt_bridge.server.routers import trading
 
 
 class DummyManager:
-    def __init__(self, account_id="acct-1"):
+    def __init__(self, account_id="acct-1", writes_enabled=False, write_blockers=None):
         self.account_id = account_id
         self.calls = []
+        self.writes_enabled = writes_enabled
+        self.write_blockers = list(write_blockers or ["bridge_order_writes_disabled"])
 
     def cancel_order(self, *, order_id, account_id):
         self.calls.append(("order_id", order_id, account_id))
@@ -84,9 +86,13 @@ def test_cancel_async_uses_order_sysid_when_present():
 
 
 def test_trading_health_reports_ready_write_contract():
-    manager = DummyManager(account_id="8890450365")
+    manager = DummyManager(
+        account_id="8890450365",
+        writes_enabled=False,
+        write_blockers=["bridge_order_writes_disabled"],
+    )
     request = _request(
-        Settings(trading_enabled=True, trading_account_id="8890450365"),
+        Settings(account_enabled=True, trading_account_id="8890450365"),
         manager,
     )
 
@@ -98,8 +104,8 @@ def test_trading_health_reports_ready_write_contract():
     assert payload["account_authenticated"] is True
     assert payload["order_supported"] is True
     assert payload["cancel_supported"] is True
-    assert payload["write_enabled"] is True
-    assert payload["write_blockers"] == []
+    assert payload["write_enabled"] is False
+    assert payload["write_blockers"] == ["bridge_order_writes_disabled"]
     assert payload["account_id"] == "8890450365"
     assert payload["supports"]["order_stock"] is True
     assert payload["supports"]["cancel_order_stock"] is True
@@ -107,7 +113,7 @@ def test_trading_health_reports_ready_write_contract():
 
 def test_trading_health_reports_connect_failure_without_manager():
     request = _request(
-        Settings(trading_enabled=True, trading_account_id="8890450365"),
+        Settings(account_enabled=True, trading_account_id="8890450365"),
         None,
     )
 
@@ -119,7 +125,7 @@ def test_trading_health_reports_connect_failure_without_manager():
     assert payload["account_authenticated"] is False
     assert payload["write_enabled"] is False
     assert payload["code"] == "QMT_TRADING_CONNECT_FAILED"
-    assert payload["write_blockers"] == ["xttrader_connect_failed"]
+    assert payload["write_blockers"] == ["bigqmt_rpc_connect_failed"]
 
 
 def test_assets_plural_alias_uses_existing_asset_query():
@@ -141,3 +147,22 @@ def test_numpy_to_python_converts_slot_based_xtquant_objects():
         "market_value": 2000,
         "total_asset": 3000.5,
     }
+
+
+def test_numpy_to_python_converts_non_finite_float_to_none():
+    payload = _numpy_to_python({"nan": float("nan"), "inf": float("inf")})
+
+    assert payload == {"nan": None, "inf": None}
+
+
+def test_market_data_records_convert_non_finite_values_to_none():
+    import pandas as pd
+
+    raw = {
+        "open": pd.DataFrame({"20260623": [float("nan")]}, index=["000001.SZ"]),
+        "close": pd.DataFrame({"20260623": [float("inf")]}, index=["000001.SZ"]),
+    }
+
+    payload = _market_data_to_records(raw, ["000001.SZ"], ["open", "close"])
+
+    assert payload == {"000001.SZ": [{"date": "20260623", "open": None, "close": None}]}
