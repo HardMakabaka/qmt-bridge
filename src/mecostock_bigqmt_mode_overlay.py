@@ -4,10 +4,10 @@
 import sys as _mecostock_sys
 
 
-_MECOSTOCK_BASE_INIT = init
-_MECOSTOCK_BASE_ADJUST = adjust
-_MECOSTOCK_BASE_HANDLEBAR = handlebar
-_MECOSTOCK_REQUEST_ID = ""
+_MECOSTOCK_BASE_INIT = globals()["init"]
+_MECOSTOCK_BASE_ADJUST = globals()["adjust"]
+_MECOSTOCK_BASE_HANDLEBAR = globals()["handlebar"]
+_mecostock_request_id = ""
 
 
 def _mecostock_detect_request_id(context_info):
@@ -23,8 +23,8 @@ def _mecostock_detect_request_id(context_info):
 
 
 def _mecostock_refresh_request_id(context_info):
-    global _MECOSTOCK_REQUEST_ID
-    _MECOSTOCK_REQUEST_ID = _mecostock_detect_request_id(context_info)
+    global _mecostock_request_id
+    _mecostock_request_id = _mecostock_detect_request_id(context_info)
 
 
 def _mecostock_install_ping_attestation():
@@ -37,16 +37,34 @@ def _mecostock_install_ping_attestation():
 
         def _handle_ping(self, params):
             payload = handlers._mecostock_base_handle_ping(self, params)
-            payload["qmt_request_id"] = _MECOSTOCK_REQUEST_ID
+            payload["qmt_request_id"] = _mecostock_request_id
             return payload
 
         handlers._handle_ping = _handle_ping
 
 
+def _mecostock_install_sector_fail_fast():
+    market_module = _mecostock_sys.modules.get(
+        "bigqmt_signal_trader.adapters.market_bigqmt"
+    )
+    provider = getattr(market_module, "BigQmtMarketDataProvider", None)
+    if provider is None:
+        return
+    if not hasattr(provider, "_mecostock_base_get_sector_list"):
+        provider._mecostock_base_get_sector_list = provider.get_sector_list
+
+        def _get_sector_list(self):
+            return list(self._FALLBACK_SECTORS)
+
+        provider.get_sector_list = _get_sector_list
+
+
 def init(ContextInfo):
     _mecostock_refresh_request_id(ContextInfo)
     _mecostock_install_ping_attestation()
+    _mecostock_install_sector_fail_fast()
     result = _MECOSTOCK_BASE_INIT(ContextInfo)
+    _mecostock_install_sector_fail_fast()
     _mecostock_refresh_request_id(ContextInfo)
     return result
 

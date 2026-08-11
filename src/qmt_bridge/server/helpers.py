@@ -241,7 +241,12 @@ def _dataframe_dict_to_records(data: dict) -> dict[str, list[dict]]:
     result: dict[str, list[dict]] = {}
     for stock, df in data.items():
         if isinstance(df, pd.DataFrame) and not df.empty:
-            records = df.reset_index().to_dict(orient="records")
+            records_frame = (
+                df
+                if isinstance(df.index, pd.RangeIndex) and df.index.name is None
+                else df.reset_index()
+            )
+            records = records_frame.to_dict(orient="records")
             result[stock] = [_numpy_to_python(r) for r in records]
         else:
             result[stock] = []

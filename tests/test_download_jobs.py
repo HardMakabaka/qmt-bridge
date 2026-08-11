@@ -4,6 +4,7 @@ import time
 from types import ModuleType, SimpleNamespace
 
 import pandas as pd
+from fastapi.testclient import TestClient
 
 xtquant_stub = ModuleType("xtquant")
 xtquant_stub.xtdata = SimpleNamespace()
@@ -713,10 +714,9 @@ def test_cancel_queued_history_download_job(monkeypatch):
 def test_legacy_batch_route_is_not_registered():
     app = create_app()
     legacy_path = "/api/download/" + "batch"
-    paths = {
-        (route.path, tuple(sorted(getattr(route, "methods", []) or [])))
-        for route in app.routes
-    }
+    with TestClient(app) as client:
+        legacy_response = client.post(legacy_path, json={})
+        jobs_response = client.post("/api/download/jobs", json={})
 
-    assert not any(path == legacy_path for path, _methods in paths)
-    assert any(path == "/api/download/jobs" for path, _methods in paths)
+    assert legacy_response.status_code == 404
+    assert jobs_response.status_code == 422

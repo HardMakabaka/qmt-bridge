@@ -177,11 +177,13 @@ def get_history_ex(
         fill_data=fill_data,
     )
 
-    def _load():
+    response_source: str | None = None
+
+    def _load(requested_stocks: list[str] | None = None):
         return _call_xtdata_serialized(
             xtdata.get_market_data_ex,
             field_list=[],
-            stock_list=stock_list,
+            stock_list=requested_stocks or stock_list,
             period=period,
             start_time=start_time,
             end_time=end_time,
@@ -191,19 +193,37 @@ def get_history_ex(
         )
 
     def _read():
-        if use_local_dat:
+        nonlocal response_source
+        if use_local_dat and local_dat_root is not None:
             reader = (
                 read_qmt_local_dat_1d
                 if period == "1d"
                 else read_qmt_local_dat_1m
             )
-            return reader(
+            local_raw = reader(
                 local_dat_root,
                 tuple(stock_list),
                 start_time=start_time,
                 end_time=end_time,
                 count=count,
             )
+            missing_stocks = [
+                stock for stock in stock_list if not _frame_has_rows(local_raw.get(stock))
+            ]
+            if not missing_stocks:
+                response_source = f"qmt_local_dat.{period}"
+                return local_raw
+            rpc_raw = _load(missing_stocks)
+            merged = dict(rpc_raw or {})
+            for stock, frame in local_raw.items():
+                if _frame_has_rows(frame):
+                    merged[stock] = frame
+            response_source = (
+                f"qmt_local_dat.{period}+qmt_rpc"
+                if _any_market_data_frame_has_rows(local_raw)
+                else f"qmt_rpc_fallback.{period}"
+            )
+            return merged
         if not use_cache:
             return _load()
         raw, _cache_meta = get_binary_cache().cached_call(
@@ -218,9 +238,9 @@ def get_history_ex(
     raw, error = _read_market_payload("get_market_data_ex", _read, validator=_is_mapping)
     if error is not None:
         return error
-    payload = {"data": _dataframe_dict_to_records(raw)}
-    if use_local_dat:
-        payload["source"] = f"qmt_local_dat.{period}"
+    payload = {"data": _dataframe_dict_to_records(raw or {})}
+    if response_source is not None:
+        payload["source"] = response_source
     return payload
 
 

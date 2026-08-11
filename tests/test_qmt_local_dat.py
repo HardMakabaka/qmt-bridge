@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pandas as pd
 
 
 xtquant_stub = ModuleType("xtquant")
@@ -184,6 +185,57 @@ def test_history_ex_prefers_configured_local_dat(
     assert len(payload["data"]["600000.SH"]) == 241
     assert payload["data"]["600000.SH"][0]["time"] == "20260210093000"
     assert payload["data"]["600000.SH"][0]["volume"] == 1_078_400.0
+
+
+def test_history_ex_falls_back_to_bigqmt_when_local_dat_has_no_requested_rows(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from qmt_bridge.server.routers import market
+
+    # Given the local QMT DAT root has no current-day minute rows.
+    monkeypatch.setenv("QMT_BRIDGE_LOCAL_DAT_ROOT", str(tmp_path))
+    calls: list[list[str]] = []
+
+    def get_market_data_ex(*_args, **kwargs):
+        calls.append(list(kwargs["stock_list"]))
+        frame = pd.DataFrame(
+            [
+                {
+                    "time": 1786411800000,
+                    "open": 10.0,
+                    "high": 10.1,
+                    "low": 9.9,
+                    "close": 10.05,
+                }
+            ],
+        )
+        return {"000001.SZ": frame}
+
+    monkeypatch.setattr(
+        market,
+        "xtdata",
+        SimpleNamespace(get_market_data_ex=get_market_data_ex),
+    )
+
+    app = FastAPI()
+    app.include_router(market.router)
+    with TestClient(app) as client:
+        # When the cutoff path requests that missing minute window.
+        response = client.get(
+            "/api/market/history_ex?stocks=000001.SZ&period=1m"
+            "&start_time=20260811093000&end_time=20260811113000"
+            "&dividend_type=none"
+        )
+
+    # Then the bridge falls through to Big-QMT instead of returning an empty cache hit.
+    assert response.status_code == 200
+    payload = response.json()
+    assert calls == [["000001.SZ"]]
+    assert payload["source"] == "qmt_rpc_fallback.1m"
+    assert len(payload["data"]["000001.SZ"]) == 1
+    assert payload["data"]["000001.SZ"][0]["time"] == 1786411800000
+    assert "index" not in payload["data"]["000001.SZ"][0]
 
 
 def test_history_ex_prefers_configured_local_daily_dat(

@@ -1,5 +1,8 @@
 """Router — Sector endpoints /api/sector/*."""
 
+import os
+from pathlib import Path
+
 from fastapi import APIRouter, Query
 from ..bigqmt import xtdata
 
@@ -11,8 +14,44 @@ from ..models import (
     RemoveSectorStocksRequest,
     ResetSectorRequest,
 )
+from ..qmt_sector_cache import read_qmt_sector_names, read_qmt_sector_stocks
 
 router = APIRouter(prefix="/api/sector", tags=["sector"])
+
+
+def _local_sector_root() -> Path | None:
+    raw = str(os.getenv("QMT_BRIDGE_LOCAL_DAT_ROOT") or "").strip()
+    return Path(raw) if raw else None
+
+
+def _current_sector_names() -> tuple[list[str], str]:
+    root = _local_sector_root()
+    if root is not None:
+        sectors = read_qmt_sector_names(root)
+        if sectors:
+            return sectors, "qmt_local_sector"
+    sectors = [
+        str(sector)
+        for sector in _call_xtdata_serialized(xtdata.get_sector_list) or []
+    ]
+    return sectors, "qmt_rpc_sector"
+
+
+def _sector_stocks(
+    sector_name: str,
+    real_timetag: int | str,
+) -> tuple[list[str], str]:
+    root = _local_sector_root()
+    if real_timetag == -1 and root is not None:
+        stocks = read_qmt_sector_stocks(root, sector_name)
+        if stocks is not None:
+            return stocks, "qmt_local_sector"
+    stocks = _call_xtdata_serialized(
+        xtdata.get_stock_list_in_sector,
+        sector_name,
+        real_timetag=real_timetag,
+    )
+    return list(stocks or []), "qmt_rpc_sector"
 
 
 def _normalize_real_timetag(value: int | str | None) -> int | str:
@@ -42,10 +81,7 @@ def get_sector_list(
     keyword: str | None = Query(None, description="可选板块名称关键词，如 英伟达 / 算力 / CPO"),
     limit: int = Query(0, ge=0, le=10000, description="最多返回条数；0 表示不限制"),
 ):
-    sectors = [
-        str(sector)
-        for sector in _call_xtdata_serialized(xtdata.get_sector_list) or []
-    ]
+    sectors, source = _current_sector_names()
     total_count = len(sectors)
     keyword_text = str(keyword or "").strip()
     if keyword_text:
@@ -60,6 +96,7 @@ def get_sector_list(
         "filtered_count": filtered_count,
         "keyword": keyword_text or None,
         "truncated": bool(limit and filtered_count > len(sectors)),
+        "source": source,
     }
 
 
@@ -72,16 +109,13 @@ def get_sector_stocks(
     ),
 ):
     normalized_real_timetag = _normalize_real_timetag(real_timetag)
-    stock_list = _call_xtdata_serialized(
-        xtdata.get_stock_list_in_sector,
-        sector,
-        real_timetag=normalized_real_timetag,
-    )
+    stock_list, source = _sector_stocks(sector, normalized_real_timetag)
     return {
         "sector": sector,
         "real_timetag": normalized_real_timetag,
         "count": len(stock_list),
         "stocks": stock_list,
+        "source": source,
     }
 
 
@@ -95,7 +129,7 @@ def get_stock_sector_memberships(
     keyword: str | None = Query(None, description="可选板块名称关键词，如 英伟达 / 算力 / CPO"),
 ):
     normalized_real_timetag = _normalize_real_timetag(real_timetag)
-    sectors = _call_xtdata_serialized(xtdata.get_sector_list) or []
+    sectors, source = _current_sector_names()
     keyword_text = str(keyword or "").strip()
     if keyword_text:
         sectors = [sector for sector in sectors if keyword_text in str(sector)]
@@ -117,10 +151,9 @@ def get_stock_sector_memberships(
     failures: list[dict[str, str]] = []
     for sector in sectors:
         try:
-            stock_list = _call_xtdata_serialized(
-                xtdata.get_stock_list_in_sector,
-                sector,
-                real_timetag=normalized_real_timetag,
+            stock_list, _stock_source = _sector_stocks(
+                str(sector),
+                normalized_real_timetag,
             )
         except Exception as exc:  # pragma: no cover - xtdata runtime boundary
             failures.append({"sector": str(sector), "error": str(exc)})
@@ -138,6 +171,7 @@ def get_stock_sector_memberships(
         "matched_count": len(matched),
         "sectors": matched,
         "failures": failures,
+        "source": source,
     }
 
 
