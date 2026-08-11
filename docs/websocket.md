@@ -9,9 +9,12 @@ QMT Bridge 提供 WebSocket 端点用于实时数据推送。历史下载进度�
 |------|------|------|
 | `/ws/realtime` | 实时行情推送 | 无 |
 | `/ws/whole_quote` | 全市场行情订阅 | 无 |
-| `/ws/l2_thousand` | L2 千档行情推送 | 无 |
-| `/ws/formula` | 公式/指标实时推送 | 无 |
+| `/ws/l2_thousand` | 当前 Big QMT 推送合同未验证，连接后返回 `unsupported` | 无 |
+| `/ws/formula` | 当前 Big QMT 推送合同未验证，连接后返回 `unsupported` | 无 |
 | `/ws/trade` | 交易回报推送 | 需要 API Key |
+
+`/ws/formula` 和 `/ws/l2_thousand` 保留兼容路径，但不会伪造订阅成功。服务端发送
+统一失败信封后关闭连接；以 `/api/meta/capabilities` 的运行时结果为准。
 
 ## 实时行情 `/ws/realtime`
 
@@ -59,7 +62,9 @@ asyncio.run(client.subscribe_whole_quote(
 
 ## L2 千档行情 `/ws/l2_thousand`
 
-订阅 L2 千档行情数据。
+当前 Big QMT 内嵌运行时没有经过验证的千档推送合同。以下请求会收到
+`status=unsupported`、`reason_code=bigqmt_l2_push_not_verified`，不会启动轮询或
+回退到普通 L2 数据。
 
 ```jsonc
 // 订阅请求
@@ -77,7 +82,8 @@ asyncio.run(client.subscribe_l2_thousand(
 
 ## 公式/指标 `/ws/formula`
 
-实时订阅公式计算结果。
+当前 Big QMT 内嵌运行时没有经过验证的公式推送合同。以下请求会收到
+`status=unsupported`、`reason_code=bigqmt_formula_push_not_verified`。
 
 ```jsonc
 // 订阅
@@ -101,6 +107,11 @@ asyncio.run(client.subscribe_l2_thousand(
     交易回报 WebSocket 需要通过查询参数传递 API Key：`ws://<host>:13543/ws/trade?api_key=your-secret-key`
 
 推送交易事件（委托回报、成交回报、错误信息等）。
+
+Big QMT 模型先通过独立回环 ZMQ `tcp://127.0.0.1:15561` 发布委托/成交事件，
+服务端再转发到本 WebSocket。每条事件包含 `{epoch, sequence}` 游标；客户端
+重连时通过 RPC 回放保留窗口并对实时重复事件去重。默认保留最近 2000 条，
+游标跨进程 epoch 或早于保留窗口时 readiness 会报告 replay gap。
 
 **Python 客户端用法：**
 

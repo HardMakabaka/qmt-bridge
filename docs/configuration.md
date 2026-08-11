@@ -21,6 +21,7 @@ QMT Bridge 支持通过 `.env` 文件、环境变量或 CLI 参数进行配置�
 | `QMT_BRIDGE_QMT_ROOT` | `--qmt-root` | _(空)_ | Big QMT 终端根目录；写门禁从其 `userdata/log` 验证当前模型 request id 的 `m_bTrade` |
 | `QMT_BRIDGE_RPC_TRANSPORT` | — | `zmq` | 固定 ZMQ RPC |
 | `QMT_BRIDGE_ZMQ_ENDPOINT` | `--zmq-endpoint` | `tcp://127.0.0.1:15560` | 仅允许回环地址 |
+| `QMT_BRIDGE_EVENT_ZMQ_ENDPOINT` | `--event-zmq-endpoint` | `tcp://127.0.0.1:15561` | 独立委托/成交事件通道；仅允许回环地址且必须与 RPC 端口不同 |
 | `QMT_BRIDGE_ACCOUNT_ENABLED` | `--account-enabled` | `false` | 启用账户只读查询 |
 | `QMT_BRIDGE_TRADING_ACCOUNT_ID` | `--account-id` | _(空)_ | 交易账户 ID |
 | `QMT_BRIDGE_ORDER_WRITES_ENABLED` | `--order-writes-enabled` | `true` | API 层委托写入门禁；可显式设为 `false` 冻结写入，终端层仍需同时启用 |
@@ -62,6 +63,7 @@ QMT_BRIDGE_RUNTIME=bigqmt
 # QMT_BRIDGE_QMT_ROOT=C:\国金证券QMT交易端
 QMT_BRIDGE_RPC_TRANSPORT=zmq
 QMT_BRIDGE_ZMQ_ENDPOINT=tcp://127.0.0.1:15560
+QMT_BRIDGE_EVENT_ZMQ_ENDPOINT=tcp://127.0.0.1:15561
 QMT_BRIDGE_FORMULA_ENABLED=true
 QMT_BRIDGE_FORMULA_HOST=127.0.0.1
 QMT_BRIDGE_FORMULA_PORT=58600
@@ -71,6 +73,10 @@ QMT_BRIDGE_FORMULA_PORT=58600
 # QMT_BRIDGE_TRADING_ACCOUNT_ID=12345678
 # QMT_BRIDGE_ORDER_WRITES_ENABLED=true
 ```
+
+RPC 请求/响应使用 `15560`；委托和成交回报使用独立的 ZMQ PUB/SUB `15561`。
+事件带 `{epoch, sequence}` 游标，内嵌运行时默认保留最近 2000 条用于断线回放；
+两条通道都必须保持在本机回环地址，不能复用同一端口。
 
 ## 认证机制
 

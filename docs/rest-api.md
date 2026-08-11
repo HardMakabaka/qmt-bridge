@@ -149,6 +149,7 @@
 |------|------|------|
 | GET | `/api/meta/health` | HTTP 进程存活检查 |
 | GET | `/api/meta/readiness` | Big QMT ZMQ、账户与固定上游版本运行就绪检查 |
+| GET | `/api/meta/capabilities` | 186 个 HTTP 操作与 5 个 WebSocket 的适配/运行状态 |
 | GET | `/api/meta/version` | 服务版本 |
 | GET | `/api/meta/xtdata_version` | xtquant 版本 |
 | GET | `/api/meta/connection_status` | xtdata 连接状态 |
@@ -208,6 +209,26 @@
 | POST | `/api/trading/export_data` | 导出交易数据 |
 | GET | `/api/trading/query_data` | 查询导出数据 |
 | POST | `/api/trading/sync_transaction` | 同步外部成交 |
+
+`sync_transaction` 请求体必须显式提供 `operation`、`data_type` 和 `data`，可选
+`account_type`（默认 `STOCK`）与 `account_id`。它不会再把字段重命名后调用不相干
+的资金或普通委托接口。
+
+## Big QMT 能力边界
+
+`GET /api/meta/capabilities` 是权威清单。当前代码基线明确标记 44 个 HTTP 操作
+和 2 个 WebSocket 为 `unsupported`，主要分组如下：
+
+- 银证接口 8 个、SMT 接口 8 个：安装的 Big QMT 精确方法未验证或不存在。
+- 资金/CTP 接口 7 个、信用接口 2 个：禁止回退到普通资金划转或普通委托。
+- 异步委托/撤单、COM、导出/查询 6 个：RPC 合同未提供对应原生能力。
+- 千档 HTTP 3 个、千档/公式 WebSocket 2 个：不以普通 L2 或轮询伪装推送。
+- 其余 10 个包括次主力、全速盘口、成交笔数、板块变更、下载、财务字段和
+  自定义指数等缺失或签名未验证接口。
+
+所有这类调用返回统一信封：`status`、`data`、`reason_code`、`message`、
+`capability`、`provider`、`retryable`、`details`。`unavailable` 可重试；
+`unsupported` 不可重试。业务空集合仅在真实成功时返回，不能再代表接口缺失。
 
 ## Credit — 融资融券 `/api/credit/*` :material-lock:
 

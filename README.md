@@ -9,7 +9,7 @@ Mac / Linux (主力机)                    Windows (中转站)
 ┌──────────────────────┐                ┌─────────────────────────┐
 │  你的分析 / 交易代码    │   HTTP/WS     │  Big QMT 客户端 (登录中)   │
 │  本地数据库            │ ◄───────────► │  ZMQ 模型 + FastAPI       │
-│  可视化仪表盘          │   局域网       │  127.0.0.1:15560         │
+│  可视化仪表盘          │   局域网       │  RPC 15560 / 事件 15561   │
 └──────────────────────┘                └─────────────────────────┘
 ```
 
@@ -21,8 +21,8 @@ QMT Bridge 把终端内能力收敛到只监听回环地址的 ZMQ 边界，再�
 
 ## Features
 
-- **100+ REST API 端点** — 历史 K 线、实时行情、L2 逐笔、板块管理、财务数据、指数权重、期权链、可转债、ETF、港股通、期货主力合约等
-- **5 个 WebSocket 端点** — 实时行情推送、全市场行情、L2 千档、下载进度、交易回报
+- **186 个 HTTP 操作** — 启用账户路由时覆盖行情、板块、财务、账户与受控交易；Python 客户端逐项覆盖
+- **5 个 WebSocket 端点** — 实时行情、全市场行情、公式、L2 千档和交易回报；未验证能力显式返回 `unsupported`
 - **账户只读查询** — 资产、持仓、当日委托和成交；不需要开启委托写入
 - **受控委托边界** — 下单和撤单默认具备写能力，仍需 API Key、资金账户、两层写门禁和 QMT 实盘模式证明
 - **零依赖客户端** — Python 客户端基于 stdlib，无需安装 xtquant 即可在任意平台使用
@@ -73,7 +73,8 @@ pip install -e ".[client]"
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-bigqmt-runtime.ps1 `
   -QmtRoot "C:\国金证券QMT交易端" `
-  -AccountId "12345678"
+  -AccountId "12345678" `
+  -EventZmqEndpoint "tcp://127.0.0.1:15561"
 ```
 
 首次安装若输出 `compiled_model_ready=false`，在 QMT 中新建名为
@@ -106,6 +107,7 @@ qmt-server --port 13543 --log-level debug
 # Big QMT ZMQ + 账户查询；写能力默认开启，实际放行仍需终端实盘证明
 qmt-server --qmt-root "C:\国金证券QMT交易端" \
   --zmq-endpoint tcp://127.0.0.1:15560 \
+  --event-zmq-endpoint tcp://127.0.0.1:15561 \
   --account-enabled --account-id 12345678 \
   --api-key your-secret-key
 ```
@@ -137,7 +139,33 @@ Swagger 只证明 HTTP 进程存活。运行验收必须检查 readiness：
 
 ```bash
 curl http://<Windows局域网IP>:13543/api/meta/readiness
+curl http://<Windows局域网IP>:13543/api/meta/capabilities
 ```
+
+### 能力与失败合同
+
+`GET /api/meta/capabilities` 是接口适配状态的唯一运行时清单。每条记录包含
+`path`、`method`、`mode`（`native` / `derived` / `unsupported`）、
+`status`、`reason_code`、`write_effect` 和线程归属。当前代码基线明确标记
+44 个 HTTP 操作与 2 个 WebSocket 操作为未适配；不要通过空列表猜测支持状态。
+
+可选 Big QMT 能力统一返回以下失败信封，客户端不会再把它解包成空数据：
+
+```json
+{
+  "status": "unsupported",
+  "data": null,
+  "reason_code": "xttrader_credit_order_missing",
+  "message": "xttrader_credit_order_missing",
+  "capability": "credit_order",
+  "provider": "bigqmt",
+  "retryable": false,
+  "details": {}
+}
+```
+
+`unavailable` 表示运行时/终端暂时不可用且 `retryable=true`；`unsupported`
+表示该精确 Big QMT 合同不存在或未验证，不允许回退到语义不同的接口。
 
 ## Configuration
 
@@ -158,6 +186,7 @@ curl http://<Windows局域网IP>:13543/api/meta/readiness
 | `QMT_BRIDGE_QMT_ROOT` | `--qmt-root` | _(空)_ | Big QMT 终端根目录；委托写入用它读取终端日志并证明当前模型为实盘模式 |
 | `QMT_BRIDGE_RPC_TRANSPORT` | — | `zmq` | 固定 ZMQ RPC |
 | `QMT_BRIDGE_ZMQ_ENDPOINT` | `--zmq-endpoint` | `tcp://127.0.0.1:15560` | 仅允许回环地址 |
+| `QMT_BRIDGE_EVENT_ZMQ_ENDPOINT` | `--event-zmq-endpoint` | `tcp://127.0.0.1:15561` | 独立委托/成交事件 PUB；仅允许回环地址且不得与 RPC 端口相同 |
 | `QMT_BRIDGE_ACCOUNT_ENABLED` | `--account-enabled` | `false` | 启用账户只读查询 |
 | `QMT_BRIDGE_TRADING_ACCOUNT_ID` | `--account-id` | _(空)_ | 交易账户 ID |
 | `QMT_BRIDGE_ORDER_WRITES_ENABLED` | `--order-writes-enabled` | `true` | API 层委托写入门禁；可显式设为 `false` 冻结写入，终端层门禁仍需同时开启 |
@@ -278,6 +307,7 @@ curl http://<Windows局域网IP>:13543/api/meta/readiness
 |--------|------|-------------|
 | GET | `/api/meta/health` | HTTP 进程存活检查 |
 | GET | `/api/meta/readiness` | Big QMT ZMQ、账户和固定上游版本运行就绪检查 |
+| GET | `/api/meta/capabilities` | 全量 HTTP/WS 能力、适配模式、运行状态和原因码 |
 | GET | `/api/meta/version` | 服务版本 |
 | GET | `/api/meta/xtdata_version` | xtquant 版本 |
 | GET | `/api/meta/connection_status` | xtdata 连接状态 |
@@ -319,17 +349,21 @@ curl http://<Windows局域网IP>:13543/api/meta/readiness
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/credit/order` | 信用交易下单 |
-| GET | `/api/credit/quota` | 额度查询 |
-| GET | `/api/credit/position` | 信用持仓 |
+| POST | `/api/credit/order` | 信用交易下单（当前精确 Big QMT 方法未适配） |
+| GET | `/api/credit/available_amount` | 额度查询（当前未适配） |
+| GET | `/api/credit/positions` | 信用持仓 |
+| GET | `/api/credit/asset` | 信用资产 |
+| GET | `/api/credit/debt` | 信用负债 |
 
 ### Fund & Bank — 资金划转 (需要 API Key)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/fund/transfer` | 资金划转 |
-| GET | `/api/fund/history` | 划转记录 |
-| POST | `/api/bank/transfer` | 银证转账 |
+| POST | `/api/fund/transfer` | 资金划转（当前未适配） |
+| GET | `/api/fund/transfer_records` | 划转记录（当前未适配） |
+| GET | `/api/fund/available` | 可用资金（由资产查询派生） |
+| POST | `/api/bank/transfer_in` | 银行转证券（当前未适配） |
+| POST | `/api/bank/transfer_out` | 证券转银行（当前未适配） |
 
 ### WebSocket
 
@@ -337,7 +371,8 @@ curl http://<Windows局域网IP>:13543/api/meta/readiness
 |------|-------------|
 | `/ws/realtime` | 实时行情推送 |
 | `/ws/whole_quote` | 全市场行情订阅 |
-| `/ws/l2_thousand` | L2 千档行情推送 |
+| `/ws/formula` | 公式推送；当前 Big QMT 合同未验证，返回 `unsupported` |
+| `/ws/l2_thousand` | L2 千档推送；当前 Big QMT 合同未验证，返回 `unsupported` |
 | `/ws/trade` | 交易回报推送 (需要 API Key) |
 
 WebSocket 连接后发送 JSON 订阅请求：

@@ -76,6 +76,7 @@ qmt-server --port 8080 --log-level debug
 # Big QMT ZMQ + 账户查询；写能力默认开启，真实委托还需终端实盘证明
 qmt-server --qmt-root "C:\国金证券QMT交易端" \
     --zmq-endpoint tcp://127.0.0.1:15560 \
+    --event-zmq-endpoint tcp://127.0.0.1:15561 \
     --account-enabled --account-id 12345678 \
     --api-key your-secret-key
 ```
@@ -107,6 +108,7 @@ Swagger 只证明 HTTP 进程存活。运行验收必须检查 readiness：
 
 ```bash
 curl http://<Windows局域网IP>:13543/api/meta/readiness
+curl http://<Windows局域网IP>:13543/api/meta/capabilities
 ```
 
 ## Python 客户端用法
