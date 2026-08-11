@@ -58,11 +58,10 @@ def test_formula_websocket_reports_push_as_unsupported():
         ws.send_json({"action": "subscribe", "formula_name": "MA"})
         payload = ws.receive_json()
 
-    assert payload == {
-        "status": "unsupported",
-        "capability": "formula_push",
-        "reason": "bigqmt_formula_push_not_verified",
-    }
+    assert payload["status"] == "unsupported"
+    assert payload["capability"] == "formula_push"
+    assert payload["reason_code"] == "bigqmt_formula_push_not_verified"
+    assert payload["retryable"] is False
 
 
 def test_l2_thousand_websocket_reports_push_as_unsupported():
@@ -70,8 +69,7 @@ def test_l2_thousand_websocket_reports_push_as_unsupported():
         ws.send_json({"stocks": ["000001.SZ"]})
         payload = ws.receive_json()
 
-    assert payload == {
-        "status": "unsupported",
-        "capability": "l2_thousand_push",
-        "reason": "bigqmt_l2_push_not_verified",
-    }
+    assert payload["status"] == "unsupported"
+    assert payload["capability"] == "l2_thousand_push"
+    assert payload["reason_code"] == "bigqmt_l2_push_not_verified"
+    assert payload["retryable"] is False

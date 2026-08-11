@@ -3,8 +3,8 @@
 from fastapi import APIRouter, Depends
 
 from ..deps import get_trader_manager
-from ..helpers import _numpy_to_python
-from ..models import SMTNegotiateOrderRequest, SMTOrderRequest, SMTQueryRequest
+from ..helpers import _is_failure_payload, _optional_result_payload
+from ..models import CancelRequest, SMTNegotiateOrderRequest, SMTOrderRequest, SMTQueryRequest
 from ..security import require_api_key
 
 router = APIRouter(prefix="/api/smt", tags=["smt"], dependencies=[Depends(require_api_key)])
@@ -24,6 +24,8 @@ def smt_order(req: SMTOrderRequest, manager=Depends(get_trader_manager)):
         order_remark=req.order_remark,
         account_id=req.account_id,
     )
+    if _is_failure_payload(result):
+        return result
     return {"order_id": result, "status": "submitted"}
 
 
@@ -40,14 +42,16 @@ def smt_negotiate_order_async(req: SMTNegotiateOrderRequest, manager=Depends(get
         order_remark=req.order_remark,
         account_id=req.account_id,
     )
+    if _is_failure_payload(result):
+        return result
     return {"seq": result, "status": "async_submitted"}
 
 
 @router.post("/cancel")
-def cancel_smt_order(order_id: int, account_id: str = "", manager=Depends(get_trader_manager)):
+def cancel_smt_order(req: CancelRequest, manager=Depends(get_trader_manager)):
     """Cancel an SMT order."""
-    result = manager.cancel_smt_order(order_id=order_id, account_id=account_id)
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    result = manager.cancel_smt_order(order_id=req.order_id, account_id=req.account_id)
+    return _optional_result_payload(result, status="ok")
 
 
 @router.get("/quoter")
@@ -57,7 +61,7 @@ def smt_query_quoter(
 ):
     """Query SMT quoter information (报价方信息)."""
     result = manager.smt_query_quoter(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/compact")
@@ -67,7 +71,7 @@ def smt_query_compact(
 ):
     """Query SMT compacts (约定合约)."""
     result = manager.smt_query_compact(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/appointment")
@@ -77,7 +81,7 @@ def query_appointment_info(
 ):
     """Query SMT appointment info (约定式预约信息)."""
     result = manager.query_appointment_info(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/secu_info")
@@ -87,14 +91,26 @@ def query_smt_secu_info(
 ):
     """Query SMT security info (约定式证券信息)."""
     result = manager.query_smt_secu_info(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/secu_rate")
 def query_smt_secu_rate(
+    stock_code: str = "",
+    max_term: int = 0,
+    fare_way: int = 0,
+    credit_type: int = 0,
+    trade_type: int = 0,
     account_id: str = "",
     manager=Depends(get_trader_manager),
 ):
     """Query SMT security rates (约定式证券费率)."""
-    result = manager.query_smt_secu_rate(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    result = manager.query_smt_secu_rate(
+        stock_code=stock_code,
+        max_term=max_term,
+        fare_way=fare_way,
+        credit_type=credit_type,
+        trade_type=trade_type,
+        account_id=account_id,
+    )
+    return _optional_result_payload(result)

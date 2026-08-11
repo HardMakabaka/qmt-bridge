@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends
 
 from ..deps import get_trader_manager
-from ..helpers import _numpy_to_python
+from ..helpers import _is_failure_payload, _optional_result_payload
 from ..models import CreditOrderRequest, CreditQueryRequest
 from ..security import require_api_key
 
@@ -24,6 +24,8 @@ def credit_order(req: CreditOrderRequest, manager=Depends(get_trader_manager)):
         order_remark=req.order_remark,
         account_id=req.account_id,
     )
+    if _is_failure_payload(result):
+        return result
     return {"order_id": result, "status": "submitted"}
 
 
@@ -34,7 +36,7 @@ def query_credit_positions(
 ):
     """Query credit trading positions."""
     result = manager.query_credit_positions(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/asset")
@@ -44,7 +46,7 @@ def query_credit_asset(
 ):
     """Query credit trading account asset."""
     result = manager.query_credit_asset(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/debt")
@@ -54,7 +56,7 @@ def query_credit_debt(
 ):
     """Query credit debt information."""
     result = manager.query_credit_debt(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/available_amount")
@@ -65,7 +67,7 @@ def query_credit_available(
 ):
     """Query available credit amount for a stock."""
     result = manager.query_credit_available(stock_code=stock_code, account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/slo_stocks")
@@ -75,7 +77,7 @@ def query_slo_stocks(
 ):
     """Query stocks available for short selling (融券标的)."""
     result = manager.query_slo_stocks(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/fin_stocks")
@@ -85,7 +87,7 @@ def query_fin_stocks(
 ):
     """Query stocks available for margin buying (融资标的)."""
     result = manager.query_fin_stocks(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/subjects")
@@ -95,7 +97,7 @@ def query_credit_subjects(
 ):
     """Query credit subject list (标的证券)."""
     result = manager.query_credit_subjects(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/assure")
@@ -105,4 +107,4 @@ def query_credit_assure(
 ):
     """Query credit assurance / collateral info (担保品)."""
     result = manager.query_credit_assure(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)

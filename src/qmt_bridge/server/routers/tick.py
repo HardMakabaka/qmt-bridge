@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Query
 from ..bigqmt import xtdata
 
-from ..helpers import _call_xtdata_serialized, _numpy_to_python
+from ..helpers import _call_xtdata_optional, _call_xtdata_serialized, _numpy_to_python
 
 router = APIRouter(prefix="/api/tick", tags=["tick"])
 
@@ -75,15 +75,17 @@ def get_l2_thousand_quote(
     count: int = Query(-1, description="返回条数"),
 ):
     """Get L2 thousand-level quote (千档行情)."""
-    raw = _call_xtdata_serialized(
-        xtdata.get_l2_thousand_quote,
+    payload = _call_xtdata_optional(
+        xtdata,
+        "get_l2_thousand_quote",
         field_list=[],
         stock_code=stock,
         start_time=start_time,
         end_time=end_time,
         count=count,
     )
-    return {"stock": stock, "data": _numpy_to_python(raw)}
+    payload["stock"] = stock
+    return payload
 
 
 @router.get("/l2_thousand_orderbook")
@@ -94,15 +96,17 @@ def get_l2_thousand_orderbook(
     count: int = Query(-1, description="返回条数"),
 ):
     """Get L2 thousand-level order book."""
-    raw = _call_xtdata_serialized(
-        xtdata.get_l2_thousand_orderbook,
+    payload = _call_xtdata_optional(
+        xtdata,
+        "get_l2_thousand_orderbook",
         field_list=[],
         stock_code=stock,
         start_time=start_time,
         end_time=end_time,
         count=count,
     )
-    return {"stock": stock, "data": _numpy_to_python(raw)}
+    payload["stock"] = stock
+    return payload
 
 
 @router.get("/l2_thousand_trade")
@@ -113,12 +117,14 @@ def get_l2_thousand_trade(
     count: int = Query(-1, description="返回条数"),
 ):
     """Get L2 thousand-level trade data."""
-    raw = _call_xtdata_serialized(
-        xtdata.get_l2_thousand_trade,
+    payload = _call_xtdata_optional(
+        xtdata,
+        "get_l2_thousand_trade",
         field_list=[],
         stock_code=stock,
         start_time=start_time,
         end_time=end_time,
         count=count,
     )
-    return {"stock": stock, "data": _numpy_to_python(raw)}
+    payload["stock"] = stock
+    return payload

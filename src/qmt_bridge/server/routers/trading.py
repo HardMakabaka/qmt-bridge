@@ -6,7 +6,11 @@ from fastapi import APIRouter, Depends, Request
 
 from ..config import get_settings
 from ..deps import get_trader_manager
-from ..helpers import _numpy_to_python
+from ..helpers import (
+    _is_failure_payload,
+    _numpy_to_python,
+    _optional_result_payload,
+)
 from ..models import (
     AsyncCancelRequest,
     AsyncOrderRequest,
@@ -356,6 +360,8 @@ def place_order_async(req: AsyncOrderRequest, manager=Depends(get_trader_manager
         order_remark=req.order_remark,
         account_id=req.account_id,
     )
+    if _is_failure_payload(result):
+        return result
     return {"seq": result, "status": "async_submitted"}
 
 
@@ -368,6 +374,8 @@ def cancel_order_async(req: AsyncCancelRequest, manager=Depends(get_trader_manag
             market=req.market,
             account_id=req.account_id,
         )
+        if _is_failure_payload(result):
+            return result
         return {
             "seq": result,
             "status": "async_submitted",
@@ -379,6 +387,8 @@ def cancel_order_async(req: AsyncCancelRequest, manager=Depends(get_trader_manag
         order_id=req.order_id,
         account_id=req.account_id,
     )
+    if _is_failure_payload(result):
+        return result
     return {"seq": result, "status": "async_submitted", "cancel_method": "order_id"}
 
 
@@ -395,7 +405,7 @@ def query_single_order(
 ):
     """Query a single order by order_id."""
     result = manager.query_single_order(order_id=order_id, account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/trade/{trade_id}")
@@ -406,7 +416,7 @@ def query_single_trade(
 ):
     """Query a single trade by trade_id."""
     result = manager.query_single_trade(trade_id=trade_id, account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/position/{stock_code}")
@@ -417,7 +427,7 @@ def query_single_position(
 ):
     """Query position for a single stock."""
     result = manager.query_single_position(stock_code=stock_code, account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 # ------------------------------------------------------------------
@@ -432,7 +442,7 @@ def query_position_statistics(
 ):
     """Query position statistics summary."""
     result = manager.query_position_statistics(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 # ------------------------------------------------------------------
@@ -447,14 +457,14 @@ def query_new_purchase_limit(
 ):
     """Query IPO new purchase limit."""
     result = manager.query_new_purchase_limit(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/ipo_data")
 def query_ipo_data(manager=Depends(get_trader_manager)):
     """Query IPO calendar data."""
     result = manager.query_ipo_data()
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 # ------------------------------------------------------------------
@@ -466,7 +476,7 @@ def query_ipo_data(manager=Depends(get_trader_manager)):
 def query_account_infos(manager=Depends(get_trader_manager)):
     """Query info for all registered trading accounts."""
     result = manager.query_account_infos()
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 # ------------------------------------------------------------------
@@ -481,7 +491,7 @@ def query_com_fund(
 ):
     """Query COM fund (option/future account funds)."""
     result = manager.query_com_fund(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/com_position")
@@ -491,7 +501,7 @@ def query_com_position(
 ):
     """Query COM positions (option/future account positions)."""
     result = manager.query_com_position(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 # ------------------------------------------------------------------
@@ -507,7 +517,7 @@ def export_data(req: ExportDataRequest, manager=Depends(get_trader_manager)):
         file_path=req.file_path,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")
 
 
 @router.get("/query_data")
@@ -527,14 +537,17 @@ def query_data(
         end_time=end_time,
         account_id=account_id,
     )
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.post("/sync_transaction")
 def sync_transaction(req: SyncTransactionRequest, manager=Depends(get_trader_manager)):
     """Sync external transaction records into the system."""
     result = manager.sync_transaction_from_external(
+        operation=req.operation,
+        data_type=req.data_type,
         data=req.data,
+        account_type=req.account_type,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")

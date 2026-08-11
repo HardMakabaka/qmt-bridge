@@ -79,6 +79,13 @@ def main():
         help="Big QMT ZMQ RPC endpoint",
     )
     parser.add_argument(
+        "--event-zmq-endpoint",
+        default=os.environ.get(
+            "QMT_BRIDGE_EVENT_ZMQ_ENDPOINT", "tcp://127.0.0.1:15561"
+        ),
+        help="Big QMT execution event ZMQ endpoint",
+    )
+    parser.add_argument(
         "--order-writes-enabled",
         action="store_true",
         default=os.environ.get(
@@ -101,6 +108,7 @@ def main():
         api_key=args.api_key,
         qmt_root=args.qmt_root,
         zmq_endpoint=args.zmq_endpoint,
+        event_zmq_endpoint=args.event_zmq_endpoint,
         account_enabled=args.account_enabled,
         trading_account_id=args.account_id,
         order_writes_enabled=args.order_writes_enabled,

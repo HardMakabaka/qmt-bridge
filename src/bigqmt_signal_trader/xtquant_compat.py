@@ -368,6 +368,13 @@ class BigQmtRpcClient:
         ).lower()
         self.zmq_config = dict(merged_redis_config.get("zmq") or {})
         self.mysql_config = dict(merged_redis_config.get("mysql") or {})
+        self.execution_event_config = dict(
+            merged_redis_config.get("exec_events") or {}
+        )
+        self.execution_event_config.setdefault(
+            "transport",
+            "zmq" if self.transport_name == "zmq" else "redis",
+        )
         self._transport_instance = None  # lazily built by _transport()
         # FormulaServer read fast-path. QMT's C++ quote service (port 58600)
         # answers reference/history reads in ~0.07ms without touching the QMT
@@ -484,7 +491,15 @@ class BigQmtRpcClient:
                 timeout_seconds=wait_seconds,
             )
         if not response.get("ok"):
-            raise RuntimeError(response.get("error") or "Big QMT RPC failed: %s" % method)
+            error = response.get("error") or "Big QMT RPC failed: %s" % method
+            error_type = str(response.get("error_type") or "")
+            if error_type in ("NotImplementedError", "AttributeError"):
+                raise NotImplementedError(error)
+            if error_type in ("TimeoutError", "TransportTimeout"):
+                raise TimeoutError(error)
+            if error_type in ("ConnectionError", "OSError", "TransportError"):
+                raise OSError(error)
+            raise RuntimeError(error)
         return _restore_jsonable(response.get("data"))
 
     def publish_event(self, event_type, payload, stream_template="bigqmt:quote_events:{account_id}"):
@@ -585,6 +600,12 @@ class BigQmtXtData:
     def get_instrument_detail(self, stock_code):
         return self.client.call("get_instrument_detail", {"code": stock_code}) or {}
 
+    def get_instrument_detail_list(self, stock_list, iscomplete=False):
+        return {
+            stock_code: self.get_instrument_detail(stock_code)
+            for stock_code in list(stock_list or [])
+        }
+
     def get_instrumentdetail(self, stock_code):
         return self.get_instrument_detail(stock_code)
 
@@ -657,6 +678,43 @@ class BigQmtXtData:
                     cache.write(code, period, df, dividend_type=dividend_type)
                 except Exception:
                     pass
+        return data
+
+    def get_market_data3(
+        self,
+        field_list=None,
+        stock_list=None,
+        period="1d",
+        start_time="",
+        end_time="",
+        count=-1,
+        dividend_type="none",
+        fill_data=True,
+    ):
+        return self.get_market_data_ex(
+            field_list=field_list,
+            stock_list=stock_list,
+            period=period,
+            start_time=start_time,
+            end_time=end_time,
+            count=count,
+            dividend_type=dividend_type,
+            fill_data=fill_data,
+        )
+
+    def get_full_kline(self, stock_code, period="1d", start_time="", end_time=""):
+        data = self.get_market_data_ex(
+            field_list=[],
+            stock_list=[stock_code],
+            period=period,
+            start_time=start_time,
+            end_time=end_time,
+            count=-1,
+            dividend_type="none",
+            fill_data=True,
+        )
+        if isinstance(data, dict):
+            return data.get(stock_code)
         return data
 
     def get_local_data(
@@ -843,6 +901,18 @@ class BigQmtXtData:
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):
         return self.download_history_data2([stock_code], period, start_time, end_time, dividend_type=dividend_type)
 
+    def download_cb_data(self):
+        return self._call("download_cb_data")
+
+    def download_history_contracts(self):
+        return self._call("download_history_contracts")
+
+    def download_index_weight(self):
+        return self._call("download_index_weight")
+
+    def download_sector_data(self):
+        return self._call("download_sector_data")
+
     def local_cache_stats(self):
         """Return (cached files, periods) for the client-side local cache."""
         cache = self._local_cache()
@@ -850,6 +920,12 @@ class BigQmtXtData:
 
     def get_trading_dates(self, market, start_time="", end_time="", count=-1):
         return self._call("get_trading_dates", market=market, start_time=start_time, end_time=end_time, count=count)
+
+    def get_period_list(self):
+        return ["tick", "1m", "5m", "15m", "30m", "60m", "1d"]
+
+    def get_trading_period(self, stock_code):
+        return self.get_trade_times(stock_code)
 
     def get_holidays(self):
         return self._call("get_holidays")
@@ -884,6 +960,21 @@ class BigQmtXtData:
             end_time=end_time,
             report_type=report_type,
         )
+
+    def get_financial_table_list(self):
+        return [
+            "Balance",
+            "Income",
+            "CashFlow",
+            "Capital",
+            "Holdernum",
+            "Top10holder",
+            "Top10flowholder",
+            "Pershareindex",
+        ]
+
+    def getfindata(self, table, field="", session=""):
+        return self._call("getfindata", table=table, field=field, session=session)
 
     def download_financial_data(self, stock_list, table_list=None, start_time="", end_time="", incrementally=None):
         return self._call(
@@ -931,6 +1022,30 @@ class BigQmtXtData:
             dividend_type=dividend_type,
             extend_param=extend_param or {},
         )
+
+    def call_formula_batch(self, formula_name, stock_codes, period, start_time="", end_time="", count=-1, dividend_type=None, **params):
+        result = {}
+        for stock_code in list(stock_codes or []):
+            try:
+                data = self.call_formula(
+                    formula_name,
+                    stock_code,
+                    period,
+                    start_time,
+                    end_time,
+                    count,
+                    dividend_type,
+                    params,
+                )
+                result[stock_code] = {"status": "ok", "data": data}
+            except Exception as exc:
+                result[stock_code] = {
+                    "status": "error",
+                    "data": None,
+                    "reason_code": "bigqmt_formula_call_failed",
+                    "message": str(exc),
+                }
+        return result
 
     def subscribe_formula(self, formula_name, stock_code, period, start_time="", end_time="", count=-1, dividend_type=None, extend_param=None, callback=None):
         result = self._call(
@@ -1083,11 +1198,61 @@ class BigQmtXtData:
     def get_hkt_details(self, stock_code):
         return self._call("get_hkt_details", stock_code=stock_code)
 
+    def get_hkt_exchange_rate(self, account_id="", account_type=""):
+        return self._call(
+            "get_hkt_exchange_rate",
+            account_id=account_id,
+            account_type=account_type,
+        )
+
     def create_sector(self, sector_name, stock_list):
         return self._call("create_sector", sector_name=sector_name, stock_list=list(stock_list or []))
 
     def get_stock_name(self, stock):
         return self._call("get_stock_name", stock=stock)
+
+    def get_last_volume(self, stock):
+        return self._call("get_last_volume", stock=stock)
+
+    def get_open_date(self, stock):
+        return self._call("get_open_date", stock=stock)
+
+    def get_contract_expire_date(self, stock):
+        return self._call("get_contract_expire_date", stock=stock)
+
+    def get_contract_multiplier(self, stockcode):
+        return self._call("get_contract_multiplier", stockcode=stockcode)
+
+    def get_total_share(self, stockcode):
+        return self._call("get_total_share", stockcode=stockcode)
+
+    def get_svol(self, stock):
+        return self._call("get_svol", stock=stock)
+
+    def get_bvol(self, stock):
+        return self._call("get_bvol", stock=stock)
+
+    def get_risk_free_rate(self, index=-1):
+        return self._call("get_risk_free_rate", index=index)
+
+    def get_basket(self, basket_name):
+        return self._call("get_basket", basket_name=basket_name)
+
+    def get_etf_iopv(self, stockcode):
+        return self._call("get_etf_iopv", stockcode=stockcode)
+
+    def get_industry_name_of_stock(self, industry_type, stock):
+        return self._call(
+            "get_industry_name_of_stock",
+            industry_type=industry_type,
+            stock=stock,
+        )
+
+    def get_market_time(self, market):
+        return self._call("get_market_time", market=market)
+
+    def is_suspended_stock(self, stock):
+        return self._call("is_suspended_stock", stock=stock)
 
     def get_close_price(self, market, stock_code, real_timetag, period=86400000, divid_type=0):
         return self._call(
@@ -1216,6 +1381,8 @@ class BigQmtXtTrader:
         self.callback = None
         self._event_thread = None
         self._event_running = False
+        self._event_cursor = None
+        self._event_replay_gap = False
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -1292,6 +1459,12 @@ class BigQmtXtTrader:
         self._event_thread.start()
 
     def _event_loop(self):
+        event_config = dict(
+            getattr(self.client, "execution_event_config", {}) or {}
+        )
+        if str(event_config.get("transport") or "redis").lower() == "zmq":
+            self._event_loop_zmq(event_config)
+            return
         from .exec_events import order_channel, trade_channel
 
         while self._event_running:
@@ -1316,18 +1489,112 @@ class BigQmtXtTrader:
                 except Exception:
                     pass
 
-    def _dispatch_event(self, raw):
+    def _event_loop_zmq(self, event_config):
+        zmq_config = dict(event_config.get("zmq") or {})
+        endpoint = str(
+            zmq_config.get("connect_address")
+            or "tcp://127.0.0.1:15561"
+        )
+        replay_interval = max(
+            0.001,
+            float(zmq_config.get("replay_interval_seconds") or 5.0),
+        )
+        while self._event_running:
+            socket = None
+            try:
+                import zmq
+
+                socket = zmq.Context.instance().socket(zmq.SUB)
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(zmq.RCVTIMEO, 1000)
+                socket.setsockopt(zmq.SUBSCRIBE, b"")
+                socket.connect(endpoint)
+                self._replay_execution_events()
+                last_replay_at = time.time()
+                while self._event_running:
+                    try:
+                        raw = socket.recv()
+                    except zmq.Again:
+                        if (
+                            self._event_running
+                            and time.time() - last_replay_at >= replay_interval
+                        ):
+                            self._replay_execution_events()
+                            last_replay_at = time.time()
+                        continue
+                    self._dispatch_event(raw)
+            except Exception:
+                if self._event_running:
+                    time.sleep(1.0)
+            finally:
+                if socket is not None:
+                    try:
+                        socket.close(linger=0)
+                    except Exception:
+                        pass
+
+    def _replay_execution_events(self):
+        cursor = self._event_cursor or {"epoch": "", "sequence": 0}
+        replay = self.client.call(
+            "get_events_since",
+            {"cursor": dict(cursor)},
+        ) or {}
+        self._event_replay_gap = bool(replay.get("gap"))
+        for event in replay.get("events") or []:
+            self._dispatch_event(event, repair_gap=False)
+        replay_cursor = replay.get("cursor")
+        if isinstance(replay_cursor, dict):
+            self._event_cursor = dict(replay_cursor)
+
+    def _dispatch_event(self, raw, repair_gap=True):
         callback = self.callback
         if callback is None:
             return
-        try:
-            text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            event = json.loads(text)
-        except Exception:
-            return
+        if isinstance(raw, dict):
+            event = dict(raw)
+        else:
+            try:
+                text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                event = json.loads(text)
+            except Exception:
+                return
         if not isinstance(event, dict):
             return
+        cursor = event.get("cursor")
+        if isinstance(cursor, dict):
+            current = self._event_cursor or {}
+            same_epoch = str(current.get("epoch") or "") == str(
+                cursor.get("epoch") or ""
+            )
+            try:
+                incoming_sequence = int(cursor.get("sequence") or 0)
+                current_sequence = int(current.get("sequence") or 0)
+                duplicate = same_epoch and incoming_sequence <= current_sequence
+                sequence_gap = (
+                    repair_gap
+                    and same_epoch
+                    and bool(current.get("epoch"))
+                    and incoming_sequence > current_sequence + 1
+                )
+            except (TypeError, ValueError):
+                duplicate = False
+                sequence_gap = False
+            if duplicate:
+                return
+            if sequence_gap:
+                self._replay_execution_events()
+                repaired = self._event_cursor or {}
+                if (
+                    str(repaired.get("epoch") or "")
+                    == str(cursor.get("epoch") or "")
+                    and _safe_int(repaired.get("sequence")) >= incoming_sequence
+                ):
+                    return
+            self._event_cursor = dict(cursor)
         account_id = str(event.get("account_id") or self.client.account_id or "")
+        subscribed_account_id = str(self.client.account_id or "")
+        if subscribed_account_id and account_id and account_id != subscribed_account_id:
+            return
         try:
             if event.get("event_type") == "trade":
                 callback.on_stock_trade(self._trade_from_dict(account_id, event))
@@ -1481,6 +1748,21 @@ class BigQmtXtTrader:
         ) or []
         return [self._trade_from_dict(account_id, item) for item in _as_list(data)]
 
+    def query_stock_trade(self, account, trade_id):
+        target_trade_id = str(trade_id or "")
+        for trade in self.query_stock_trades(account, strategy_name=""):
+            if str(getattr(trade, "trade_id", "") or "") == target_trade_id:
+                return trade
+        return None
+
+    def query_position_statistics(self, account):
+        account_id = _account_id(account, self.client.account_id)
+        return self.client.call(
+            "query_position_statistics",
+            {"account_id": account_id},
+            account_id=account_id,
+        ) or []
+
     def query_execution_snapshot(
         self,
         account,
@@ -1547,7 +1829,9 @@ class BigQmtXtTrader:
         ) or {}
 
     def order_stock_async(self, *args, **kwargs):
-        return self.order_stock(*args, **kwargs)
+        raise NotImplementedError(
+            "order_stock_async is not supported via Big QMT RPC"
+        )
 
     def order_stock_batch(self, account, orders, batch_id=""):
         account_id = _account_id(account, self.client.account_id)
@@ -1595,10 +1879,11 @@ class BigQmtXtTrader:
 
     def _query_account_list(self, account, method):
         account_id = _account_id(account, self.client.account_id)
-        try:
-            return self.client.call(method, {"account_id": account_id}, account_id=account_id) or []
-        except Exception:
-            return []
+        return self.client.call(
+            method,
+            {"account_id": account_id},
+            account_id=account_id,
+        ) or []
 
     def query_account_infos(self, account=None):
         return self._query_account_list(account, "query_account_infos")
@@ -1629,21 +1914,18 @@ class BigQmtXtTrader:
 
     def query_smt_secu_rate(self, account, stock_code, max_term, fare_way, credit_type, trade_type):
         account_id = _account_id(account, self.client.account_id)
-        try:
-            return self.client.call(
-                "query_smt_secu_rate",
-                {"account_id": account_id, "stock_code": stock_code, "max_term": max_term,
-                 "fare_way": fare_way, "credit_type": credit_type, "trade_type": trade_type},
-                account_id=account_id,
-            ) or []
-        except Exception:
-            return []
+        return self.client.call(
+            "query_smt_secu_rate",
+            {"account_id": account_id, "stock_code": stock_code, "max_term": max_term,
+             "fare_way": fare_way, "credit_type": credit_type, "trade_type": trade_type},
+            account_id=account_id,
+        ) or []
 
     def query_ipo_data(self, account=None):
-        return self._query_account_list(account, "query_appointment_info")
+        return self._query_account_list(account, "get_ipo_data")
 
     def query_new_purchase_limit(self, account):
-        return {}
+        return self._query_account_list(account, "get_new_purchase_limit")
 
     # ------------------------------------------------------------------
     # async 变体：MiniQMT 的 *_async 方法返回 seq 后异步回调。
@@ -1715,10 +1997,34 @@ class BigQmtXtTrader:
         return self._next_async_seq()
 
     def cancel_order_stock_async(self, account, order_id):
-        return self.cancel_order_stock(account, order_id)
+        raise NotImplementedError(
+            "cancel_order_stock_async is not supported via Big QMT RPC"
+        )
 
     def cancel_order_stock_sysid_async(self, account, market, order_sysid):
-        return self.cancel_order_stock_sysid(account, market, order_sysid)
+        raise NotImplementedError(
+            "cancel_order_stock_sysid_async is not supported via Big QMT RPC"
+        )
+
+    def sync_transaction_from_external(
+        self,
+        operation,
+        data_type,
+        account_id,
+        account_type,
+        data_list,
+    ):
+        return self.client.call(
+            "sync_transaction_from_external",
+            {
+                "operation": operation,
+                "data_type": data_type,
+                "account_id": account_id,
+                "account_type": account_type,
+                "data_list": list(data_list or []),
+            },
+            account_id=account_id,
+        )
 
     def set_relaxed_response_order_enabled(self, enabled=True):
         # 内部行为开关，RPC 模式下无意义，no-op。
@@ -1743,6 +2049,8 @@ class BigQmtXtTrader:
             order_id=order_sysid or str(item.get("user_order_id") or ""),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
+            cursor=dict(item.get("cursor") or {}),
+            published_at=item.get("published_at"),
         )
 
     def _trade_from_dict(self, account_id, item):
@@ -1761,6 +2069,8 @@ class BigQmtXtTrader:
             traded_price=_safe_float(item.get("price", item.get("traded_price"))),
             traded_at=str(item.get("traded_at") or ""),
             order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
+            cursor=dict(item.get("cursor") or {}),
+            published_at=item.get("published_at"),
         )
 
 

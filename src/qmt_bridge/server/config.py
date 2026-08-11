@@ -45,6 +45,7 @@ class Settings:
     qmt_root: str = ""
     rpc_transport: str = "zmq"
     zmq_endpoint: str = "tcp://127.0.0.1:15560"
+    event_zmq_endpoint: str = "tcp://127.0.0.1:15561"
     rpc_timeout_seconds: float = 6.0
     formula_enabled: bool = True
     formula_host: str = "127.0.0.1"
@@ -92,6 +93,9 @@ class Settings:
             ).strip().lower(),
             zmq_endpoint=os.environ.get(
                 "QMT_BRIDGE_ZMQ_ENDPOINT", "tcp://127.0.0.1:15560"
+            ),
+            event_zmq_endpoint=os.environ.get(
+                "QMT_BRIDGE_EVENT_ZMQ_ENDPOINT", "tcp://127.0.0.1:15561"
             ),
             rpc_timeout_seconds=float(
                 os.environ.get("QMT_BRIDGE_RPC_TIMEOUT_SECONDS", "6.0")

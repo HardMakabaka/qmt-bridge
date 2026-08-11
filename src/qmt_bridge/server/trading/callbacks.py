@@ -129,6 +129,7 @@ def _order_to_dict(order) -> dict:
         "order_time", "order_type", "order_volume", "price_type",
         "price", "traded_volume", "traded_price", "order_status",
         "status_msg", "strategy_name", "order_remark",
+        "cursor", "published_at",
     ]
     return {a: getattr(order, a, None) for a in attrs}
 
@@ -139,6 +140,7 @@ def _trade_to_dict(trade) -> dict:
         "account_id", "stock_code", "order_id", "order_sysid",
         "traded_id", "traded_time", "traded_volume", "traded_price",
         "order_type", "strategy_name", "order_remark",
+        "cursor", "published_at",
     ]
     return {a: getattr(trade, a, None) for a in attrs}
 

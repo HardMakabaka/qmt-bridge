@@ -234,7 +234,10 @@ class ExportDataRequest(BaseModel):
 
 class SyncTransactionRequest(BaseModel):
     account_id: str = ""
-    data: list[dict] = []
+    account_type: str = "STOCK"
+    operation: str
+    data_type: str
+    data: list[dict] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

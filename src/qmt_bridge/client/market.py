@@ -34,7 +34,9 @@ class MarketMixin:
             "count": count,
             "fields": fields,
         })
-        records = resp.get("data", [])
+        records = self._response_value(resp, default=[])
+        if records is resp:
+            return resp
         try:
             import pandas as pd
         except ImportError:
@@ -70,7 +72,9 @@ class MarketMixin:
             "count": count,
             "fields": fields,
         })
-        data = resp.get("data", {})
+        data = self._response_value(resp, default={})
+        if data is resp:
+            return resp
         try:
             import pandas as pd
         except ImportError:
@@ -89,12 +93,12 @@ class MarketMixin:
     def get_full_tick(self, stocks: list[str]) -> dict:
         """Fetch latest tick snapshot for given stocks."""
         resp = self._get("/api/full_tick", {"stocks": ",".join(stocks)})
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_instrument_detail(self, stock: str) -> dict:
         """Fetch instrument details for a stock (legacy)."""
         resp = self._get("/api/instrument_detail", {"stock": stock})
-        return resp.get("detail", {})
+        return self._response_value(resp, key="detail", default={})
 
     def download(self, stock: str, period: str = "1d", start: str = "", end: str = "") -> dict:
         """Trigger history data download on the server side (legacy)."""
@@ -142,7 +146,10 @@ class MarketMixin:
             "dividend_type": dividend_type,
             "fill_data": fill_data,
         })
-        return self._to_dataframes(resp.get("data", {}))
+        data = self._response_value(resp, default={})
+        if data is resp:
+            return resp
+        return self._to_dataframes(data)
 
     def get_local_data(
         self,
@@ -177,7 +184,10 @@ class MarketMixin:
             "dividend_type": dividend_type,
             "fill_data": fill_data,
         })
-        return self._to_dataframes(resp.get("data", {}))
+        data = self._response_value(resp, default={})
+        if data is resp:
+            return resp
+        return self._to_dataframes(data)
 
     def get_market_snapshot(self, stocks: list[str]) -> dict:
         """获取实时行情快照（个股/指数）。
@@ -189,7 +199,7 @@ class MarketMixin:
             dict — 以股票代码为 key 的快照数据
         """
         resp = self._get("/api/market/snapshot", {"stocks": ",".join(stocks)})
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_major_indices(self) -> dict:
         """Fetch real-time snapshot of major market indices."""
@@ -204,7 +214,7 @@ class MarketMixin:
             "start_time": start_time,
             "end_time": end_time,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_market_data(
         self,
@@ -228,7 +238,7 @@ class MarketMixin:
             "dividend_type": dividend_type,
             "fill_data": fill_data,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_market_data3(
         self,
@@ -252,7 +262,10 @@ class MarketMixin:
             "dividend_type": dividend_type,
             "fill_data": fill_data,
         })
-        return self._to_dataframes(resp.get("data", {}))
+        data = self._response_value(resp, default={})
+        if data is resp:
+            return resp
+        return self._to_dataframes(data)
 
     def get_full_kline(
         self, stock: str, period: str = "1d", start_time: str = "", end_time: str = ""
@@ -264,7 +277,7 @@ class MarketMixin:
             "start_time": start_time,
             "end_time": end_time,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_fullspeed_orderbook(
         self, stock: str, start_time: str = "", end_time: str = ""
@@ -275,7 +288,7 @@ class MarketMixin:
             "start_time": start_time,
             "end_time": end_time,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_transactioncount(
         self, stock: str, start_time: str = "", end_time: str = ""
@@ -286,4 +299,28 @@ class MarketMixin:
             "start_time": start_time,
             "end_time": end_time,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
+
+    def subscribe_warmup(
+        self,
+        stocks: list[str],
+        period: str = "1m",
+        start_time: str = "",
+        end_time: str = "",
+        count: int = 0,
+        keep_subscription: bool = False,
+    ) -> dict:
+        return self._post("/api/market/subscribe_warmup", {
+            "stocks": stocks,
+            "period": period,
+            "start_time": start_time,
+            "end_time": end_time,
+            "count": count,
+            "keep_subscription": keep_subscription,
+        })
+
+    def unsubscribe_quote(self, seq: int) -> dict:
+        return self._post("/api/market/unsubscribe", {"seq": seq})
+
+    def get_all_subscriptions(self) -> dict:
+        return self._get("/api/market/subscriptions")

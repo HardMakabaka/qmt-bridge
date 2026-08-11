@@ -61,3 +61,45 @@ def test_base_client_uses_direct_urlopen(monkeypatch):
 
     assert payload == {"status": "ok"}
     assert calls == ["http://127.0.0.1:13543/api/meta/health"]
+
+
+def test_base_client_encodes_get_query_parameters(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen_direct(request):
+        calls.append(request.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr(client_base, "urlopen_direct", fake_urlopen_direct)
+
+    BaseClient("127.0.0.1")._get(
+        "/api/smt/secu_rate",
+        {"stock_code": "600000.SH", "label": "a b&c", "unused": None},
+    )
+
+    assert calls == [
+        "http://127.0.0.1:13543/api/smt/secu_rate?"
+        "stock_code=600000.SH&label=a+b%26c"
+    ]
+
+
+def test_client_response_value_preserves_provider_failure_envelope() -> None:
+    client = BaseClient("127.0.0.1")
+    failure = {
+        "status": "unsupported",
+        "data": None,
+        "reason_code": "native_method_missing",
+    }
+
+    assert client._response_value(failure, default={}) is failure
+    assert client._response_value({"status": "ok", "data": [1]}, default=[]) == [1]

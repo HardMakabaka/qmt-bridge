@@ -457,12 +457,11 @@ def test_market_history_ex_reports_none_payload_as_unavailable(monkeypatch):
         use_cache=False,
     )
 
-    assert payload == {
-        "status": "unavailable",
-        "data": None,
-        "reason": "xtdata_get_market_data_ex_returned_none",
-        "function": "get_market_data_ex",
-    }
+    assert payload["status"] == "unavailable"
+    assert payload["data"] is None
+    assert payload["reason_code"] == "xtdata_get_market_data_ex_returned_none"
+    assert payload["function"] == "get_market_data_ex"
+    assert payload["retryable"] is True
 
 
 def test_market_local_data_reports_non_mapping_payload_as_error(monkeypatch):
@@ -483,13 +482,12 @@ def test_market_local_data_reports_non_mapping_payload_as_error(monkeypatch):
         use_cache=False,
     )
 
-    assert payload == {
-        "status": "error",
-        "data": None,
-        "reason": "xtdata_get_local_data_invalid_response",
-        "function": "get_local_data",
-        "error_type": "list",
-    }
+    assert payload["status"] == "error"
+    assert payload["data"] is None
+    assert payload["reason_code"] == "xtdata_get_local_data_invalid_response"
+    assert payload["function"] == "get_local_data"
+    assert payload["error_type"] == "list"
+    assert payload["retryable"] is False
 
 
 def test_market_divid_factors_caches_nonempty_dataframe(monkeypatch, tmp_path):

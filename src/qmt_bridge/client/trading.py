@@ -95,6 +95,9 @@ class TradingMixin:
         """Query account asset information."""
         return self._get("/api/trading/asset", {"account_id": account_id})
 
+    def query_assets(self, account_id: str = "") -> dict:
+        return self._get("/api/trading/assets", {"account_id": account_id})
+
     def query_trades(self, account_id: str = "") -> dict:
         """Query trade records."""
         return self._get("/api/trading/trades", {"account_id": account_id})
@@ -121,6 +124,9 @@ class TradingMixin:
     def get_account_info(self, account_id: str = "") -> dict:
         """Get trading account basic information."""
         return self._get("/api/trading/account_info", {"account_id": account_id})
+
+    def get_trading_health(self) -> dict:
+        return self._get("/api/trading/health")
 
     # ------------------------------------------------------------------
     # Async order/cancel
@@ -236,18 +242,37 @@ class TradingMixin:
             "account_id": account_id,
         })
 
-    def query_data(self, data_type: str = "orders", account_id: str = "") -> dict:
+    def query_data(
+        self,
+        data_type: str = "orders",
+        result_path: str = "",
+        start_time: str | None = None,
+        end_time: str | None = None,
+        account_id: str = "",
+    ) -> dict:
         """Query exported trading data."""
         return self._get("/api/trading/query_data", {
             "data_type": data_type,
+            "result_path": result_path,
+            "start_time": start_time,
+            "end_time": end_time,
             "account_id": account_id,
         })
 
     def sync_transaction_from_external(
-        self, data: list[dict], account_id: str = ""
+        self,
+        data: list[dict],
+        account_id: str = "",
+        *,
+        operation: str,
+        data_type: str,
+        account_type: str = "STOCK",
     ) -> dict:
         """Sync external transaction records into the system."""
         return self._post("/api/trading/sync_transaction", {
             "data": data,
             "account_id": account_id,
+            "account_type": account_type,
+            "operation": operation,
+            "data_type": data_type,
         })

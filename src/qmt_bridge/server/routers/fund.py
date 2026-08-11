@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends
 
 from ..deps import get_trader_manager
-from ..helpers import _numpy_to_python
+from ..helpers import _optional_result_payload
 from ..models import CTPCrossMarketTransferRequest, FundTransferRequest
 from ..security import require_api_key
 
@@ -18,7 +18,7 @@ def fund_transfer(req: FundTransferRequest, manager=Depends(get_trader_manager))
         amount=req.amount,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")
 
 
 @router.get("/transfer_records")
@@ -28,7 +28,7 @@ def query_transfer_records(
 ):
     """Query fund transfer records."""
     result = manager.query_fund_transfer_records(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/available")
@@ -38,7 +38,7 @@ def query_available_fund(
 ):
     """Query available fund balance."""
     result = manager.query_available_fund(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.post("/ctp_transfer_in")
@@ -49,7 +49,7 @@ def ctp_transfer_in(req: FundTransferRequest, manager=Depends(get_trader_manager
         amount=req.amount,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")
 
 
 @router.post("/ctp_transfer_out")
@@ -60,7 +60,7 @@ def ctp_transfer_out(req: FundTransferRequest, manager=Depends(get_trader_manage
         amount=req.amount,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")
 
 
 @router.get("/ctp_balance")
@@ -70,7 +70,7 @@ def query_ctp_balance(
 ):
     """Query CTP account balance."""
     result = manager.query_ctp_balance(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.post("/ctp_option_to_future")
@@ -83,7 +83,7 @@ def ctp_transfer_option_to_future(
         amount=req.amount,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")
 
 
 @router.post("/ctp_future_to_option")
@@ -96,4 +96,4 @@ def ctp_transfer_future_to_option(
         amount=req.amount,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")

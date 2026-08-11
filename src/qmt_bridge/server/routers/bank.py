@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends
 
 from ..deps import get_trader_manager
-from ..helpers import _numpy_to_python
+from ..helpers import _optional_result_payload
 from ..models import BankTransferRequest
 from ..security import require_api_key
 
@@ -19,7 +19,7 @@ def bank_transfer_in(req: BankTransferRequest, manager=Depends(get_trader_manage
         bank_code=req.bank_code,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")
 
 
 @router.post("/transfer_out")
@@ -31,7 +31,7 @@ def bank_transfer_out(req: BankTransferRequest, manager=Depends(get_trader_manag
         bank_code=req.bank_code,
         account_id=req.account_id,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _optional_result_payload(result, status="ok")
 
 
 @router.get("/balance")
@@ -41,7 +41,7 @@ def query_bank_balance(
 ):
     """Query bank account balance."""
     result = manager.query_bank_balance(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/transfer_records")
@@ -51,7 +51,7 @@ def query_bank_transfer_records(
 ):
     """Query bank transfer records."""
     result = manager.query_bank_transfer_records(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/banks")
@@ -61,7 +61,7 @@ def query_bound_banks(
 ):
     """Query bound bank accounts."""
     result = manager.query_bound_banks(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/transfer_limit")
@@ -71,7 +71,7 @@ def query_transfer_limit(
 ):
     """Query bank transfer limit."""
     result = manager.query_transfer_limit(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/available_amount")
@@ -81,7 +81,7 @@ def query_bank_available(
 ):
     """Query available amount for bank transfer."""
     result = manager.query_bank_available(account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)
 
 
 @router.get("/status")
@@ -92,4 +92,4 @@ def query_bank_transfer_status(
 ):
     """Query status of a specific bank transfer."""
     result = manager.query_bank_transfer_status(transfer_id=transfer_id, account_id=account_id)
-    return {"data": _numpy_to_python(result)}
+    return _optional_result_payload(result)

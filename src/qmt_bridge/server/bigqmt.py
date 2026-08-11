@@ -101,6 +101,12 @@ class BigQmtRuntime:
                 "connect_address": self.settings.zmq_endpoint,
                 "redis_discovery_enabled": False,
             },
+            "exec_events": {
+                "transport": "zmq",
+                "zmq": {
+                    "connect_address": self.settings.event_zmq_endpoint,
+                },
+            },
             "formula_server": {
                 "enabled": self.settings.formula_enabled,
                 "host": self.settings.formula_host,
@@ -116,6 +122,11 @@ class BigQmtRuntime:
         if self.settings.rpc_transport != "zmq":
             raise ValueError("QMT_BRIDGE_RPC_TRANSPORT must be zmq")
         _require_loopback_endpoint(self.settings.zmq_endpoint)
+        _require_loopback_endpoint(self.settings.event_zmq_endpoint)
+        if self.settings.zmq_endpoint.strip().lower() == self.settings.event_zmq_endpoint.strip().lower():
+            raise ValueError(
+                "QMT_BRIDGE_EVENT_ZMQ_ENDPOINT must differ from QMT_BRIDGE_ZMQ_ENDPOINT"
+            )
         if self.settings.formula_host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("QMT_BRIDGE_FORMULA_HOST must be loopback")
         account_id = self.settings.trading_account_id.strip()
@@ -185,6 +196,7 @@ class BigQmtRuntime:
             "runtime": "bigqmt",
             "transport": "zmq",
             "zmq_endpoint": self.settings.zmq_endpoint,
+            "event_zmq_endpoint": self.settings.event_zmq_endpoint,
             "formula_endpoint": f"{self.settings.formula_host}:{self.settings.formula_port}",
             "formula_enabled": self.settings.formula_enabled,
             "qmt_root": self.settings.qmt_root,

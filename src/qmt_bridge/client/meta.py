@@ -7,17 +7,17 @@ class MetaMixin:
     def get_markets(self) -> dict:
         """Fetch available markets."""
         resp = self._get("/api/meta/markets")
-        return resp.get("markets", {})
+        return self._response_value(resp, key="markets", default={})
 
     def get_periods(self) -> list:
         """Fetch available K-line periods."""
         resp = self._get("/api/meta/periods")
-        return resp.get("periods", [])
+        return self._response_value(resp, key="periods", default=[])
 
     def get_stock_list_by_category(self, category: str) -> list[str]:
         """Fetch stock codes by category."""
         resp = self._get("/api/meta/stock_list", {"category": category})
-        return resp.get("stocks", [])
+        return self._response_value(resp, key="stocks", default=[])
 
     def get_last_trade_date(self, market: str) -> str:
         """Fetch the last trade date for a market."""
@@ -45,3 +45,12 @@ class MetaMixin:
     def get_quote_server_status(self) -> dict:
         """Get detailed quote server connection status."""
         return self._get("/api/meta/quote_server_status")
+
+    def get_capabilities(self) -> dict:
+        return self._get("/api/meta/capabilities")
+
+    def get_readiness(self) -> dict:
+        return self._get("/api/meta/readiness")
+
+    def get_binary_cache_stats(self) -> dict:
+        return self._get("/api/meta/binary_cache")

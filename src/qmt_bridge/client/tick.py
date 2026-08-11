@@ -14,7 +14,7 @@ class TickMixin:
             "end_time": end_time,
             "count": count,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_l2_order(
         self, stock: str, start_time: str = "", end_time: str = "", count: int = -1
@@ -26,7 +26,7 @@ class TickMixin:
             "end_time": end_time,
             "count": count,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_l2_transaction(
         self, stock: str, start_time: str = "", end_time: str = "", count: int = -1
@@ -38,7 +38,7 @@ class TickMixin:
             "end_time": end_time,
             "count": count,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_l2_thousand_quote(
         self, stock: str, start_time: str = "", end_time: str = "", count: int = -1
@@ -50,7 +50,7 @@ class TickMixin:
             "end_time": end_time,
             "count": count,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_l2_thousand_orderbook(
         self, stock: str, start_time: str = "", end_time: str = "", count: int = -1
@@ -62,7 +62,7 @@ class TickMixin:
             "end_time": end_time,
             "count": count,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
 
     def get_l2_thousand_trade(
         self, stock: str, start_time: str = "", end_time: str = "", count: int = -1
@@ -74,4 +74,4 @@ class TickMixin:
             "end_time": end_time,
             "count": count,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})

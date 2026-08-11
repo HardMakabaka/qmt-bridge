@@ -3,7 +3,7 @@
 from fastapi import APIRouter
 from ..bigqmt import xtdata
 
-from ..helpers import _call_xtdata_serialized, _numpy_to_python
+from ..helpers import _call_xtdata_optional, _call_xtdata_serialized, _numpy_to_python
 from ..models import (
     CallFormulaBatchRequest,
     CallFormulaRequest,
@@ -50,13 +50,14 @@ def call_formula_batch(req: CallFormulaBatchRequest):
 @router.post("/generate_index")
 def generate_index_data(req: GenerateIndexDataRequest):
     """Generate custom index data from stocks and weights."""
-    result = _call_xtdata_serialized(
-        xtdata.generate_index_data,
+    return _call_xtdata_optional(
+        xtdata,
+        "generate_index_data",
         req.index_code,
         req.stocks,
         req.weights,
         req.period,
         req.start_time,
         req.end_time,
+        missing_reason="xtdata_generate_index_data_contract_unavailable",
     )
-    return {"data": _numpy_to_python(result)}

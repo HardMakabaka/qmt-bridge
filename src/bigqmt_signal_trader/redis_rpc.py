@@ -21,7 +21,7 @@ from .code_utils import normalize_stock_code
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
 
-RPC_REVISION = "20260715-execution-snapshot-v1"
+RPC_REVISION = "20260811-zmq-events-v2"
 
 
 READ_METHODS = {
@@ -62,6 +62,9 @@ READ_METHODS = {
     "query_orders",
     "query_trades",
     "query_execution_snapshot",
+    "query_position_statistics",
+    "get_event_cursor",
+    "get_events_since",
     "query_stock_position",
     "sync_positions",
     # 账户 / 融资融券 / 交易扩展查询（官方全局函数 + detail types）
@@ -96,6 +99,7 @@ ORDER_METHODS = {
     "submit_order",
     "submit_orders_batch",
     "cancel_order",
+    "sync_transaction_from_external",
 }
 
 LISTENER_DEFERRED_METHODS = {
@@ -108,6 +112,7 @@ LISTENER_DEFERRED_METHODS = {
     "get_asset",
     "get_positions",
     "query_stock_position",
+    "query_position_statistics",
     "query_orders",
     "query_trades",
     "query_account_infos",
@@ -149,7 +154,6 @@ METHOD_ALIASES = {
     "query_stock_orders": "query_orders",
     "query_stock_trades": "query_trades",
     "order_stock": "submit_order",
-    "order_stock_async": "submit_order",
     "order_stock_batch": "submit_orders_batch",
     "cancel_order_stock": "cancel_order",
     "cancel_order_stock_sysid": "cancel_order",
@@ -237,6 +241,12 @@ MARKET_DATA_METHODS = {
     "get_svol",
     "get_bvol",
     "get_risk_free_rate",
+    "get_basket",
+    "get_etf_iopv",
+    "get_industry_name_of_stock",
+    "get_market_time",
+    "getfindata",
+    "is_suspended_stock",
     # L2 行情（需 L2 权限 + 原生 xtdata SDK 行情服务）
     "get_l2_quote",
     "get_l2_order",
@@ -491,6 +501,19 @@ class BigQmtRpcHandlers:
             "trades": self.order_gateway.query_trades(account_id, str(trade_name)),
         }
 
+    def _handle_query_position_statistics(self, params):
+        return self._query_trade_detail(params, "POSITION_STATISTICS")
+
+    def _handle_get_event_cursor(self, params):
+        from .exec_events import get_event_cursor
+
+        return get_event_cursor()
+
+    def _handle_get_events_since(self, params):
+        from .exec_events import get_events_since
+
+        return get_events_since(params.get("cursor"))
+
     def _handle_sync_positions(self, params):
         account_id = self._request_account_id(params)
         snapshot = AccountSnapshot(
@@ -512,20 +535,12 @@ class BigQmtRpcHandlers:
     # ------------------------------------------------------------------
 
     def _call_qmt_global(self, func_name, *args, **kwargs):
-        """Call a QMT runtime-injected global function, returning [] on failure.
-
-        These functions (get_assure_contract / get_unclosed_compacts / ...)
-        are injected by QMT into the process global namespace, same as
-        passorder. When unavailable (no margin account, function not bound)
-        we degrade to [] rather than crashing the RPC.
-        """
         func = self.qmt_api.get(func_name)
         if func is None:
-            return []
-        try:
-            return _normalize_detail_rows(func(*args, **kwargs))
-        except Exception:
-            return []
+            raise NotImplementedError(
+                "QMT runtime function is unavailable: %s" % func_name
+            )
+        return _normalize_detail_rows(func(*args, **kwargs))
 
     def _query_trade_detail(self, params, detail_type, strategy_name=""):
         """get_trade_detail_data with one of the 6 official detail types.
@@ -537,20 +552,25 @@ class BigQmtRpcHandlers:
         account_id = self._request_account_id(params)
         gateway = self.order_gateway
         if gateway is None or gateway.get_trade_detail_data is None:
-            return []
-        try:
-            rows = gateway.get_trade_detail_data(account_id, gateway.account_type, detail_type, strategy_name)
-            return _normalize_detail_rows(rows)
-        except Exception:
-            return []
+            raise NotImplementedError(
+                "get_trade_detail_data is unavailable"
+            )
+        rows = gateway.get_trade_detail_data(
+            account_id,
+            gateway.account_type,
+            detail_type,
+            strategy_name,
+        )
+        return _normalize_detail_rows(rows)
 
     def _handle_query_account_infos(self, params):
         # 账户信息 — get_trade_detail_data(ACCOUNT)
         return self._query_trade_detail(params, "ACCOUNT")
 
     def _handle_query_account_status(self, params):
-        # 账户状态 — 用 TASK detail type 近似（委托任务状态）
-        return self._query_trade_detail(params, "TASK")
+        raise NotImplementedError(
+            "query_account_status is not verified for Big QMT RPC"
+        )
 
     def _handle_query_credit_detail(self, params):
         # 融资融券账户明细 — 官方独立函数 get_debt_contract
@@ -573,20 +593,42 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global("get_assure_contract", self._request_account_id(params))
 
     def _handle_query_appointment_info(self, params):
-        # 新股数据 — 官方 get_ipo_data
-        return self._call_qmt_global("get_ipo_data", self._request_account_id(params))
+        raise NotImplementedError(
+            "query_appointment_info is not verified for Big QMT RPC"
+        )
 
     def _handle_query_smt_secu_info(self, params):
-        # 期权标的持仓 — 官方 get_option_subject_position
-        return self._call_qmt_global("get_option_subject_position", self._request_account_id(params))
+        raise NotImplementedError(
+            "query_smt_secu_info is not verified for Big QMT RPC"
+        )
 
     def _handle_query_smt_secu_rate(self, params):
-        # 组合期权 — 官方 get_comb_option
-        return self._call_qmt_global("get_comb_option", self._request_account_id(params))
+        raise NotImplementedError(
+            "query_smt_secu_rate is not verified for Big QMT RPC"
+        )
 
     def _handle_smt_appointment(self, params):
         # SMB/预约打新属于交易类，需要下单通道；当前不支持。
         raise NotImplementedError("smt_appointment is not supported via Big QMT RPC")
+
+    def _handle_sync_transaction_from_external(self, params):
+        operation = str(params.get("operation") or "")
+        data_type = str(params.get("data_type") or "")
+        account_id = self._request_account_id(params)
+        account_type = str(params.get("account_type") or "STOCK")
+        data_list = list(params.get("data_list") or params.get("data") or [])
+        if not operation:
+            raise ValueError("operation is required")
+        if not data_type:
+            raise ValueError("data_type is required")
+        return self._call_qmt_global(
+            "sync_transaction_from_external",
+            operation,
+            data_type,
+            account_id,
+            account_type,
+            data_list,
+        )
 
     # 官方交易查询函数（直接暴露）
     def _handle_get_value_by_order_id(self, params):
@@ -1136,6 +1178,7 @@ class RedisPubSubRpcService:
             "ok": False,
             "data": None,
             "error": "",
+            "error_type": "",
             # server_error carries QMT-side diagnostic info (e.g. passorder
             # submitted but order not found in system, get_trade_detail_data
             # returned empty) that doesn't raise an exception but indicates a
@@ -1155,6 +1198,7 @@ class RedisPubSubRpcService:
                 response["server_error"] = str(server_error)
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            response["error_type"] = exc.__class__.__name__
         self._publish_response(request, response)
         self._processed_count += 1
         if self._processed_count <= self.debug_log_limit:

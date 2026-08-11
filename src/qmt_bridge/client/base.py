@@ -3,6 +3,7 @@
 import json
 import urllib.request
 from typing import Optional
+from urllib.parse import urlencode
 
 from qmt_bridge.no_proxy import urlopen_direct
 
@@ -40,11 +41,7 @@ class BaseClient:
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         """Send a GET request and return parsed JSON."""
         if params:
-            query = "&".join(
-                f"{k}={urllib.request.quote(str(v))}"
-                for k, v in params.items()
-                if v is not None
-            )
+            query = urlencode({k: v for k, v in params.items() if v is not None})
             url = f"{self.base_url}{path}?{query}"
         else:
             url = f"{self.base_url}{path}"
@@ -64,11 +61,7 @@ class BaseClient:
     def _delete(self, path: str, params: Optional[dict] = None) -> dict:
         """Send a DELETE request and return parsed JSON."""
         if params:
-            query = "&".join(
-                f"{k}={urllib.request.quote(str(v))}"
-                for k, v in params.items()
-                if v is not None
-            )
+            query = urlencode({k: v for k, v in params.items() if v is not None})
             url = f"{self.base_url}{path}?{query}"
         else:
             url = f"{self.base_url}{path}"
@@ -93,3 +86,14 @@ class BaseClient:
                 continue
             result[stock] = pd.DataFrame(records)
         return result
+
+    def _response_value(self, payload: dict, key: str = "data", default=None):
+        if payload.get("status") in {"unsupported", "unavailable", "error"}:
+            return payload
+        return payload.get(key, default)
+
+    def _response_value(self, payload: dict, key: str = "data", default=None):
+        """Return a response field without hiding a provider failure envelope."""
+        if payload.get("status") in {"unsupported", "unavailable", "error"}:
+            return payload
+        return payload.get(key, default)

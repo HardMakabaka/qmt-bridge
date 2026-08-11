@@ -144,9 +144,20 @@ def _numpy_to_python(obj):
 
 
 def _exception_status(exc: Exception) -> str:
-    message = str(exc)
+    message = str(exc).lower()
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError)) or any(
+        marker in message
+        for marker in (
+            "connection refused",
+            "connection reset",
+            "provider offline",
+            "rpc timeout",
+            "transport unavailable",
+        )
+    ):
+        return "unavailable"
     if (
-        isinstance(exc, AttributeError)
+        isinstance(exc, (AttributeError, NotImplementedError))
         or "function not realize" in message
         or "未支持此功能" in message
     ):
@@ -163,15 +174,38 @@ def _status_payload(
     **extra,
 ):
     """Build a stable JSON payload for optional QMT functions."""
+    reason_code = reason or (f"xtdata_{function}_{status}" if function else status)
     payload = {
         "status": status,
         "data": _numpy_to_python(data),
+        "reason_code": reason_code,
+        "message": reason_code,
+        "capability": function or None,
+        "provider": "bigqmt",
+        "retryable": status == "unavailable",
+        "details": {},
     }
     if reason:
         payload["reason"] = reason
     if function:
         payload["function"] = function
     payload.update(extra)
+    return payload
+
+
+def _is_failure_payload(value) -> bool:
+    return isinstance(value, dict) and value.get("status") in {
+        "unsupported",
+        "unavailable",
+        "error",
+    }
+
+
+def _optional_result_payload(result, **success):
+    if _is_failure_payload(result):
+        return _numpy_to_python(result)
+    payload = {"data": _numpy_to_python(result)}
+    payload.update(success)
     return payload
 
 

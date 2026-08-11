@@ -2,6 +2,7 @@
 
 import json
 from typing import Callable
+from urllib.parse import urlencode
 
 
 class WebSocketMixin:
@@ -87,9 +88,36 @@ class WebSocketMixin:
                 "websockets package is required. Install with: pip install websockets"
             )
 
-        params = f"?api_key={self.api_key}" if self.api_key else ""
+        params = f"?{urlencode({'api_key': self.api_key})}" if self.api_key else ""
         url = f"{self.ws_url}/ws/trade{params}"
         async with websockets.connect(url) as ws:
+            async for message in ws:
+                data = json.loads(message)
+                callback(data)
+
+    async def subscribe_formula(
+        self,
+        formula_name: str,
+        callback: Callable[[dict], None],
+        *,
+        stock_code: str = "",
+        period: str = "1d",
+    ):
+        try:
+            import websockets
+        except ImportError:
+            raise ImportError(
+                "websockets package is required. Install with: pip install websockets"
+            )
+
+        url = f"{self.ws_url}/ws/formula"
+        async with websockets.connect(url) as ws:
+            await ws.send(json.dumps({
+                "action": "subscribe",
+                "formula_name": formula_name,
+                "stock_code": stock_code,
+                "period": period,
+            }))
             async for message in ws:
                 data = json.loads(message)
                 callback(data)

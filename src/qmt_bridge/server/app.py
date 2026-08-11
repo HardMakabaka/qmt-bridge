@@ -1,5 +1,6 @@
 """FastAPI application factory with lifespan management."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -36,7 +37,7 @@ async def _lifespan(app: FastAPI):
                 account_id=settings.trading_account_id,
                 order_writes_enabled=settings.order_writes_enabled,
             )
-            manager.connect()
+            manager.connect(event_loop=asyncio.get_running_loop())
             app.state.trader_manager = manager
             logger.info("Big QMT account query module initialized")
         except Exception:

@@ -1,10 +1,11 @@
-"""Real-time order/trade (execution) event push over Redis.
+"""Real-time order/trade execution events with bounded replay.
 
 Big QMT fires ``order_callback(ContextInfo, orderInfo)`` and
 ``deal_callback(ContextInfo, dealInfo)`` inside the strategy process. We normalize
-the QMT order/deal object (ThinkTrader ``m_*`` fields) into a plain dict and
-publish it to a Redis channel, so clients receive ``on_stock_order`` /
-``on_stock_trade`` callbacks in real time (MiniQMT style) instead of polling.
+the QMT order/deal object (ThinkTrader ``m_*`` fields) into a plain dict. The
+Big QMT runtime publishes an independent loopback ZMQ stream and retains a
+bounded in-process replay buffer. Redis channels remain available for legacy
+runtime configurations.
 
 Channels (also used as capped streams for short replay, xadd + publish):
 - ``bigqmt:order_events:{account_id}``
@@ -15,7 +16,11 @@ The normalized field names match ``BigQmtXtTrader._order_from_dict`` /
 """
 
 import json
+import threading
 import time
+import uuid
+
+from collections import deque
 
 
 ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
@@ -23,6 +28,171 @@ TRADE_CHANNEL_TEMPLATE = "bigqmt:trade_events:{account_id}"
 
 EVENT_ORDER = "order"
 EVENT_TRADE = "trade"
+DEFAULT_EVENT_ZMQ_BIND_ADDRESS = "tcp://127.0.0.1:15561"
+
+
+class EventReplayBuffer(object):
+    def __init__(self, maxlen=2000, epoch=None):
+        self.maxlen = max(1, int(maxlen))
+        self.epoch = str(epoch or uuid.uuid4().hex)
+        self._events = deque(maxlen=self.maxlen)
+        self._sequence = 0
+        self._lock = threading.RLock()
+
+    def cursor(self):
+        with self._lock:
+            return {"epoch": self.epoch, "sequence": self._sequence}
+
+    def append(self, event):
+        with self._lock:
+            self._sequence += 1
+            payload = dict(event or {})
+            payload["cursor"] = {
+                "epoch": self.epoch,
+                "sequence": self._sequence,
+            }
+            payload.setdefault("published_at", time.time())
+            self._events.append(payload)
+            return dict(payload)
+
+    def events_since(self, cursor=None):
+        cursor = dict(cursor or {})
+        with self._lock:
+            requested_epoch = str(cursor.get("epoch") or self.epoch)
+            try:
+                requested_sequence = int(cursor.get("sequence") or 0)
+            except (TypeError, ValueError):
+                requested_sequence = 0
+            first_sequence = (
+                int(self._events[0]["cursor"]["sequence"])
+                if self._events
+                else self._sequence + 1
+            )
+            gap = (
+                requested_epoch != self.epoch
+                or requested_sequence < first_sequence - 1
+                or requested_sequence > self._sequence
+            )
+            if gap:
+                events = list(self._events)
+            else:
+                events = [
+                    event
+                    for event in self._events
+                    if int(event["cursor"]["sequence"]) > requested_sequence
+                ]
+            return {
+                "cursor": {"epoch": self.epoch, "sequence": self._sequence},
+                "events": [dict(event) for event in events],
+                "gap": gap,
+                "retained_from_sequence": first_sequence,
+            }
+
+
+class ZmqExecutionEventPublisher(object):
+    def __init__(self, bind_address=None, maxlen=2000, replay_buffer=None):
+        self.bind_address = str(
+            bind_address or DEFAULT_EVENT_ZMQ_BIND_ADDRESS
+        )
+        if not _is_loopback_zmq_address(self.bind_address):
+            raise ValueError("execution event endpoint must use tcp loopback")
+        self.replay_buffer = replay_buffer or EventReplayBuffer(maxlen=maxlen)
+        self._lock = threading.RLock()
+        self._socket = None
+
+    def start(self):
+        with self._lock:
+            if self._socket is not None:
+                return self.bind_address
+            import zmq
+
+            socket = zmq.Context.instance().socket(zmq.PUB)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.SNDHWM, self.replay_buffer.maxlen)
+            socket.bind(self.bind_address)
+            self._socket = socket
+            return self.bind_address
+
+    def publish(self, event):
+        with self._lock:
+            if self._socket is None:
+                self.start()
+            payload = self.replay_buffer.append(event)
+            self._socket.send_string(
+                json.dumps(payload, ensure_ascii=False, default=str)
+            )
+            return payload
+
+    def close(self):
+        with self._lock:
+            socket = self._socket
+            self._socket = None
+            if socket is not None:
+                socket.close(linger=0)
+
+
+def _is_loopback_zmq_address(address):
+    text = str(address or "").lower()
+    return text.startswith("tcp://127.0.0.1:") or text.startswith(
+        "tcp://localhost:"
+    ) or text.startswith("tcp://[::1]:")
+
+
+_ZMQ_EVENT_PUBLISHER = None
+_ZMQ_EVENT_PUBLISHER_LOCK = threading.RLock()
+
+
+def configure_zmq_event_publisher(config=None):
+    global _ZMQ_EVENT_PUBLISHER
+    config = dict(config or {})
+    bind_address = str(
+        config.get("bind_address") or DEFAULT_EVENT_ZMQ_BIND_ADDRESS
+    )
+    maxlen = int(config.get("maxlen") or 2000)
+    with _ZMQ_EVENT_PUBLISHER_LOCK:
+        current = _ZMQ_EVENT_PUBLISHER
+        if current is not None and (
+            current.bind_address != bind_address
+            or current.replay_buffer.maxlen != maxlen
+        ):
+            current.close()
+            current = None
+        if current is None:
+            current = ZmqExecutionEventPublisher(
+                bind_address=bind_address,
+                maxlen=maxlen,
+            )
+            _ZMQ_EVENT_PUBLISHER = current
+        return current
+
+
+def publish_zmq_event(event, config=None):
+    return configure_zmq_event_publisher(config).publish(event)
+
+
+def get_event_cursor():
+    with _ZMQ_EVENT_PUBLISHER_LOCK:
+        publisher = _ZMQ_EVENT_PUBLISHER
+        if publisher is None:
+            publisher = configure_zmq_event_publisher()
+        return publisher.replay_buffer.cursor()
+
+
+def get_events_since(cursor=None):
+    with _ZMQ_EVENT_PUBLISHER_LOCK:
+        publisher = _ZMQ_EVENT_PUBLISHER
+        if publisher is None:
+            publisher = configure_zmq_event_publisher()
+        return publisher.replay_buffer.events_since(cursor)
+
+
+def stop_zmq_event_publisher():
+    global _ZMQ_EVENT_PUBLISHER
+    with _ZMQ_EVENT_PUBLISHER_LOCK:
+        publisher = _ZMQ_EVENT_PUBLISHER
+        _ZMQ_EVENT_PUBLISHER = None
+    if publisher is not None:
+        publisher.close()
 
 # ThinkTrader enum_EEntrustBS (买卖方向, the m_nDirection field), universal across
 # 股票/期货/期权. Ref: https://dict.thinktrader.net/innerApi/enum_constants.html

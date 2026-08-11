@@ -112,6 +112,11 @@ DOWNLOAD_JOB_TTL_SECONDS = 3600
 # Push order_callback/deal_callback details to Redis so clients get real-time
 # on_stock_order/on_stock_trade callbacks (MiniQMT style) instead of polling.
 EXEC_EVENTS_ENABLED = True
+EXEC_EVENTS_TRANSPORT = ""
+EXEC_EVENTS_ZMQ_CONFIG = {
+    "bind_address": "tcp://127.0.0.1:15561",
+    "maxlen": 2000,
+}
 # Dump the raw order_callback/deal_callback object fields to the QMT output panel
 # (and into the published event as "raw_fields"). Off by default — it prints on
 # every callback. Turn on to settle what m_nDirection/m_nOffsetFlag actually
@@ -164,6 +169,12 @@ DOWNLOAD_JOB_MAX_WALL_SECONDS = float(
 )
 DOWNLOAD_JOB_TTL_SECONDS = int(BIGQMT_REDIS_CONFIG.get("download_job_ttl_seconds", DOWNLOAD_JOB_TTL_SECONDS))
 EXEC_EVENTS_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("exec_events_enabled", EXEC_EVENTS_ENABLED))
+EXEC_EVENTS_TRANSPORT = str(
+    BIGQMT_REDIS_CONFIG.get("exec_events_transport", EXEC_EVENTS_TRANSPORT or RPC_TRANSPORT)
+).lower()
+EXEC_EVENTS_ZMQ_CONFIG = dict(
+    BIGQMT_REDIS_CONFIG.get("exec_events_zmq", EXEC_EVENTS_ZMQ_CONFIG)
+)
 EXEC_EVENTS_DEBUG_RAW_FIELDS = bool(
     BIGQMT_REDIS_CONFIG.get("exec_events_debug_raw_fields", EXEC_EVENTS_DEBUG_RAW_FIELDS)
 )
@@ -227,6 +238,8 @@ def _apply_config(account_id):
         exec_events={
             "enabled": EXEC_EVENTS_ENABLED,
             "account_id": account_id,
+            "transport": EXEC_EVENTS_TRANSPORT or RPC_TRANSPORT,
+            "zmq": EXEC_EVENTS_ZMQ_CONFIG,
             "debug_raw_fields": EXEC_EVENTS_DEBUG_RAW_FIELDS,
         },
     )
@@ -237,7 +250,7 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS
+    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_TRANSPORT, EXEC_EVENTS_ZMQ_CONFIG, EXEC_EVENTS_DEBUG_RAW_FIELDS
     redis_config = dict(redis_config or {})
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
     REDIS_PORT = int(redis_config.get("port", REDIS_PORT))
@@ -286,6 +299,12 @@ def configure_runtime_redis(redis_config):
     )
     DOWNLOAD_JOB_TTL_SECONDS = int(redis_config.get("download_job_ttl_seconds", DOWNLOAD_JOB_TTL_SECONDS))
     EXEC_EVENTS_ENABLED = bool(redis_config.get("exec_events_enabled", EXEC_EVENTS_ENABLED))
+    EXEC_EVENTS_TRANSPORT = str(
+        redis_config.get("exec_events_transport", EXEC_EVENTS_TRANSPORT or RPC_TRANSPORT)
+    ).lower()
+    EXEC_EVENTS_ZMQ_CONFIG = dict(
+        redis_config.get("exec_events_zmq", EXEC_EVENTS_ZMQ_CONFIG)
+    )
     EXEC_EVENTS_DEBUG_RAW_FIELDS = bool(
         redis_config.get("exec_events_debug_raw_fields", EXEC_EVENTS_DEBUG_RAW_FIELDS)
     )

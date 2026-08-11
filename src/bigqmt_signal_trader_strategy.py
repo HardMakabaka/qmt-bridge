@@ -122,6 +122,12 @@ def reset_app():
             _rpc_service.stop()
         except Exception:
             pass
+    try:
+        from bigqmt_signal_trader import exec_events
+
+        exec_events.stop_zmq_event_publisher()
+    except Exception:
+        pass
     _rpc_service = None
     _reset_runner_app()
 
@@ -194,6 +200,7 @@ _EXTRA_QMT_GLOBAL_FUNCS = (
     "get_option_subject_position",    # 期权标的持仓
     "get_comb_option",                # 组合期权
     "get_hkt_exchange_rate",          # 港股通汇率
+    "sync_transaction_from_external",
 )
 
 
@@ -371,6 +378,19 @@ def _start_rpc_service(context_info, app, config):
     global _rpc_service
     if _rpc_service is not None:
         return _rpc_service
+    event_config = dict(config.get("exec_events") or {})
+    if (
+        _config_bool(event_config.get("enabled"), True)
+        and str(event_config.get("transport") or "").lower() == "zmq"
+    ):
+        try:
+            from bigqmt_signal_trader import exec_events
+
+            exec_events.configure_zmq_event_publisher(
+                dict(event_config.get("zmq") or {})
+            )
+        except Exception as exc:
+            print("[bigqmt_exec_events] configure failed: %s" % exc)
     _rpc_service = _build_rpc_service(context_info, app, config)
     if _rpc_service is not None:
         _rpc_service.start()
@@ -690,7 +710,6 @@ def handlebar(ContextInfo):
 
 
 def _publish_exec_event(kind, obj):
-    """Push a normalized order/trade event to Redis for real-time client callbacks."""
     config = _build_config()
     event_config = dict(config.get("exec_events") or {})
     # Raw-field diagnostics run BEFORE every other check (and before the
@@ -710,14 +729,6 @@ def _publish_exec_event(kind, obj):
     account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         return
-    redis_client = getattr(_rpc_service, "redis", None)
-    if redis_client is None:
-        redis_config = dict(config.get("redis") or {})
-        if not redis_config:
-            return
-        from bigqmt_signal_trader.adapters.redis_common import build_redis_client
-
-        redis_client = build_redis_client(redis_config)
     try:
         from bigqmt_signal_trader import exec_events
 
@@ -725,11 +736,32 @@ def _publish_exec_event(kind, obj):
             event = exec_events.normalize_trade_event(obj, account_id)
             if raw_fields:
                 event["raw_fields"] = raw_fields
-            exec_events.publish_trade_event(redis_client, account_id, event)
         else:
             event = exec_events.normalize_order_event(obj, account_id)
             if raw_fields:
                 event["raw_fields"] = raw_fields
+        transport = str(
+            event_config.get("transport")
+            or dict(config.get("rpc") or {}).get("transport")
+            or "redis"
+        ).lower()
+        if transport == "zmq":
+            exec_events.publish_zmq_event(
+                event,
+                dict(event_config.get("zmq") or {}),
+            )
+            return
+        redis_client = getattr(_rpc_service, "redis", None)
+        if redis_client is None:
+            redis_config = dict(config.get("redis") or {})
+            if not redis_config:
+                return
+            from bigqmt_signal_trader.adapters.redis_common import build_redis_client
+
+            redis_client = build_redis_client(redis_config)
+        if kind == "trade":
+            exec_events.publish_trade_event(redis_client, account_id, event)
+        else:
             exec_events.publish_order_event(redis_client, account_id, event)
     except Exception as exc:
         print("[bigqmt_exec_events] publish %s failed: %s" % (kind, exc))

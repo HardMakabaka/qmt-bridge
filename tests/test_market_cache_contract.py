@@ -20,6 +20,23 @@ reset_binary_cache = binary_cache.reset_binary_cache
 XtdataTransportStuckError = helpers.XtdataTransportStuckError
 
 
+def _expected_status(status, reason, function, **extra):
+    payload = {
+        "status": status,
+        "data": None,
+        "reason": reason,
+        "reason_code": reason,
+        "message": reason,
+        "capability": function,
+        "provider": "bigqmt",
+        "retryable": status == "unavailable",
+        "details": {},
+        "function": function,
+    }
+    payload.update(extra)
+    return payload
+
+
 @pytest.fixture
 def market_client():
     app = FastAPI()
@@ -142,13 +159,12 @@ def test_market_read_provider_errors_are_structured(
 
     # Then it returns the stable structured error contract rather than HTTP 500.
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "error",
-        "data": None,
-        "reason": "provider offline",
-        "function": function_name,
-        "error_type": "RuntimeError",
-    }
+    assert response.json() == _expected_status(
+        "unavailable",
+        "provider offline",
+        function_name,
+        error_type="RuntimeError",
+    )
 
 
 @pytest.mark.parametrize(
@@ -175,14 +191,13 @@ def test_market_transport_stuck_is_structured_unavailable(
 
     # Then transport poisoning is unavailable, not an ordinary provider error.
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "unavailable",
-        "data": None,
-        "reason": "xtdata_transport_stuck",
-        "function": function_name,
-        "error_type": "XtdataTransportStuckError",
-        "detail": "blocked by timed-out native call",
-    }
+    assert response.json() == _expected_status(
+        "unavailable",
+        "xtdata_transport_stuck",
+        function_name,
+        error_type="XtdataTransportStuckError",
+        detail="blocked by timed-out native call",
+    )
 
 
 @pytest.mark.parametrize(
@@ -218,12 +233,11 @@ def test_market_read_none_payloads_are_unavailable(
 
     # Then absence is explicit and cannot be mistaken for empty market data.
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "unavailable",
-        "data": None,
-        "reason": f"xtdata_{function_name}_returned_none",
-        "function": function_name,
-    }
+    assert response.json() == _expected_status(
+        "unavailable",
+        f"xtdata_{function_name}_returned_none",
+        function_name,
+    )
 
 
 @pytest.mark.parametrize(
@@ -256,13 +270,12 @@ def test_mapping_market_reads_reject_wrong_shapes(
 
     # Then conversion never raises and the malformed shape is explicit.
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "error",
-        "data": None,
-        "reason": f"xtdata_{function_name}_invalid_response",
-        "function": function_name,
-        "error_type": "list",
-    }
+    assert response.json() == _expected_status(
+        "error",
+        f"xtdata_{function_name}_invalid_response",
+        function_name,
+        error_type="list",
+    )
 
 
 @pytest.mark.parametrize(

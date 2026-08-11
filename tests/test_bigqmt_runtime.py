@@ -153,6 +153,12 @@ def test_runtime_builds_explicit_zmq_client_without_redis_discovery():
             "connect_address": "tcp://127.0.0.1:15560",
             "redis_discovery_enabled": False,
         },
+        "exec_events": {
+            "transport": "zmq",
+            "zmq": {
+                "connect_address": "tcp://127.0.0.1:15561",
+            },
+        },
         "formula_server": {
             "enabled": True,
             "host": "127.0.0.1",
@@ -167,6 +173,23 @@ def test_runtime_builds_explicit_zmq_client_without_redis_discovery():
     assert runtime.readiness()["qmt_trade_mode"] == "unknown"
     assert runtime.readiness()["terminal_real_mode"] is False
     assert runtime.readiness()["terminal_mode_source"] == "unavailable"
+
+
+def test_runtime_rejects_shared_rpc_and_event_zmq_endpoint():
+    from qmt_bridge.server.bigqmt import BigQmtRuntime
+
+    endpoint = "tcp://127.0.0.1:15560"
+    runtime = BigQmtRuntime(
+        Settings(
+            trading_account_id="acct-1",
+            zmq_endpoint=endpoint,
+            event_zmq_endpoint=endpoint,
+        ),
+        compat_module=_compat_module(),
+    )
+
+    with pytest.raises(ValueError, match="must differ"):
+        runtime.connect()
 
 
 def test_runtime_attests_real_mode_from_qmt_terminal_log(tmp_path):
@@ -246,7 +269,7 @@ def test_manager_refreshes_terminal_mode_before_order(tmp_path):
     assert not any(call[0] == "order_stock" for call in manager._trader.calls)
 
 
-def test_manager_never_starts_redis_callback_listener_and_queries_account_wide():
+def test_manager_starts_zmq_callback_listener_and_queries_account_wide():
     from qmt_bridge.server.bigqmt import BigQmtRuntime
     from qmt_bridge.server.trading.manager import XtTraderManager
 
@@ -266,7 +289,8 @@ def test_manager_never_starts_redis_callback_listener_and_queries_account_wide()
     manager.query_trades()
 
     assert ("connect",) in manager._trader.calls
-    assert not any(call[0] in {"start", "subscribe"} for call in manager._trader.calls)
+    assert ("start",) in manager._trader.calls
+    assert ("subscribe", "acct-1") in manager._trader.calls
     assert ("query_orders", "acct-1", False, "") in manager._trader.calls
     assert ("query_trades", "acct-1", "") in manager._trader.calls
 

@@ -67,7 +67,7 @@ def get_full_tick(
     return {"data": _numpy_to_python(raw)}
 
 
-@router.get("/api/sector_stocks")
+@router.get("/api/sector_stocks", operation_id="legacy_get_sector_stocks")
 def get_sector_stocks(
     sector: str = Query(..., description="板块名称，如 沪深A股"),
 ):

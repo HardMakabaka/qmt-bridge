@@ -108,6 +108,7 @@ class RpcTransport(object):
                 "ok": False,
                 "data": None,
                 "error": "%s: %s" % (exc.__class__.__name__, exc),
+                "error_type": exc.__class__.__name__,
                 "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
         if response is not None:

@@ -5,9 +5,21 @@ from fastapi.responses import JSONResponse
 
 from ..bigqmt import BIGQMT_UPSTREAM_SHA, BIGQMT_UPSTREAM_VERSION, xtdata
 from ..binary_cache import get_binary_cache
+from ..capabilities import build_capability_registry, capability_summary
 from ..helpers import _call_xtdata_serialized, _numpy_to_python
 
 router = APIRouter(prefix="/api/meta", tags=["meta"])
+
+
+@router.get("/capabilities")
+def get_capabilities(request: Request):
+    runtime = getattr(request.app.state, "bigqmt_runtime", None)
+    registry = build_capability_registry(request.app, runtime)
+    return {
+        "status": "ok",
+        "counts": capability_summary(registry),
+        "capabilities": [item.to_payload() for item in registry],
+    }
 
 
 @router.get("/markets")
@@ -132,7 +144,19 @@ def readiness_check(request: Request):
         "write_blockers": list(
             getattr(manager, "write_blockers", ["account_manager_unavailable"])
         ),
+        "execution_events": getattr(
+            manager,
+            "event_status",
+            {
+                "transport": "zmq",
+                "listener_alive": False,
+                "replay_gap": False,
+                "cursor": None,
+            },
+        ),
     }
+    registry = build_capability_registry(request.app, runtime)
+    payload["capability_counts"] = capability_summary(registry)
     return payload
 
 

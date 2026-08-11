@@ -6,6 +6,7 @@ param(
     [string]$AccountId,
     [string]$SourceRoot = "",
     [string]$ZmqEndpoint = "tcp://127.0.0.1:15560",
+    [string]$EventZmqEndpoint = "tcp://127.0.0.1:15561",
     [bool]$OrderMethodsEnabled = $true
 )
 
@@ -26,6 +27,12 @@ if ([string]::IsNullOrWhiteSpace($AccountId)) {
 }
 if ($ZmqEndpoint -notmatch '^tcp://(127\.0\.0\.1|localhost|\[::1\]):[0-9]+$') {
     throw "ZmqEndpoint must use TCP loopback"
+}
+if ($EventZmqEndpoint -notmatch '^tcp://(127\.0\.0\.1|localhost|\[::1\]):[0-9]+$') {
+    throw "EventZmqEndpoint must use TCP loopback"
+}
+if ($EventZmqEndpoint -eq $ZmqEndpoint) {
+    throw "EventZmqEndpoint must differ from ZmqEndpoint"
 }
 
 $temporarySource = $null
@@ -124,6 +131,7 @@ try {
 
         $escapedAccountId = $AccountId.Replace("'", "\'")
         $escapedEndpoint = $ZmqEndpoint.Replace("'", "\'")
+        $escapedEventEndpoint = $EventZmqEndpoint.Replace("'", "\'")
         $pythonOrderMethodsEnabled = if ($OrderMethodsEnabled) { "True" } else { "False" }
         $config = @"
 BIGQMT_ACCOUNT_ID = '$escapedAccountId'
@@ -142,7 +150,12 @@ BIGQMT_REDIS_CONFIG = {
     'schedule_adjust_interval': '200nMilliSecond',
     'full_tick_cache_enabled': False,
     'download_jobs_enabled': False,
-    'exec_events_enabled': False,
+    'exec_events_enabled': True,
+    'exec_events_transport': 'zmq',
+    'exec_events_zmq': {
+        'bind_address': '$escapedEventEndpoint',
+        'maxlen': 2000,
+    },
 }
 "@
         [IO.File]::WriteAllText($targetConfig, $config, [Text.UTF8Encoding]::new($false))
@@ -154,6 +167,7 @@ BIGQMT_REDIS_CONFIG = {
             installed_at = (Get-Date).ToString("o")
             transport = "zmq"
             endpoint = $ZmqEndpoint
+            event_endpoint = $EventZmqEndpoint
             order_methods_enabled = $OrderMethodsEnabled
             terminal_mode_attestation = $true
             terminal_mode_attestation_source = "qmt_request_id_and_terminal_log"

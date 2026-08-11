@@ -907,6 +907,29 @@ class BigQmtMarketDataProvider:
         # ContextInfo stub: get_risk_free_rate(index) — 无风险利率。
         return self._call_context("get_risk_free_rate", index)
 
+    def get_basket(self, basket_name):
+        return self._call_context("get_basket", basket_name)
+
+    def get_etf_iopv(self, stockcode):
+        return self._call_context("get_etf_iopv", stockcode)
+
+    def get_industry_name_of_stock(self, industry_type, stock):
+        return self._call_context("get_industry_name_of_stock", industry_type, stock)
+
+    def get_market_time(self, market):
+        return self._call_context("get_market_time", market)
+
+    def getfindata(self, table, field="", session=""):
+        args = [table]
+        if field or session:
+            args.append(field)
+        if session:
+            args.append(session)
+        return self._call_context("getfindata", *args)
+
+    def is_suspended_stock(self, stock):
+        return self._call_context("is_suspended_stock", stock)
+
     # ------------------------------------------------------------------
     # L2 行情（需 L2 权限）
     # ------------------------------------------------------------------

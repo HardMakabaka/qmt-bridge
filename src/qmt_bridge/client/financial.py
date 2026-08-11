@@ -20,7 +20,48 @@ class FinancialMixin:
             "end_time": end_time,
             "report_type": report_type,
         })
-        return resp.get("data", {})
+        return self._response_value(resp, default={})
+
+    def get_financial_data_field(
+        self,
+        table: str,
+        field: str,
+        market: str = "",
+        code: str = "",
+        report_type: str = "report_time",
+        barpos: int = -1,
+    ) -> dict:
+        return self._get("/api/financial/field", {
+            "table": table,
+            "field": field,
+            "market": market,
+            "code": code,
+            "report_type": report_type,
+            "barpos": barpos,
+        })
+
+    def get_raw_financial_data(
+        self,
+        stocks: list[str],
+        fields: list[str] | None = None,
+        start_time: str = "",
+        end_time: str = "",
+        report_type: str = "report_time",
+    ) -> dict:
+        return self._get("/api/financial/raw_data", {
+            "stocks": ",".join(stocks),
+            "fields": ",".join(fields or []),
+            "start_time": start_time,
+            "end_time": end_time,
+            "report_type": report_type,
+        })
+
+    def get_findata(self, table: str, field: str = "", session: str = "") -> dict:
+        return self._get("/api/financial/findata", {
+            "table": table,
+            "field": field,
+            "session": session,
+        })
 
     def download_financial(
         self,

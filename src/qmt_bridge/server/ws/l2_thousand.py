@@ -1,5 +1,7 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from ..helpers import _status_payload
+
 router = APIRouter()
 
 
@@ -9,11 +11,11 @@ async def ws_l2_thousand(ws: WebSocket):
     try:
         await ws.receive_text()
         await ws.send_json(
-            {
-                "status": "unsupported",
-                "capability": "l2_thousand_push",
-                "reason": "bigqmt_l2_push_not_verified",
-            }
+            _status_payload(
+                "unsupported",
+                reason="bigqmt_l2_push_not_verified",
+                function="l2_thousand_push",
+            )
         )
         await ws.close(code=1003)
     except WebSocketDisconnect:

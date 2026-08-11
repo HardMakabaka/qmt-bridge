@@ -19,6 +19,7 @@ from ..bigqmt import xtdata
 from ..helpers import (
     XtdataCallCancelledError,
     XtdataTransportStuckError,
+    _call_xtdata_optional,
     _call_xtdata_serialized,
     _call_xtdata_serialized_cancellable,
     _mark_xtdata_transport_stuck,
@@ -1025,15 +1026,13 @@ def download_history_contracts():
 @router.post("/ipo_data")
 def download_ipo_data():
     """Trigger IPO data download."""
-    _call_xtdata_serialized(xtdata.download_ipo_data)
-    return {"status": "ok"}
+    return _call_xtdata_optional(xtdata, "download_ipo_data")
 
 
 @router.post("/option_data")
 def download_option_data():
     """Trigger option data download."""
-    _call_xtdata_serialized(xtdata.download_option_data)
-    return {"status": "ok"}
+    return _call_xtdata_optional(xtdata, "download_option_data")
 
 
 @router.post("/financial2")

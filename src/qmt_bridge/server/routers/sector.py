@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Query
 from ..bigqmt import xtdata
 
-from ..helpers import _call_xtdata_serialized, _numpy_to_python
+from ..helpers import _call_xtdata_optional, _call_xtdata_serialized, _numpy_to_python
 from ..models import (
     AddSectorStocksRequest,
     CreateSectorFolderRequest,
@@ -200,8 +200,7 @@ def get_sector_info(
 @router.post("/create_folder")
 def create_sector_folder(req: CreateSectorFolderRequest):
     """Create a new sector folder."""
-    result = _call_xtdata_serialized(xtdata.create_sector_folder, req.folder_name)
-    return {"status": "ok", "data": _numpy_to_python(result)}
+    return _call_xtdata_optional(xtdata, "create_sector_folder", req.folder_name)
 
 
 @router.post("/create")
@@ -229,12 +228,12 @@ def add_sector_stocks(req: AddSectorStocksRequest):
 @router.post("/remove_stocks")
 def remove_sector_stocks(req: RemoveSectorStocksRequest):
     """Remove stocks from a sector."""
-    result = _call_xtdata_serialized(
-        xtdata.remove_stock_from_sector,
+    return _call_xtdata_optional(
+        xtdata,
+        "remove_stock_from_sector",
         req.sector_name,
         req.stocks,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
 
 
 @router.delete("/remove")
@@ -249,9 +248,9 @@ def remove_sector(
 @router.post("/reset")
 def reset_sector(req: ResetSectorRequest):
     """Reset sector stocks (replace all stocks)."""
-    result = _call_xtdata_serialized(
-        xtdata.reset_sector,
+    return _call_xtdata_optional(
+        xtdata,
+        "reset_sector",
         req.sector_name,
         req.stocks,
     )
-    return {"status": "ok", "data": _numpy_to_python(result)}
