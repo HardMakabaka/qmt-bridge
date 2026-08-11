@@ -93,4 +93,17 @@ def read_qmt_sector_stocks(
     return stocks
 
 
-__all__ = ["read_qmt_sector_names", "read_qmt_sector_stocks"]
+def resolve_qmt_sector_raw_name(
+    local_dat_root: Path,
+    sector_name: str,
+) -> str:
+    target = str(sector_name or "").strip()
+    membership_path = _current_sector_paths(local_dat_root).get(target)
+    return membership_path.name if membership_path is not None else target
+
+
+__all__ = [
+    "read_qmt_sector_names",
+    "read_qmt_sector_stocks",
+    "resolve_qmt_sector_raw_name",
+]

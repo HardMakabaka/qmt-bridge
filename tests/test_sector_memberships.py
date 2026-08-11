@@ -130,6 +130,34 @@ def test_prefixed_local_concept_sector_resolves_membership_file(
     assert payload["stocks"] == ["000001.SZ"]
 
 
+def test_prefixed_concept_sector_uses_raw_name_for_historical_rpc(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _write_concept_sector_cache(tmp_path)
+    monkeypatch.setenv("QMT_BRIDGE_LOCAL_DAT_ROOT", str(tmp_path))
+    calls = []
+
+    def get_stock_list_in_sector(sector_name, real_timetag=-1):
+        calls.append((sector_name, real_timetag))
+        return ["000001.SZ"]
+
+    monkeypatch.setattr(
+        sector,
+        "xtdata",
+        SimpleNamespace(get_stock_list_in_sector=get_stock_list_in_sector),
+    )
+
+    payload = sector.get_sector_stocks(
+        sector="TGN算力",
+        real_timetag="20260811",
+    )
+
+    assert calls == [("算力", "20260811")]
+    assert payload["source"] == "qmt_rpc_sector"
+    assert payload["stocks"] == ["000001.SZ"]
+
+
 def test_sector_list_filters_keyword_and_limit(monkeypatch):
     monkeypatch.setattr(
         sector,

@@ -14,7 +14,11 @@ from ..models import (
     RemoveSectorStocksRequest,
     ResetSectorRequest,
 )
-from ..qmt_sector_cache import read_qmt_sector_names, read_qmt_sector_stocks
+from ..qmt_sector_cache import (
+    read_qmt_sector_names,
+    read_qmt_sector_stocks,
+    resolve_qmt_sector_raw_name,
+)
 
 router = APIRouter(prefix="/api/sector", tags=["sector"])
 
@@ -46,9 +50,14 @@ def _sector_stocks(
         stocks = read_qmt_sector_stocks(root, sector_name)
         if stocks is not None:
             return stocks, "qmt_local_sector"
+    rpc_sector_name = (
+        resolve_qmt_sector_raw_name(root, sector_name)
+        if root is not None
+        else sector_name
+    )
     stocks = _call_xtdata_serialized(
         xtdata.get_stock_list_in_sector,
-        sector_name,
+        rpc_sector_name,
         real_timetag=real_timetag,
     )
     return list(stocks or []), "qmt_rpc_sector"
