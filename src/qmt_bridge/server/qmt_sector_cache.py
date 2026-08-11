@@ -7,6 +7,10 @@ from functools import lru_cache
 from pathlib import Path
 
 SectorConfigSignature = tuple[tuple[str, int, int], ...]
+_CONCEPT_PREFIX_BY_FOLDER = {
+    "D概念": "TDGN",
+    "T概念": "TGN",
+}
 
 
 def _sector_root(local_dat_root: Path) -> Path:
@@ -44,9 +48,15 @@ def _sector_paths(signature: SectorConfigSignature) -> Mapping[str, Path]:
             if item.get("type") != "2":
                 continue
             name = str(item.get("name") or "").strip()
-            if not name or name in sector_paths:
+            prefix = _CONCEPT_PREFIX_BY_FOLDER.get(config_path.parent.name, "")
+            public_name = (
+                f"{prefix}{name}"
+                if prefix and not name.upper().startswith(prefix)
+                else name
+            )
+            if not public_name or public_name in sector_paths:
                 continue
-            sector_paths[name] = config_path.parent / name
+            sector_paths[public_name] = config_path.parent / name
     return sector_paths
 
 

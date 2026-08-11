@@ -27,6 +27,24 @@ def _write_sector_cache(root: Path) -> None:
     (sector_root / "SW1食品饮料").write_text("600519.SH", encoding="utf-8")
 
 
+def _write_concept_sector_cache(root: Path) -> None:
+    fixtures = {
+        "D概念": ("大盘", "600000.SH"),
+        "T概念": ("算力", "000001.SZ"),
+    }
+    for folder, (sector_name, stock_code) in fixtures.items():
+        sector_root = root / "Sector" / folder
+        sector_root.mkdir(parents=True)
+        (sector_root / "sectorConfig.xml").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            f'<CustomSector><Item name="{folder}" type="0">'
+            f'<Item name="{sector_name}" type="2" />'
+            "</Item></CustomSector>",
+            encoding="utf-8",
+        )
+        (sector_root / sector_name).write_text(stock_code, encoding="utf-8")
+
+
 def test_sector_list_prefers_local_full_qmt_cache_without_rpc(
     monkeypatch,
     tmp_path: Path,
@@ -76,6 +94,40 @@ def test_latest_sector_stocks_prefers_local_full_qmt_cache_without_rpc(
     # Then: codes are read and deduplicated from the QMT cache.
     assert payload["source"] == "qmt_local_sector"
     assert payload["stocks"] == ["600000.SH", "000001.SZ"]
+
+
+def test_local_concept_sector_names_restore_legacy_namespaces(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _write_concept_sector_cache(tmp_path)
+    monkeypatch.setenv("QMT_BRIDGE_LOCAL_DAT_ROOT", str(tmp_path))
+
+    payload = sector.get_sector_list(keyword=None, limit=0)
+
+    assert payload["sectors"] == ["TDGN大盘", "TGN算力"]
+
+
+def test_prefixed_local_concept_sector_resolves_membership_file(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _write_concept_sector_cache(tmp_path)
+    monkeypatch.setenv("QMT_BRIDGE_LOCAL_DAT_ROOT", str(tmp_path))
+
+    def unexpected_rpc_call(*_args, **_kwargs):
+        raise AssertionError("prefixed local concept must not call Big-QMT RPC")
+
+    monkeypatch.setattr(
+        sector,
+        "xtdata",
+        SimpleNamespace(get_stock_list_in_sector=unexpected_rpc_call),
+    )
+
+    payload = sector.get_sector_stocks(sector="TGN算力", real_timetag="-1")
+
+    assert payload["source"] == "qmt_local_sector"
+    assert payload["stocks"] == ["000001.SZ"]
 
 
 def test_sector_list_filters_keyword_and_limit(monkeypatch):
