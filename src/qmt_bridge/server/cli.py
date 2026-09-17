@@ -1,12 +1,50 @@
 """CLI entry point — ``qmt-server`` command."""
 
 import argparse
+import hmac
 import os
+import threading
+import uuid
 from dataclasses import replace
+from pathlib import Path
+
+from bigqmt_signal_trader import telemetry
 
 from .config import Settings, _load_env_file, reset_settings
-from .singleton import stop_existing_qmt_servers
+from .singleton import ensure_qmt_server_port_available
 from ..no_proxy import disable_environment_proxies
+
+
+def _start_local_shutdown_watcher(
+    server: object,
+    shutdown_file: str,
+    shutdown_token: str,
+) -> tuple[threading.Event, threading.Thread]:
+    """Accept a one-shot local shutdown request from the owning controller.
+
+    This is deliberately a file/nonce handshake, not an HTTP administration
+    endpoint.  The process only acts on its caller-provided private path and
+    matching nonce; setting ``should_exit`` lets Uvicorn run FastAPI lifespan
+    cleanup normally.
+    """
+    stop = threading.Event()
+    request_path = Path(shutdown_file)
+
+    def watch() -> None:
+        while not stop.wait(0.1):
+            try:
+                candidate = request_path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            if hmac.compare_digest(candidate, shutdown_token):
+                setattr(server, "should_exit", True)
+                return
+
+    worker = threading.Thread(target=watch, name="qmt-bridge-local-shutdown", daemon=True)
+    worker.start()
+    return stop, worker
 
 
 def main():
@@ -47,7 +85,7 @@ def main():
         action="store_true",
         default=os.environ.get("QMT_BRIDGE_SINGLETON", "true").lower()
         in ("0", "false", "no", "off"),
-        help="Disable qmt-server singleton cleanup before binding the port",
+        help="Disable the non-destructive bridge-port availability preflight",
     )
     parser.add_argument(
         "--account-enabled",
@@ -94,8 +132,12 @@ def main():
         in ("1", "true", "yes", "on"),
         help="Enable bridge-side order and cancel writes",
     )
+    parser.add_argument("--shutdown-file", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--shutdown-token", default="", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+    if bool(args.shutdown_file) != bool(args.shutdown_token):
+        parser.error("--shutdown-file and --shutdown-token must be supplied together")
 
     # Build settings from CLI args (override env)
     settings = replace(
@@ -114,20 +156,54 @@ def main():
         order_writes_enabled=args.order_writes_enabled,
     )
     reset_settings(settings)
-    stop_existing_qmt_servers(port=settings.port, enabled=settings.singleton)
+    ensure_qmt_server_port_available(port=settings.port, enabled=settings.singleton)
 
     import uvicorn
 
     from .app import create_app
 
     app = create_app(settings)
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level,
         workers=settings.workers,
     )
+    server = uvicorn.Server(config)
+    watcher_stop: threading.Event | None = None
+    watcher: threading.Thread | None = None
+    if args.shutdown_file:
+        watcher_stop, watcher = _start_local_shutdown_watcher(
+            server, args.shutdown_file, args.shutdown_token
+        )
+    telemetry.configure(
+        enabled=os.environ.get("QMT_BRIDGE_TRACE_ENABLED", "true").strip().lower()
+        not in {"0", "false", "no", "off"},
+        directory=os.environ.get("QMT_BRIDGE_TRACE_DIR") or None,
+        role="bridge_server",
+    )
+    trace_id = os.environ.get("QMT_BRIDGE_TRACE_ID", "") or uuid.uuid4().hex
+    context = telemetry.bind_context(trace_id=trace_id)
+    exit_outcome = "success"
+    exit_error_type = ""
+    try:
+        context.__enter__()
+        telemetry.emit("process.server_start", critical=True, outcome="started", port=settings.port)
+        server.run()
+    except Exception as exc:
+        exit_outcome = "error"
+        exit_error_type = type(exc).__name__
+        raise
+    finally:
+        if watcher_stop is not None:
+            watcher_stop.set()
+        if watcher is not None:
+            watcher.join(timeout=1)
+        telemetry.emit("process.server_exit", critical=True, outcome=exit_outcome, error_type=exit_error_type)
+        context.__exit__(None, None, None)
+        telemetry.flush(0.5)
+        telemetry.shutdown(0.5)
 
 
 if __name__ == "__main__":

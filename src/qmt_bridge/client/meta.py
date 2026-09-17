@@ -29,13 +29,13 @@ class MetaMixin:
         resp = self._get("/api/meta/version")
         return resp.get("version", "")
 
-    def get_xtdata_version(self) -> str:
-        """Fetch xtquant/xtdata library version on the server."""
-        resp = self._get("/api/meta/xtdata_version")
-        return resp.get("xtdata_version", "")
+    def get_runtime_version(self) -> str:
+        """Fetch the embedded Big QMT adapter's upstream version."""
+        resp = self._get("/api/meta/runtime_version")
+        return resp.get("runtime_version", "")
 
     def get_connection_status(self) -> dict:
-        """Check xtdata connection status."""
+        """Check the Big QMT bridge connection status."""
         return self._get("/api/meta/connection_status")
 
     def health_check(self) -> dict:
@@ -51,6 +51,19 @@ class MetaMixin:
 
     def get_readiness(self) -> dict:
         return self._get("/api/meta/readiness")
+
+    def get_history_readiness(
+        self, stock: str, start_time: str, end_time: str, *, timeout_seconds: float = 8,
+    ) -> dict:
+        """Return the complete RPC-only minute-probe status, not just its data."""
+        return self._get("/api/meta/history-readiness", {
+            "stock": stock, "start_time": start_time, "end_time": end_time,
+            "timeout_seconds": timeout_seconds,
+        })
+
+    def get_recovery_status(self) -> dict:
+        """Read the current HTTP write-inflight guard without making an RPC call."""
+        return self._get("/api/meta/recovery-status")
 
     def get_binary_cache_stats(self) -> dict:
         return self._get("/api/meta/binary_cache")

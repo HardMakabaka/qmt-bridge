@@ -8,9 +8,15 @@ header. Business logic stays in the importable package.
 
 import datetime
 import importlib as _importlib
+import os
 import sys
 import threading
 import time
+from bigqmt_signal_trader.telemetry import emit as _telemetry_emit_direct, span as _telemetry_span, traced as _telemetry_traced
+
+
+def _telemetry_emit(name, critical=False, **fields):
+    _telemetry_emit_direct(name, critical=critical, **fields)
 
 # The DRYRUN entry reloads strategy/runtime/redis_rpc/redis_common but NOT the
 # other package submodules. Without this, the "from adapter_factory import build_app"
@@ -77,6 +83,17 @@ _last_full_tick_market_refresh_at = 0.0
 # Observed adjust cadence, so a mis-scheduled run_time (e.g. clamped to bar
 # cadence) is visible in the logs instead of silently costing latency.
 _adjust_tick_stats = {"last_ts": 0.0, "count": 0, "window_start": 0.0, "sum": 0.0, "min": 0.0, "max": 0.0}
+_telemetry_phase_summary = {}
+
+
+def _summary_emit(name, **fields):
+    now = time.time()
+    item = _telemetry_phase_summary.setdefault(name, {"count": 0, "start": now})
+    item["count"] += 1
+    if now - item["start"] >= 10.0:
+        fields["count"] = item["count"]
+        _telemetry_emit(name, **fields)
+        item.update({"count": 0, "start": now})
 
 
 def set_app_factory(factory):
@@ -187,6 +204,7 @@ def _detect_account_id(context_info=None):
 # QMT injects them into the process global namespace at startup. We resolve
 # them lazily so the module imports cleanly outside QMT (tests/dev).
 _EXTRA_QMT_GLOBAL_FUNCS = (
+    "download_history_data",          # single-symbol history supplementation
     "get_history_trade_detail_data",  # 历史成交明细
     "get_value_by_order_id",          # 按 order_id 查委托详情
     "get_last_order_id",              # 最近委托号
@@ -321,7 +339,10 @@ def _build_rpc_service(context_info, app, config):
     allow_order_methods = _config_bool(rpc_config.get("allow_order_methods"), False)
     handlers = BigQmtRpcHandlers(
         account_id=account_id,
-        market_data=BigQmtMarketDataProvider(context_info),
+        market_data=BigQmtMarketDataProvider(
+            context_info,
+            native_history_downloader=qmt_api.get("download_history_data"),
+        ),
         position_provider=BigQmtPositionProvider(
             get_trade_detail_data_func=qmt_api.get("get_trade_detail_data"),
             account_type=config.get("account_type", "STOCK"),
@@ -491,16 +512,20 @@ def _schedule_adjust_if_needed(context_info, config):
             "[bigqmt_signal_trader] WARNING: ContextInfo.run_time unavailable; RPC drain "
             "falls back to bar cadence (requested interval=%s not applied)" % interval
         )
+        _telemetry_emit("adjust_schedule_fallback", critical=True, reason="run_time_unavailable")
         return
     start_time = (datetime.datetime.now() + datetime.timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
     try:
         context_info.run_time("adjust", interval, start_time)
         _scheduled_adjust = True
+        _telemetry_emit("adjust_schedule_registered", critical=True, interval=interval)
         print(
             "[bigqmt_signal_trader] scheduled adjust interval=%s "
             "(verify observed cadence in the 'adjust cadence' log line)" % interval
         )
     except Exception as exc:
+        _telemetry_emit("adjust_schedule_fallback", critical=True,
+                        reason="run_time_error", error_type=exc.__class__.__name__)
         print(
             "[bigqmt_signal_trader] WARNING: schedule adjust failed (%s); RPC drain falls back "
             "to bar cadence, requested interval=%s not applied" % (exc, interval)
@@ -588,15 +613,27 @@ def init(ContextInfo):
     _apply_gil_tuning()
     _start_latency_probe()
     config = _build_config()
-    runtime = BigQmtRuntimeAdapter(ContextInfo)
-    app = init_app(runtime, _build_app)
-    _start_rpc_service(ContextInfo, app, config)
-    _schedule_adjust_if_needed(ContextInfo, config)
-    print("[bigqmt_signal_trader] init ok")
-
-    # 启动时自动诊断：检测服务状态 + 关键函数绑定，方便发现问题
-    _diag_startup(ContextInfo, config)
-    return app
+    try:
+        from bigqmt_signal_trader import telemetry
+        trace_config = dict(config.get("telemetry") or {})
+        enabled_default = str(os.environ.get("QMT_BRIDGE_TRACE_ENABLED", "true")).lower() not in ("0", "false", "no", "off")
+        telemetry.configure(enabled=_config_bool(trace_config.get("enabled"), enabled_default),
+                            directory=trace_config.get("dir") or os.environ.get("QMT_BRIDGE_TRACE_DIR"),
+                            role="qmt_strategy")
+    except Exception:
+        pass
+    with _telemetry_span("strategy.init", service_role="qmt_strategy") as trace:
+        _telemetry_emit("strategy_init_started", critical=True, service_role="qmt_strategy")
+        runtime = BigQmtRuntimeAdapter(ContextInfo)
+        app = init_app(runtime, _build_app)
+        _start_rpc_service(ContextInfo, app, config)
+        _schedule_adjust_if_needed(ContextInfo, config)
+        print("[bigqmt_signal_trader] init ok")
+        _diag_startup(ContextInfo, config)
+        _telemetry_emit("strategy_init_completed", critical=True,
+                        account_configured=bool(_account_id), rpc_running=_rpc_service is not None)
+        trace["outcome"] = "success"
+        return app
 
 
 def _diag_startup(ContextInfo, config):
@@ -643,14 +680,17 @@ def _pump_download_jobs(context_info, config):
     """Advance any queued async download job by a bounded slice on this thread."""
     job_config = dict(config.get("download_jobs") or {})
     if not _config_bool(job_config.get("enabled"), True):
+        _telemetry_emit("strategy_download_pump_skipped", reason="disabled")
         return None
     account_id = str(job_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
+        _telemetry_emit("strategy_download_pump_skipped", reason="no_account")
         return None
     redis_client = getattr(_rpc_service, "redis", None)
     if redis_client is None:
         redis_config = dict(config.get("redis") or {})
         if not redis_config:
+            _telemetry_emit("strategy_download_pump_skipped", reason="no_redis")
             return None
         from bigqmt_signal_trader.adapters.redis_common import build_redis_client
 
@@ -659,7 +699,11 @@ def _pump_download_jobs(context_info, config):
     if market_data is None:
         from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 
-        market_data = BigQmtMarketDataProvider(context_info)
+        qmt_api = dict(config.get("qmt_api") or {})
+        market_data = BigQmtMarketDataProvider(
+            context_info,
+            native_history_downloader=qmt_api.get("download_history_data"),
+        )
     try:
         from bigqmt_signal_trader.download_jobs import pump_download_jobs
 
@@ -673,6 +717,8 @@ def _pump_download_jobs(context_info, config):
         )
     except Exception as exc:
         print("[bigqmt_download_jobs] pump failed: %s" % exc)
+        _telemetry_emit("strategy_download_pump_failed", critical=True,
+                        error_type=exc.__class__.__name__)
         return None
 
 
@@ -682,11 +728,22 @@ def _adjust_phase(name, fn, *args):
     this shows WHERE). The finally-log never alters the call's result/exception."""
     t0 = time.perf_counter()
     try:
-        return fn(*args)
-    finally:
+        result = fn(*args)
+    except Exception as exc:
+        ms = (time.perf_counter() - t0) * 1000.0
+        _telemetry_emit("adjust.phase", critical=True, phase=name, outcome="error",
+                        error_type=exc.__class__.__name__, elapsed_ms=int(ms))
+        raise
+    else:
         ms = (time.perf_counter() - t0) * 1000.0
         if ms > 50.0:
             print("[adjust_phase] %s %.0fms" % (name, ms))
+            _telemetry_emit("adjust.phase", critical=True, phase=name,
+                            outcome="success", elapsed_ms=int(ms), slow=True)
+        else:
+            _summary_emit("adjust.phase.summary", phase=name,
+                          outcome="success", elapsed_ms=int(ms))
+        return result
 
 
 def adjust(ContextInfo):
@@ -709,7 +766,9 @@ def handlebar(ContextInfo):
     return adjust(ContextInfo)
 
 
+@_telemetry_traced("exec_event.publish", service_role="qmt_strategy")
 def _publish_exec_event(kind, obj):
+    _telemetry_emit("exec_event_publish_started", critical=True, kind=kind)
     config = _build_config()
     event_config = dict(config.get("exec_events") or {})
     # Raw-field diagnostics run BEFORE every other check (and before the
@@ -725,9 +784,13 @@ def _publish_exec_event(kind, obj):
         except Exception as exc:
             print("[bigqmt_exec_raw] snapshot %s failed: %s" % (kind, exc))
     if not _config_bool(event_config.get("enabled"), True):
+        _telemetry_emit("exec_event_publish_terminal", critical=True, kind=kind,
+                        outcome="not_enabled")
         return
     account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
+        _telemetry_emit("exec_event_publish_terminal", critical=True, kind=kind,
+                        outcome="no_account")
         return
     try:
         from bigqmt_signal_trader import exec_events
@@ -750,11 +813,15 @@ def _publish_exec_event(kind, obj):
                 event,
                 dict(event_config.get("zmq") or {}),
             )
+            _telemetry_emit("exec_event_publish_terminal", critical=True, kind=kind,
+                            outcome="published", transport="zmq")
             return
         redis_client = getattr(_rpc_service, "redis", None)
         if redis_client is None:
             redis_config = dict(config.get("redis") or {})
             if not redis_config:
+                _telemetry_emit("exec_event_publish_terminal", critical=True, kind=kind,
+                                outcome="no_redis")
                 return
             from bigqmt_signal_trader.adapters.redis_common import build_redis_client
 
@@ -763,8 +830,12 @@ def _publish_exec_event(kind, obj):
             exec_events.publish_trade_event(redis_client, account_id, event)
         else:
             exec_events.publish_order_event(redis_client, account_id, event)
+        _telemetry_emit("exec_event_publish_terminal", critical=True, kind=kind,
+                        outcome="published", transport="redis")
     except Exception as exc:
         print("[bigqmt_exec_events] publish %s failed: %s" % (kind, exc))
+        _telemetry_emit("exec_event_publish_terminal", critical=True, kind=kind,
+                        outcome="error", error_type=exc.__class__.__name__)
 
 
 def on_order(ContextInfo, order):

@@ -3,7 +3,7 @@
 A client submits a download job (fire-and-forget) into a Redis queue and polls
 its status. The Big QMT strategy thread drains one job at a time and downloads a
 bounded slice of symbols per tick (``chunk_size`` symbols, capped by a wall-clock
-budget), so a long ``download_history_data2`` never blocks the strategy thread /
+budget), so a series of single-symbol ``download_history_data`` calls does not monopolize the strategy thread /
 RPC pump. Historical bars land in the Big QMT machine's local store; clients then
 read them back with fast ``get_local_data`` / ``get_market_data`` calls.
 
@@ -18,6 +18,11 @@ job data the pump reads back:
 import json
 import time
 import uuid
+from .telemetry import emit
+
+
+def _emit(name, critical=False, **fields):
+    emit(name, critical=critical, **fields)
 
 
 # Dedicated "bigqmt:dljob:*" namespace for the client<->pump protocol.
@@ -89,7 +94,7 @@ def submit_download_job(
     account_id,
     stock_list,
     period,
-    method="download_history_data2",
+    method="download_history_data",
     start_time="",
     end_time="",
     incrementally=None,
@@ -104,7 +109,7 @@ def submit_download_job(
     now = time.time()
     job = {
         "job_id": job_id,
-        "method": str(method or "download_history_data2"),
+        "method": str(method or "download_history_data"),
         "stock_list": codes,
         "period": period,
         "start_time": start_time or "",
@@ -115,6 +120,8 @@ def submit_download_job(
         "done": 0,
         "state": PENDING,
         "error": "",
+        "download_invocation_completed": False,
+        "coverage_verified": False,
         "created_at_ts": now,
         "updated_at_ts": now,
     }
@@ -125,6 +132,8 @@ def submit_download_job(
         redis_client.expire(queue_key(account_id), ttl)
     except Exception:
         pass
+    _emit("download_job_submitted", critical=True, job_id=job_id,
+          total=len(codes), period=period, method=job["method"])
     return job
 
 
@@ -162,6 +171,8 @@ def _write_job(redis_client, account_id, job, job_ttl_seconds):
     job["updated_at_ts"] = time.time()
     ttl = int(max(1, job_ttl_seconds))
     redis_client.setex(job_key(account_id, job["job_id"]), ttl, _enc(json.dumps(job, ensure_ascii=False)))
+    _emit("download_job_persisted", job_id=job.get("job_id"),
+          state=job.get("state"), done=job.get("done"), total=job.get("total"))
 
 
 def _acquire_current_job(redis_client, account_id):
@@ -185,11 +196,14 @@ def _acquire_current_job(redis_client, account_id):
 
 
 def _download_chunk(market_data, method, chunk, period, start_time, end_time, incrementally):
-    if method == "download_history_data":
-        for code in chunk:
-            market_data.download_history_data(code, period, start_time, end_time, incrementally)
-    else:
-        market_data.download_history_data2(chunk, period, start_time, end_time, incrementally)
+    if method != "download_history_data":
+        raise NotImplementedError(
+            "unsupported_bigqmt_download_method:%s" % method
+        )
+    for code in chunk:
+        market_data.download_history_data(
+            code, period, start_time, end_time, incrementally
+        )
 
 
 def pump_download_jobs(
@@ -208,6 +222,7 @@ def pump_download_jobs(
     """
     job = _acquire_current_job(redis_client, account_id)
     if job is None:
+        _emit("download_job_queue_empty", account_id=str(account_id or ""))
         return None
     stock_list = job.get("stock_list") or []
     total = int(job.get("total") or len(stock_list))
@@ -215,7 +230,7 @@ def pump_download_jobs(
     step = int(job.get("chunk_size") or chunk_size or DEFAULT_CHUNK_SIZE)
     if step <= 0:
         step = DEFAULT_CHUNK_SIZE
-    method = str(job.get("method") or "download_history_data2")
+    method = str(job.get("method") or "download_history_data")
     period = job.get("period")
     start_time = job.get("start_time") or ""
     end_time = job.get("end_time") or ""
@@ -224,29 +239,41 @@ def pump_download_jobs(
     started_at = time.time()
     processed_this_tick = 0
     try:
-        while done < total:
-            # Always run one chunk; only the budget check (after the first) can
-            # stop the tick, so a single heavy chunk is the smallest block unit.
+        slice_done = 0
+        while done < total and slice_done < step:
+            # Always run one symbol; only the budget check (after the first) can
+            # stop the tick. The official Big QMT API is single-symbol only.
             if max_wall_seconds and processed_this_tick and (time.time() - started_at) > float(max_wall_seconds):
                 break
-            chunk = stock_list[done:done + step]
+            chunk = stock_list[done:done + 1]
             _download_chunk(market_data, method, chunk, period, start_time, end_time, incrementally)
+            _emit("download_job_native_complete", job_id=job.get("job_id"),
+                  symbol_count=len(chunk), attempt=done + 1)
             done += len(chunk)
             processed_this_tick += len(chunk)
+            slice_done += len(chunk)
     except Exception as exc:
         job["state"] = FAILED
         job["error"] = "%s: %s" % (exc.__class__.__name__, exc)
         job["done"] = done
         _write_job(redis_client, account_id, job, job_ttl_seconds)
         redis_client.delete(current_key(account_id))
+        _emit("download_job_failed", critical=True, job_id=job.get("job_id"),
+              done=done, total=total, error_type=exc.__class__.__name__)
         return {"job_id": job["job_id"], "state": FAILED, "done": done, "total": total, "error": job["error"]}
 
     job["done"] = done
     if done >= total:
         job["state"] = DONE
+        job["download_invocation_completed"] = True
         _write_job(redis_client, account_id, job, job_ttl_seconds)
         redis_client.delete(current_key(account_id))
+        _emit("download_job_completed", critical=True, job_id=job.get("job_id"),
+              done=done, total=total, elapsed_ms=int((time.time() - started_at) * 1000))
         return {"job_id": job["job_id"], "state": DONE, "done": done, "total": total}
     job["state"] = RUNNING
     _write_job(redis_client, account_id, job, job_ttl_seconds)
+    _emit("download_job_progress", job_id=job.get("job_id"), done=done,
+          total=total, processed=processed_this_tick,
+          elapsed_ms=int((time.time() - started_at) * 1000))
     return {"job_id": job["job_id"], "state": RUNNING, "done": done, "total": total}

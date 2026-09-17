@@ -38,6 +38,7 @@ data/
 
 # PID files
 *.pid
+qmt-bridge.process.json
 
 # Logs
 *.log

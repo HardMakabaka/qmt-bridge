@@ -81,19 +81,17 @@ qmt-server --qmt-root "C:\国金证券QMT交易端" \
     --api-key your-secret-key
 ```
 
-也可以使用脚本：
+Windows 推荐使用受管理脚本；它只管理本仓库虚拟环境启动的 bridge 进程，并校验 PID、
+启动时间、可执行文件和命令行。它不启动 QMT、不登录账户、不加载模型：
 
-```bash
-# 前台运行（Ctrl+C 停止）
-bash scripts/start.sh
+```powershell
+# 后台启动、检查、停止
+.\scripts\manage-bridge.ps1 start
+.\scripts\manage-bridge.ps1 status
+.\scripts\manage-bridge.ps1 stop
 
-# 后台运行
-bash scripts/start-nohup.sh
-bash scripts/stop.sh
-
-# Windows
-scripts\start.bat
-scripts\stop.bat
+# 调试时保留在当前窗口
+.\scripts\manage-bridge.ps1 start -Foreground -- --log-level debug
 ```
 
 ## 5. 验证
@@ -110,6 +108,9 @@ Swagger 只证明 HTTP 进程存活。运行验收必须检查 readiness：
 curl http://<Windows局域网IP>:13543/api/meta/readiness
 curl http://<Windows局域网IP>:13543/api/meta/capabilities
 ```
+
+代码仓库不是部署切换器：编辑当前仓库不会自动更新 `D:\AIWORK\qmt-bridge`、重启 bridge
+或重新加载 QMT 模型。部署和模型 reload 后再重新检查 readiness。
 
 ## Python 客户端用法
 

@@ -11,8 +11,8 @@ Channels (also used as capped streams for short replay, xadd + publish):
 - ``bigqmt:order_events:{account_id}``
 - ``bigqmt:trade_events:{account_id}``
 
-The normalized field names match ``BigQmtXtTrader._order_from_dict`` /
-``_trade_from_dict`` so the client can shape them straight into MiniQMT objects.
+The normalized fields are the bridge's native order and trade event payloads;
+BigQmtTradingClient delivers these as ordinary dictionaries.
 """
 
 import json
@@ -21,6 +21,8 @@ import time
 import uuid
 
 from collections import deque
+
+from .telemetry import emit, inject_trace, span
 
 
 ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
@@ -53,6 +55,16 @@ class EventReplayBuffer(object):
             }
             payload.setdefault("published_at", time.time())
             self._events.append(payload)
+            cursor = payload["cursor"]
+            emit(
+                "execution_event.replay_append",
+                critical=True,
+                event_type=payload.get("event_type"),
+                event_epoch=cursor.get("epoch"),
+                event_sequence=cursor.get("sequence"),
+                order_sys_id=payload.get("order_sys_id"),
+                trade_id=payload.get("trade_id"),
+            )
             return dict(payload)
 
     def events_since(self, cursor=None):
@@ -81,12 +93,23 @@ class EventReplayBuffer(object):
                     for event in self._events
                     if int(event["cursor"]["sequence"]) > requested_sequence
                 ]
-            return {
+            result = {
                 "cursor": {"epoch": self.epoch, "sequence": self._sequence},
                 "events": [dict(event) for event in events],
                 "gap": gap,
                 "retained_from_sequence": first_sequence,
             }
+            emit(
+                "execution_event.replay_read",
+                critical=gap,
+                outcome="gap" if gap else "success",
+                event_epoch=self.epoch,
+                event_sequence=self._sequence,
+                event_count=len(events),
+                gap=gap,
+                retained_from_sequence=first_sequence,
+            )
+            return result
 
 
 class ZmqExecutionEventPublisher(object):
@@ -99,6 +122,8 @@ class ZmqExecutionEventPublisher(object):
         self.replay_buffer = replay_buffer or EventReplayBuffer(maxlen=maxlen)
         self._lock = threading.RLock()
         self._socket = None
+        self._transient_count = 0
+        self._transient_started_monotonic = None
 
     def start(self):
         with self._lock:
@@ -111,24 +136,71 @@ class ZmqExecutionEventPublisher(object):
             socket.setsockopt(zmq.SNDHWM, self.replay_buffer.maxlen)
             socket.bind(self.bind_address)
             self._socket = socket
+            emit("execution_event.publisher_started", critical=True)
             return self.bind_address
 
     def publish(self, event):
         with self._lock:
             if self._socket is None:
                 self.start()
-            payload = self.replay_buffer.append(event)
-            self._socket.send_string(
-                json.dumps(payload, ensure_ascii=False, default=str)
-            )
+            with span("execution_event.publish", event_type=(event or {}).get("event_type")) as result:
+                # The trace travels in the durable event envelope, not merely
+                # in this process-local span. Replay and the bridge event
+                # listener can therefore restore its causal context.
+                payload = self.replay_buffer.append(inject_trace(event))
+                self._socket.send_string(
+                    json.dumps(payload, ensure_ascii=False, default=str)
+                )
+                result["outcome"] = "success"
             return payload
+
+    def publish_transient(self, event):
+        with self._lock:
+            if self._socket is None:
+                self.start()
+            payload = dict(event or {})
+            payload.setdefault("published_at", time.time())
+            try:
+                import zmq
+
+                self._socket.send_string(
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    flags=zmq.NOBLOCK,
+                )
+            except zmq.Again:
+                emit("execution_event.transient_drop", critical=True, outcome="overloaded")
+                return None
+            if self._transient_started_monotonic is None:
+                self._transient_started_monotonic = time.monotonic()
+            self._transient_count += 1
+            self._emit_transient_summary()
+            return payload
+
+    def _emit_transient_summary(self, force=False):
+        """Report quote callback volume periodically, never once per tick."""
+        if not self._transient_count:
+            return
+        started = self._transient_started_monotonic or time.monotonic()
+        elapsed = time.monotonic() - started
+        if not force and self._transient_count < 100 and elapsed < 60.0:
+            return
+        emit(
+            "execution_event.transient_summary",
+            outcome="success",
+            event_count=self._transient_count,
+            interval_ms=round(elapsed * 1000.0, 3),
+        )
+        self._transient_count = 0
+        self._transient_started_monotonic = None
 
     def close(self):
         with self._lock:
+            self._emit_transient_summary(force=True)
             socket = self._socket
             self._socket = None
             if socket is not None:
                 socket.close(linger=0)
+                emit("execution_event.publisher_closed", critical=True)
 
 
 def _is_loopback_zmq_address(address):
@@ -168,6 +240,16 @@ def configure_zmq_event_publisher(config=None):
 
 def publish_zmq_event(event, config=None):
     return configure_zmq_event_publisher(config).publish(event)
+
+
+def publish_transient_zmq_event(event, config=None):
+    if config is not None:
+        return configure_zmq_event_publisher(config).publish_transient(event)
+    with _ZMQ_EVENT_PUBLISHER_LOCK:
+        publisher = _ZMQ_EVENT_PUBLISHER
+        if publisher is None:
+            publisher = configure_zmq_event_publisher()
+        return publisher.publish_transient(event)
 
 
 def get_event_cursor():
@@ -369,7 +451,7 @@ def _extract_direction(obj):
 
 
 # Fields we care about when diagnosing a direction misread. Anything starting
-# with "m_" is captured automatically; these are the MiniQMT-style names that
+# with "m_" is captured automatically; these are bridge field names that
 # do not match that prefix.
 _RAW_SNAPSHOT_EXTRA_FIELDS = (
     "stock_code",
@@ -491,12 +573,20 @@ def normalize_trade_event(trade, account_id=""):
 
 
 def _publish(redis_client, channel, event, maxlen=2000):
+    # Redis stream/pubsub is also a process boundary. Preserve any ambient
+    # request/callback trace without changing the event's business fields.
+    event = inject_trace(event)
     raw = json.dumps(event, ensure_ascii=False, default=str)
     try:
         redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)
-    except Exception:
-        pass
-    redis_client.publish(channel, raw)
+    except Exception as exc:
+        emit("execution_event.redis_replay_write", critical=True, outcome="error", error_type=type(exc).__name__)
+    try:
+        redis_client.publish(channel, raw)
+        emit("execution_event.redis_publish", critical=True, outcome="success", event_type=(event or {}).get("event_type"))
+    except Exception as exc:
+        emit("execution_event.redis_publish", critical=True, outcome="error", error_type=type(exc).__name__)
+        raise
     return event
 
 

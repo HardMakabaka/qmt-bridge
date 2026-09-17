@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from collections.abc import Iterable, Iterator
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, cast, runtime_checkable
 
 from fastapi import APIRouter, FastAPI
 from fastapi.routing import APIRoute, APIWebSocketRoute
@@ -14,7 +14,7 @@ CapabilitySurface = Literal["http", "websocket"]
 
 
 class RuntimeFacade(Protocol):
-    xtdata: ProviderFacade | None
+    market_data: ProviderFacade | None
 
 
 class ProviderFacade(Protocol):
@@ -45,58 +45,22 @@ class CapabilitySpec:
 
 
 _UNSUPPORTED_PATHS = {
-    "/api/bank/available_amount": "xttrader_query_bank_available_missing",
-    "/api/bank/balance": "xttrader_query_bank_balance_missing",
-    "/api/bank/banks": "xttrader_query_bound_banks_missing",
-    "/api/bank/status": "xttrader_query_bank_transfer_status_missing",
-    "/api/bank/transfer_in": "xttrader_bank_transfer_missing",
-    "/api/bank/transfer_limit": "xttrader_query_transfer_limit_missing",
-    "/api/bank/transfer_out": "xttrader_bank_transfer_missing",
-    "/api/bank/transfer_records": "xttrader_query_bank_transfer_records_missing",
-    "/api/credit/available_amount": "xttrader_query_credit_available_missing",
-    "/api/credit/order": "xttrader_credit_order_missing",
-    "/api/fund/ctp_balance": "xttrader_query_ctp_balance_missing",
-    "/api/fund/ctp_future_to_option": "xttrader_ctp_transfer_future_to_option_missing",
-    "/api/fund/ctp_option_to_future": "xttrader_ctp_transfer_option_to_future_missing",
-    "/api/fund/ctp_transfer_in": "xttrader_ctp_fund_transfer_missing",
-    "/api/fund/ctp_transfer_out": "xttrader_ctp_fund_transfer_missing",
-    "/api/fund/transfer": "xttrader_fund_transfer_missing",
-    "/api/fund/transfer_records": "xttrader_query_fund_transfer_missing",
-    "/api/financial/field": "xtdata_get_financial_data_field_signature_unavailable",
     "/api/smt/appointment": "bigqmt_query_appointment_info_unverified",
-    "/api/smt/cancel": "xttrader_cancel_smt_order_missing",
-    "/api/smt/compact": "xttrader_smt_query_compact_missing",
-    "/api/smt/negotiate_order_async": "xttrader_smt_negotiate_order_async_missing",
-    "/api/smt/order": "xttrader_smt_order_missing",
-    "/api/smt/quoter": "xttrader_smt_query_quoter_missing",
     "/api/smt/secu_info": "bigqmt_query_smt_secu_info_unverified",
     "/api/smt/secu_rate": "bigqmt_query_smt_secu_rate_unverified",
-    "/api/trading/cancel_async": "xttrader_async_cancel_unsupported",
-    "/api/trading/com_fund": "xttrader_query_com_fund_missing",
-    "/api/trading/com_position": "xttrader_query_com_position_missing",
-    "/api/trading/export_data": "xttrader_export_data_missing",
-    "/api/trading/order_async": "xttrader_async_order_unsupported",
-    "/api/trading/query_data": "xttrader_query_data_missing",
-    "/api/sector/create_folder": "xtdata_create_sector_folder_missing",
     "/api/download/ipo_data": "xtdata_download_ipo_data_missing",
     "/api/download/option_data": "xtdata_download_option_data_missing",
     "/api/market/fullspeed_orderbook": "xtdata_get_fullspeed_orderbook_missing",
-    "/api/tick/l2_thousand_quote": "xtdata_get_l2_thousand_quote_missing",
-    "/api/tick/l2_thousand_orderbook": "xtdata_get_l2_thousand_orderbook_missing",
-    "/api/tick/l2_thousand_trade": "xtdata_get_l2_thousand_trade_missing",
-    "/api/futures/sec_main_contract": "xtdata_get_sec_main_contract_missing",
     "/api/market/transactioncount": "xtdata_get_transactioncount_missing",
-    "/api/sector/remove_stocks": "xtdata_remove_stock_from_sector_missing",
-    "/api/sector/reset": "xtdata_reset_sector_missing",
-    "/api/formula/generate_index": "xtdata_generate_index_data_contract_unavailable",
     "/ws/formula": "bigqmt_formula_push_not_verified",
-    "/ws/l2_thousand": "bigqmt_l2_push_not_verified",
 }
 
 _DERIVED_PATHS = {
+    "/api/download/jobs": "download_history_data",
     "/api/instrument/batch_detail": "get_instrument_detail_list",
     "/api/market/market_data3": "get_market_data3",
     "/api/market/full_kline": "get_full_kline",
+    "/api/market/minute_tail": "get_market_data_ex",
     "/api/meta/periods": "get_period_list",
     "/api/calendar/trading_period": "get_trading_period",
     "/api/formula/call_batch": "call_formula_batch",
@@ -106,6 +70,7 @@ _DERIVED_PATHS = {
 
 _PROVIDER_METHODS = {
     **_DERIVED_PATHS,
+    "/api/download": "download_history_data",
     "/api/instrument/total_share": "get_total_share",
     "/api/financial/findata": "getfindata",
     "/api/etf/iopv": "get_etf_iopv",
@@ -125,13 +90,14 @@ _WRITE_SEGMENTS = (
     "/reset",
 )
 
-_ACCOUNT_DOMAINS = {"bank", "credit", "fund", "smt", "trading"}
+_ACCOUNT_DOMAINS = {"credit", "fund", "smt", "trading"}
 
 _RUNTIME_INDEPENDENT_PATHS = {
     "/api/meta/capabilities",
     "/api/meta/connection_status",
     "/api/meta/health",
     "/api/meta/readiness",
+    "/api/meta/recovery-status",
     "/api/trading/health",
 }
 
@@ -151,6 +117,17 @@ def _probe_status(
     runtime: RuntimeFacade | None,
     account_runtime_available: bool,
 ) -> tuple[CapabilityStatus, str | None]:
+    if path in {"/api/download/jobs", "/api/download"}:
+        # Only the currently attached native model can attest that its QMT
+        # global function was actually bound. A Python method's presence is
+        # not evidence that the installed embedded runtime supports download.
+        payload: object = getattr(runtime, "ping_payload", None)
+        available = (
+            isinstance(payload, dict)
+            and cast(dict[str, object], payload).get("native_history_download_available") is True
+        )
+        if not available:
+            return "unsupported", "native_history_download_unavailable"
     unsupported_reason = _UNSUPPORTED_PATHS.get(path)
     if unsupported_reason is not None:
         return "unsupported", unsupported_reason
@@ -164,9 +141,9 @@ def _probe_status(
         return "unavailable", "bigqmt_runtime_unavailable"
     if provider_method is None:
         return "ok", None
-    if runtime is None or runtime.xtdata is None:
+    if runtime is None or runtime.market_data is None:
         return "unavailable", "bigqmt_runtime_unavailable"
-    if provider_method not in dir(runtime.xtdata):
+    if provider_method not in dir(runtime.market_data):
         return "unsupported", f"xtdata_{provider_method}_missing"
     return "ok", None
 

@@ -1,7 +1,7 @@
 """Router — Instrument info endpoints /api/instrument/*."""
 
 from fastapi import APIRouter, Query
-from ..bigqmt import xtdata
+from ..bigqmt import market_data
 
 from ..helpers import (
     _call_xtdata_optional,
@@ -19,7 +19,7 @@ def get_batch_instrument_detail(
 ):
     stock_list = [s.strip() for s in stocks.split(",")]
     raw = _call_xtdata_serialized(
-        xtdata.get_instrument_detail_list,
+        market_data.get_instrument_detail_list,
         stock_list,
         iscomplete=iscomplete,
     )
@@ -30,7 +30,7 @@ def get_batch_instrument_detail(
 def get_instrument_type(
     stock: str = Query(..., description="股票代码，如 600000.SH"),
 ):
-    raw = _call_xtdata_serialized(xtdata.get_instrument_type, stock)
+    raw = _call_xtdata_serialized(market_data.get_instrument_type, stock)
     return {"stock": stock, "type": raw}
 
 
@@ -40,7 +40,7 @@ def get_ipo_info(
     end_time: str = Query("", description="结束时间"),
 ):
     raw = _call_xtdata_serialized(
-        xtdata.get_ipo_info,
+        market_data.get_ipo_info,
         start_time=start_time,
         end_time=end_time,
     )
@@ -51,7 +51,7 @@ def get_ipo_info(
 def get_index_weight(
     index_code: str = Query(..., description="指数代码，如 000300.SH"),
 ):
-    raw = _call_xtdata_serialized(xtdata.get_index_weight, index_code)
+    raw = _call_xtdata_serialized(market_data.get_index_weight, index_code)
     return {"index_code": index_code, "data": _numpy_to_python(raw)}
 
 
@@ -59,7 +59,7 @@ def get_index_weight(
 def get_st_history(
     stock: str = Query(..., description="股票代码"),
 ):
-    raw = _call_xtdata_serialized(xtdata.get_his_st_data, stock)
+    raw = _call_xtdata_serialized(market_data.get_his_st_data, stock)
     return {"stock": stock, "data": _numpy_to_python(raw)}
 
 
@@ -72,7 +72,7 @@ def get_open_date(
     status = "ok"
     reason = ""
     for stock in stock_list:
-        payload = _call_xtdata_optional(xtdata, "get_open_date", stock)
+        payload = _call_xtdata_optional(market_data, "get_open_date", stock)
         data[stock] = {
             "status": payload["status"],
             "open_date": payload.get("data"),
@@ -93,7 +93,7 @@ def get_total_share(
     status = "ok"
     reason = ""
     for stock in stock_list:
-        payload = _call_xtdata_optional(xtdata, "get_total_share", stock)
+        payload = _call_xtdata_optional(market_data, "get_total_share", stock)
         data[stock] = payload
         if payload["status"] != "ok":
             status = payload["status"]
@@ -113,7 +113,7 @@ def get_total_share(
 def get_last_volume(
     stock: str = Query(..., description="股票代码"),
 ):
-    return _call_xtdata_optional(xtdata, "get_last_volume", stock)
+    return _call_xtdata_optional(market_data, "get_last_volume", stock)
 
 
 @router.get("/turnover_rate")
@@ -124,7 +124,7 @@ def get_turnover_rate(
 ):
     stock_list = [s.strip() for s in stocks.split(",") if s.strip()]
     payload = _call_xtdata_optional(
-        xtdata,
+        market_data,
         "get_turnover_rate",
         stock_list,
         start_time,
@@ -138,7 +138,7 @@ def get_turnover_rate(
 def get_svol(
     stock: str = Query(..., description="股票代码"),
 ):
-    payload = _call_xtdata_optional(xtdata, "get_svol", stock)
+    payload = _call_xtdata_optional(market_data, "get_svol", stock)
     payload["unit_contract"] = {"data": "inner sell volume as returned by QMT"}
     return payload
 
@@ -147,7 +147,7 @@ def get_svol(
 def get_bvol(
     stock: str = Query(..., description="股票代码"),
 ):
-    payload = _call_xtdata_optional(xtdata, "get_bvol", stock)
+    payload = _call_xtdata_optional(market_data, "get_bvol", stock)
     payload["unit_contract"] = {"data": "outer buy volume as returned by QMT"}
     return payload
 
@@ -160,7 +160,7 @@ def get_longhubang(
 ):
     stock_list = [s.strip() for s in stocks.split(",") if s.strip()]
     return _call_xtdata_optional(
-        xtdata,
+        market_data,
         "get_longhubang",
         stock_list,
         start_time,
@@ -177,7 +177,7 @@ def get_top10_share_holder(
 ):
     stock_list = [s.strip() for s in stocks.split(",") if s.strip()]
     return _call_xtdata_optional(
-        xtdata,
+        market_data,
         "get_top10_share_holder",
         stock_list,
         data_name,
@@ -190,18 +190,18 @@ def get_top10_share_holder(
 def get_risk_free_rate(
     index: int = Query(0, description="利率索引"),
 ):
-    return _call_xtdata_optional(xtdata, "get_risk_free_rate", index)
+    return _call_xtdata_optional(market_data, "get_risk_free_rate", index)
 
 
 @router.get("/his_index_data")
 def get_his_index_data(
     stock: str = Query(..., description="指数代码"),
 ):
-    return _call_xtdata_optional(xtdata, "get_his_index_data", stock)
+    return _call_xtdata_optional(market_data, "get_his_index_data", stock)
 
 
 @router.get("/suspended")
 def is_suspended_stock(
     stock: str = Query(..., description="股票代码"),
 ):
-    return _call_xtdata_optional(xtdata, "is_suspended_stock", stock)
+    return _call_xtdata_optional(market_data, "is_suspended_stock", stock)

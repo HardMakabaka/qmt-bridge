@@ -58,7 +58,6 @@ order_id = client.place_order(
 | [融资融券](credit.md) | 信用交易 | `credit_order`, `query_credit_positions` |
 | [资金划转](fund.md) | 资金管理 | `fund_transfer`, `query_available_fund` |
 | [约定式交易](smt.md) | SMT 交易 | `smt_order`, `smt_query_compact` |
-| [银证转账](bank.md) | 银证互转 | `bank_transfer_in`, `bank_transfer_out` |
 | [WebSocket](websocket-client.md) | 实时订阅 | `subscribe_realtime`, `subscribe_whole_quote` |
 
 ## 类引用

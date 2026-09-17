@@ -1,6 +1,7 @@
 ﻿# bigqmt_signal_trader
 
-大 QMT 信号交易包的核心骨架。当前版本只完成可替换包边界和 dry-run 运行入口，不会发送真实委托。
+Big QMT 内嵌运行时包。它由策略进程加载，接收本机 ZMQ RPC 请求，并只调用
+Big QMT 已注入的 `ContextInfo` / 全局交易函数；不是 MiniQMT 或 XtQuant 兼容包。
 
 ## 已完成
 
@@ -15,30 +16,19 @@
   6. 调用可替换 `OrderGateway`。
   7. 写回状态。
   8. 同步持仓快照。
-- `DryRunOrderGateway`：记录委托请求，不调用真实 `passorder`。
-- `bigqmt_signal_trader_strategy.py`：大 QMT 运行文件骨架，响应 `init`、`adjust`、`on_order`、`on_trade`、`sync_positions`。
+- `bigqmt_signal_trader_strategy.py`：内嵌入口，响应 `init`、`adjust`、`handlebar`、订单和成交回调。
+- 运行时注入的 `passorder`、`cancel`、`get_trade_detail_data`，以及单股
+  `download_history_data`（若当前 QMT 终端实际提供）。
 
 ## 当前安全状态
 
-默认 `adapter_factory.build_app()` 使用：
-
-- 空信号源。
-- 空行情源。
-- 空持仓源。
-- dry-run 下单 gateway。
-- no-op 状态存储。
-- 内存持仓同步 sink。
-
-因此即使大 QMT 加载该运行文件，也不会真实下单。
+订单 RPC 默认不允许；即使启用，外层 HTTP 服务仍要求 API Key、账户、写门禁和
+终端实盘证明。`passorder` 没有同步成交回执，调用方必须按 `userOrderId` 对账。
 
 ## 后续接入顺序
 
-1. 实现 `BigQmtMarketDataProvider` 和 `BigQmtPositionProvider`。
-2. 实现 `BigQmtOrderGateway(passorder/cancel/get_trade_detail_data)`。
-3. 实现 Redis Stream / MySQL outbox 信号源。
-4. 实现 Redis / MySQL 状态写回。
-5. 实现 Redis / MySQL 持仓同步 sink。
-6. dry-run 跑通后，再按账户灰度切换真实下单。
+外部程序使用 HTTP `QMTClient`；不要导入已移除的 `xtquant_compat` 或 Xt 风格对象。
+完整迁移见仓库根文档 [MIGRATION_3.md](../../docs/MIGRATION_3.md)。
 
 ## 测试
 

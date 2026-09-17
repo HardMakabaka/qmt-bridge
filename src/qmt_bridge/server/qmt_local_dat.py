@@ -5,14 +5,18 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 import re
 import struct
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from bigqmt_signal_trader.telemetry import span
 
 
 _HEADER_BYTES = 8
 _RECORD_BYTES = 64
 _MARKET_CODE = re.compile(r"^(?P<code>\d{6})\.(?P<market>SH|SZ|BJ)$")
 _COLUMNS = ("open", "high", "low", "close", "volume", "amount")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _expected_times() -> tuple[int, ...]:
@@ -37,7 +41,8 @@ def _request_bound(value: str, *, end: bool) -> datetime | None:
     if not digits:
         return None
     if len(digits) >= 14:
-        return datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+        resolved = datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+        return resolved + timedelta(seconds=1) if end else resolved
     if len(digits) >= 8:
         resolved = datetime.combine(
             date.fromisoformat(f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"),
@@ -53,6 +58,18 @@ def _record_timestamp(handle, index: int) -> int:
     if len(raw) != 4:
         raise OSError("QMT local DAT record timestamp is truncated")
     return struct.unpack("<I", raw)[0]
+
+
+def _epoch_seconds(value: datetime | None, *, default: int) -> int:
+    if value is None:
+        return default
+    # DAT timestamps are exchange-local epoch seconds.  Do not let the host's
+    # local timezone change a range query when this code runs in CI or a server.
+    return int(value.replace(tzinfo=_SHANGHAI).timestamp())
+
+
+def _exchange_datetime(timestamp: int) -> datetime:
+    return datetime.fromtimestamp(timestamp, _SHANGHAI).replace(tzinfo=None)
 
 
 def _lower_bound(handle, record_count: int, timestamp: int) -> int:
@@ -73,6 +90,8 @@ def _read_stock(
     start: datetime | None,
     end_exclusive: datetime | None,
     count: int,
+    complete_days_only: bool = True,
+    _tail_window: int | None = None,
 ) -> pd.DataFrame:
     if not path.is_file():
         return _empty_frame()
@@ -80,11 +99,17 @@ def _read_stock(
     record_count = max(0, (file_size - _HEADER_BYTES) // _RECORD_BYTES)
     if record_count == 0:
         return _empty_frame()
-    start_timestamp = int(start.timestamp()) if start is not None else 0
-    end_timestamp = int(end_exclusive.timestamp()) if end_exclusive is not None else 0xFFFFFFFF
+    start_timestamp = _epoch_seconds(start, default=0)
+    end_timestamp = _epoch_seconds(end_exclusive, default=0xFFFFFFFF)
     with path.open("rb") as handle:
         first = _lower_bound(handle, record_count, start_timestamp)
+        range_first = first
         last = _lower_bound(handle, record_count, end_timestamp)
+        if count > 0:
+            # Start near the tail, expanding only if incomplete/invalid records
+            # prevent this block from supplying the requested usable bars.
+            window = _tail_window or (count if not complete_days_only else max(count, 241) * 2)
+            first = max(first, last - window)
         handle.seek(_HEADER_BYTES + first * _RECORD_BYTES)
         payload = handle.read(max(0, last - first) * _RECORD_BYTES)
     rows_by_date: dict[date, list[tuple[datetime, float, float, float, float, float, float]]] = defaultdict(list)
@@ -93,7 +118,7 @@ def _read_stock(
         if len(raw) != _RECORD_BYTES:
             break
         values = struct.unpack("<16I", raw)
-        timestamp = datetime.fromtimestamp(values[0])
+        timestamp = _exchange_datetime(values[0])
         open_price, high_price, low_price, close_price = (
             float(value) / 1000.0 for value in values[1:5]
         )
@@ -120,6 +145,17 @@ def _read_stock(
         times = tuple(row[0].hour * 10000 + row[0].minute * 100 for row in rows)
         if times == _EXPECTED_TIMES:
             complete_rows.extend(rows)
+        elif not complete_days_only:
+            complete_rows.extend(
+                row for row in rows
+                if row[0].second == 0
+                and row[0].hour * 10000 + row[0].minute * 100 in _EXPECTED_TIMES
+            )
+    if count > 0 and len(complete_rows) < count and first > range_first:
+        return _read_stock(
+            path, start=start, end_exclusive=end_exclusive, count=count,
+            complete_days_only=complete_days_only, _tail_window=window * 2,
+        )
     if count > 0:
         complete_rows = complete_rows[-count:]
     if not complete_rows:
@@ -154,8 +190,8 @@ def _read_daily_stock(
     record_count = max(0, (file_size - _HEADER_BYTES) // _RECORD_BYTES)
     if record_count == 0:
         return _empty_frame()
-    start_timestamp = int(start.timestamp()) if start is not None else 0
-    end_timestamp = int(end_exclusive.timestamp()) if end_exclusive is not None else 0xFFFFFFFF
+    start_timestamp = _epoch_seconds(start, default=0)
+    end_timestamp = _epoch_seconds(end_exclusive, default=0xFFFFFFFF)
     with path.open("rb") as handle:
         first = _lower_bound(handle, record_count, start_timestamp)
         last = _lower_bound(handle, record_count, end_timestamp)
@@ -167,7 +203,7 @@ def _read_daily_stock(
         if len(raw) != _RECORD_BYTES:
             break
         values = struct.unpack("<16I", raw)
-        timestamp = datetime.fromtimestamp(values[0])
+        timestamp = _exchange_datetime(values[0])
         open_price, high_price, low_price, close_price = (
             float(value) / 1000.0 for value in values[1:5]
         )
@@ -202,27 +238,31 @@ def read_qmt_local_dat_1m(
     start_time: str,
     end_time: str,
     count: int,
+    complete_days_only: bool = True,
 ) -> dict[str, pd.DataFrame]:
     start = _request_bound(start_time, end=False)
     end_exclusive = _request_bound(end_time, end=True)
     result: dict[str, pd.DataFrame] = {}
-    for stock in stocks:
-        matched = _MARKET_CODE.fullmatch(stock.upper())
-        if matched is None:
-            result[stock] = _empty_frame()
-            continue
-        path = (
-            root
-            / matched.group("market")
-            / "60"
-            / f"{matched.group('code')}.DAT"
-        )
-        result[stock] = _read_stock(
-            path,
-            start=start,
-            end_exclusive=end_exclusive,
-            count=count,
-        )
+    with span("market.dat.read", period="1m", stock_count=len(stocks),
+              complete_days_only=complete_days_only, requested_count=count) as telemetry_result:
+        for stock in stocks:
+            matched = _MARKET_CODE.fullmatch(stock.upper())
+            if matched is None:
+                result[stock] = _empty_frame()
+                continue
+            path = (
+                root
+                / matched.group("market")
+                / "60"
+                / f"{matched.group('code')}.DAT"
+            )
+            result[stock] = _read_stock(
+                path, start=start, end_exclusive=end_exclusive, count=count,
+                complete_days_only=complete_days_only,
+            )
+        rows = sum(int(getattr(frame, "shape", (0,))[0]) for frame in result.values())
+        telemetry_result["returned_rows"] = rows
+        telemetry_result["outcome"] = "success" if rows else "empty"
     return result
 
 
@@ -238,26 +278,28 @@ def read_qmt_local_dat_1d(
     end_exclusive = _request_bound(end_time, end=True)
     roots = (root, root.parent / "userdata_mini" / "datadir")
     result: dict[str, pd.DataFrame] = {}
-    for stock in stocks:
-        matched = _MARKET_CODE.fullmatch(stock.upper())
-        if matched is None:
-            result[stock] = _empty_frame()
-            continue
-        relative_path = (
-            Path(matched.group("market"))
-            / "86400"
-            / f"{matched.group('code')}.DAT"
-        )
-        path = next(
-            (candidate for candidate in (base / relative_path for base in roots) if candidate.is_file()),
-            root / relative_path,
-        )
-        result[stock] = _read_daily_stock(
-            path,
-            start=start,
-            end_exclusive=end_exclusive,
-            count=count,
-        )
+    with span("market.dat.read", period="1d", stock_count=len(stocks),
+              requested_count=count) as telemetry_result:
+        for stock in stocks:
+            matched = _MARKET_CODE.fullmatch(stock.upper())
+            if matched is None:
+                result[stock] = _empty_frame()
+                continue
+            relative_path = (
+                Path(matched.group("market"))
+                / "86400"
+                / f"{matched.group('code')}.DAT"
+            )
+            path = next(
+                (candidate for candidate in (base / relative_path for base in roots) if candidate.is_file()),
+                root / relative_path,
+            )
+            result[stock] = _read_daily_stock(
+                path, start=start, end_exclusive=end_exclusive, count=count,
+            )
+        rows = sum(int(getattr(frame, "shape", (0,))[0]) for frame in result.values())
+        telemetry_result["returned_rows"] = rows
+        telemetry_result["outcome"] = "success" if rows else "empty"
     return result
 
 

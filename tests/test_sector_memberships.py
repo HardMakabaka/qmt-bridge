@@ -3,7 +3,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 xtquant_stub = ModuleType("xtquant")
-setattr(xtquant_stub, "xtdata", SimpleNamespace())
+setattr(xtquant_stub, "market_data", SimpleNamespace())
 sys.modules.setdefault("xtquant", xtquant_stub)
 
 from qmt_bridge.server.routers import sector
@@ -58,7 +58,7 @@ def test_sector_list_prefers_local_full_qmt_cache_without_rpc(
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_sector_list=unexpected_rpc_call),
     )
 
@@ -84,7 +84,7 @@ def test_latest_sector_stocks_prefers_local_full_qmt_cache_without_rpc(
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_stock_list_in_sector=unexpected_rpc_call),
     )
 
@@ -120,7 +120,7 @@ def test_prefixed_local_concept_sector_resolves_membership_file(
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_stock_list_in_sector=unexpected_rpc_call),
     )
 
@@ -144,7 +144,7 @@ def test_prefixed_concept_sector_uses_raw_name_for_historical_rpc(
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_stock_list_in_sector=get_stock_list_in_sector),
     )
 
@@ -161,7 +161,7 @@ def test_prefixed_concept_sector_uses_raw_name_for_historical_rpc(
 def test_sector_list_filters_keyword_and_limit(monkeypatch):
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(
             get_sector_list=lambda: [
                 "TGN英伟达概念",
@@ -191,7 +191,7 @@ def test_sector_stocks_preserves_yyyymmdd_real_timetag(monkeypatch):
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_stock_list_in_sector=get_stock_list_in_sector),
     )
 
@@ -218,7 +218,7 @@ def test_sector_stock_memberships_filters_keyword_and_preserves_date(monkeypatch
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(
             get_sector_list=get_sector_list,
             get_stock_list_in_sector=get_stock_list_in_sector,
@@ -250,7 +250,7 @@ def test_sector_stock_memberships_reports_keyword_cache_miss(monkeypatch):
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(
             get_sector_list=get_sector_list,
             get_stock_list_in_sector=get_stock_list_in_sector,

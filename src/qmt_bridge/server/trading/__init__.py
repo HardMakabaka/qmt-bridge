@@ -1,1 +1,1 @@
-"""Trading module — XtQuantTrader lifecycle management."""
+"""Trading module — Big QMT trading lifecycle management."""

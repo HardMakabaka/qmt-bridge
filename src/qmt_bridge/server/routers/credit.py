@@ -3,30 +3,11 @@
 from fastapi import APIRouter, Depends
 
 from ..deps import get_trader_manager
-from ..helpers import _is_failure_payload, _optional_result_payload
-from ..models import CreditOrderRequest, CreditQueryRequest
+from ..helpers import _optional_result_payload
+from ..models import CreditQueryRequest
 from ..security import require_api_key
 
 router = APIRouter(prefix="/api/credit", tags=["credit"], dependencies=[Depends(require_api_key)])
-
-
-@router.post("/order")
-def credit_order(req: CreditOrderRequest, manager=Depends(get_trader_manager)):
-    """Place a credit (margin) trading order."""
-    result = manager.credit_order(
-        stock_code=req.stock_code,
-        order_type=req.order_type,
-        order_volume=req.order_volume,
-        price_type=req.price_type,
-        price=req.price,
-        credit_type=req.credit_type,
-        strategy_name=req.strategy_name,
-        order_remark=req.order_remark,
-        account_id=req.account_id,
-    )
-    if _is_failure_payload(result):
-        return result
-    return {"order_id": result, "status": "submitted"}
 
 
 @router.get("/positions")
@@ -35,7 +16,7 @@ def query_credit_positions(
     manager=Depends(get_trader_manager),
 ):
     """Query credit trading positions."""
-    result = manager.query_credit_positions(account_id=account_id)
+    result = manager.query_positions(account_id=account_id)
     return _optional_result_payload(result)
 
 
@@ -45,7 +26,7 @@ def query_credit_asset(
     manager=Depends(get_trader_manager),
 ):
     """Query credit trading account asset."""
-    result = manager.query_credit_asset(account_id=account_id)
+    result = manager.query_asset(account_id=account_id)
     return _optional_result_payload(result)
 
 
@@ -55,18 +36,7 @@ def query_credit_debt(
     manager=Depends(get_trader_manager),
 ):
     """Query credit debt information."""
-    result = manager.query_credit_debt(account_id=account_id)
-    return _optional_result_payload(result)
-
-
-@router.get("/available_amount")
-def query_credit_available(
-    stock_code: str = "",
-    account_id: str = "",
-    manager=Depends(get_trader_manager),
-):
-    """Query available credit amount for a stock."""
-    result = manager.query_credit_available(stock_code=stock_code, account_id=account_id)
+    result = manager.query_extension("query_stk_compacts", account_id=account_id)
     return _optional_result_payload(result)
 
 
@@ -76,7 +46,7 @@ def query_slo_stocks(
     manager=Depends(get_trader_manager),
 ):
     """Query stocks available for short selling (融券标的)."""
-    result = manager.query_slo_stocks(account_id=account_id)
+    result = manager.query_extension("query_credit_slo_code", account_id=account_id)
     return _optional_result_payload(result)
 
 
@@ -86,7 +56,7 @@ def query_fin_stocks(
     manager=Depends(get_trader_manager),
 ):
     """Query stocks available for margin buying (融资标的)."""
-    result = manager.query_fin_stocks(account_id=account_id)
+    result = manager.query_extension("query_credit_subjects", account_id=account_id)
     return _optional_result_payload(result)
 
 
@@ -96,7 +66,7 @@ def query_credit_subjects(
     manager=Depends(get_trader_manager),
 ):
     """Query credit subject list (标的证券)."""
-    result = manager.query_credit_subjects(account_id=account_id)
+    result = manager.query_extension("query_credit_subjects", account_id=account_id)
     return _optional_result_payload(result)
 
 
@@ -106,5 +76,5 @@ def query_credit_assure(
     manager=Depends(get_trader_manager),
 ):
     """Query credit assurance / collateral info (担保品)."""
-    result = manager.query_credit_assure(account_id=account_id)
+    result = manager.query_extension("query_credit_assure", account_id=account_id)
     return _optional_result_payload(result)

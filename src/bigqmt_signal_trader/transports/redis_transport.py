@@ -27,6 +27,7 @@ from ..redis_rpc import (
     decode_rpc_request_payload,
     encode_rpc_request_payload,
 )
+from ..telemetry import emit, extract_trace, span
 from .base import RpcTransport, TransportTimeout
 
 import json  # noqa: E402  (kept here so transport owns all wire encoding)
@@ -121,18 +122,25 @@ class RedisTransport(RpcTransport):
         RPUSH+BLPOP) or ``"pubsub"`` (PUBLISH+subscribe). Kept for parity with
         the original ``call_redis_rpc`` signature.
         """
-        return _call_redis_rpc(
-            self.listen_redis,
-            self.account_id,
-            request,
-            timeout_seconds=float(timeout_seconds),
-            transport=transport,
-            request_channel_template=self.request_channel_template,
-            request_queue_template=self.request_queue_template,
-            response_channel_template=self.response_channel_template,
-            response_list_template=self.response_list_template,
-            response_key_template=self.response_key_template,
-        )
+        request = dict(request or {})
+        trace = extract_trace(request)
+        rpc_request_id = str(request.get("request_id") or "")
+        trace.setdefault("rpc_request_id", rpc_request_id)
+        emit("rpc.transport.redis.send", method=str(request.get("method") or ""),
+             mode=str(transport), **trace)
+        with span("rpc.transport.redis.roundtrip", rpc_request_id=rpc_request_id,
+                  method=str(request.get("method") or ""), mode=str(transport)) as observed:
+            response = _call_redis_rpc(
+                self.listen_redis, self.account_id, request,
+                timeout_seconds=float(timeout_seconds), transport=transport,
+                request_channel_template=self.request_channel_template,
+                request_queue_template=self.request_queue_template,
+                response_channel_template=self.response_channel_template,
+                response_list_template=self.response_list_template,
+                response_key_template=self.response_key_template,
+            )
+            observed["outcome"] = "success" if response.get("ok") else "rejected"
+            return response
 
     # -- server side -------------------------------------------------------
     def start_receiving(self, on_request, background_threads=True):
@@ -233,6 +241,10 @@ class RedisTransport(RpcTransport):
     def send_response(self, request, response):
         """Fan out the response to reply_key/reply_list/reply_channel."""
         request_id = response.get("request_id") or request.get("request_id") or ""
+        trace = extract_trace(request)
+        trace.setdefault("rpc_request_id", str(request_id))
+        emit("rpc.transport.redis.response", method=str(request.get("method") or ""),
+             outcome="success" if response.get("ok") else "rejected", **trace)
         account_id = response.get("account_id") or request.get("account_id") or self.account_id
         payload = json.dumps(response, ensure_ascii=False)
         ttl_seconds = int(request.get("ttl_seconds") or self.response_ttl_seconds)

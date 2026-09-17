@@ -66,6 +66,7 @@ dev = [
 
 [project.scripts]
 qmt-server = "qmt_bridge.server.cli:main"
+qmt-install-runtime = "qmt_bridge.install_runtime:main"
 
 [project.urls]
 Homepage = "https://github.com/atompilot/qmt-bridge"
@@ -77,6 +78,15 @@ path = "src/qmt_bridge/_version.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/qmt_bridge", "src/bigqmt_signal_trader"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"src/BIGQMT_REDIS_DRYRUN.py" = "qmt_bridge/_runtime_assets/src/BIGQMT_REDIS_DRYRUN.py"
+"src/MECOSTOCK_BIGQMT_ZMQ.py" = "qmt_bridge/_runtime_assets/src/MECOSTOCK_BIGQMT_ZMQ.py"
+"src/mecostock_bigqmt_mode_overlay.py" = "qmt_bridge/_runtime_assets/src/mecostock_bigqmt_mode_overlay.py"
+"src/bigqmt_signal_trader_strategy.py" = "qmt_bridge/_runtime_assets/src/bigqmt_signal_trader_strategy.py"
+"src/bigqmt_signal_trader_redis_rpc_runtime.py" = "qmt_bridge/_runtime_assets/src/bigqmt_signal_trader_redis_rpc_runtime.py"
+"src/bigqmt_signal_trader" = "qmt_bridge/_runtime_assets/src/bigqmt_signal_trader"
+"third_party/xtquant_big_convert.UPSTREAM.json" = "qmt_bridge/_runtime_assets/third_party/xtquant_big_convert.UPSTREAM.json"
+
 [tool.hatch.build.targets.sdist]
 include = [
     "src/qmt_bridge",
@@ -85,8 +95,14 @@ include = [
     "src/bigqmt_signal_trader_redis_rpc_runtime.py",
     "src/BIGQMT_REDIS_DRYRUN.py",
     "src/MECOSTOCK_BIGQMT_ZMQ.py",
+    "src/mecostock_bigqmt_mode_overlay.py",
     "third_party/xtquant_big_convert.UPSTREAM.json",
     "scripts/install-bigqmt-runtime.ps1",
+    "scripts/manage-bridge.ps1",
+    "scripts/start.bat",
+    "scripts/start-nohup.bat",
+    "scripts/stop.bat",
+    "scripts/check-embedded-py36.py",
     "tests",
     "README.md",
     "LICENSE",

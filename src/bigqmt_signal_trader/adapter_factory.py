@@ -91,6 +91,8 @@ def build_app(context_info=None, config=None):
             group_name=redis_cfg.get("group_name", "bigqmt-signal-trader"),
             consumer_name=redis_cfg.get("consumer_name", "bigqmt-consumer"),
             block_ms=int(redis_cfg.get("block_ms", 0)),
+            reclaim_idle_ms=int(redis_cfg.get("reclaim_idle_ms", 60000)),
+            reclaim_count=int(redis_cfg.get("reclaim_count", 20)),
         )
 
     if state_type == "redis" or (source_type == "redis" and state_store is None):

@@ -26,7 +26,6 @@ class FormulaMixin:
             "dividend_type": dividend_type,
             "params": params,
         })
-
     def call_formula_batch(
         self,
         formula_name: str,
@@ -48,23 +47,4 @@ class FormulaMixin:
             "count": count,
             "dividend_type": dividend_type,
             "params": params,
-        })
-
-    def generate_index_data(
-        self,
-        index_code: str,
-        stocks: list[str],
-        weights: list[float],
-        period: str = "1d",
-        start_time: str = "",
-        end_time: str = "",
-    ) -> dict:
-        """Generate custom index data from stocks and weights."""
-        return self._post("/api/formula/generate_index", {
-            "index_code": index_code,
-            "stocks": stocks,
-            "weights": weights,
-            "period": period,
-            "start_time": start_time,
-            "end_time": end_time,
         })

@@ -1,7 +1,7 @@
 """Router — ETF & convertible bond endpoints /api/etf/*, /api/fund/* and /api/cb/*."""
 
 from fastapi import APIRouter, Query
-from ..bigqmt import xtdata
+from ..bigqmt import market_data
 
 from ..helpers import (
     _call_xtdata_optional,
@@ -17,7 +17,7 @@ cb_router = APIRouter(prefix="/api/cb", tags=["cb"])
 @etf_router.get("/list")
 def get_etf_list():
     stock_list = _call_xtdata_serialized(
-        xtdata.get_stock_list_in_sector,
+        market_data.get_stock_list_in_sector,
         "沪深ETF",
     )
     return {"count": len(stock_list), "stocks": stock_list}
@@ -25,7 +25,7 @@ def get_etf_list():
 
 @etf_router.get("/info")
 def get_etf_info():
-    raw = _call_xtdata_serialized(xtdata.get_etf_info)
+    raw = _call_xtdata_serialized(market_data.get_etf_info)
     return {"data": _numpy_to_python(raw)}
 
 
@@ -34,7 +34,7 @@ def get_fund_etf_info(
     stocks: str = Query("", description="ETF 代码列表，逗号分隔"),
 ):
     stock_list = [s.strip() for s in stocks.split(",") if s.strip()] if stocks else []
-    payload = _call_xtdata_optional(xtdata, "get_etf_info")
+    payload = _call_xtdata_optional(market_data, "get_etf_info")
     if payload["status"] != "ok":
         return payload
     data = payload.get("data")
@@ -56,7 +56,7 @@ def get_fund_iopv(
     status = "ok"
     reason = ""
     for stock in stock_list:
-        payload = _call_xtdata_optional(xtdata, "get_etf_iopv", stock)
+        payload = _call_xtdata_optional(market_data, "get_etf_iopv", stock)
         data[stock] = payload.get("data")
         if payload["status"] != "ok":
             data[stock] = payload
@@ -77,7 +77,7 @@ def get_fund_iopv(
 def get_cb_info(
     stock: str = Query(..., description="可转债代码"),
 ):
-    raw = _call_xtdata_serialized(xtdata.get_cb_info, stock)
+    raw = _call_xtdata_serialized(market_data.get_cb_info, stock)
     return {"stock": stock, "data": _numpy_to_python(raw)}
 
 
@@ -90,7 +90,7 @@ def get_cb_info(
 def get_cb_list():
     """Get all convertible bond codes."""
     stock_list = _call_xtdata_serialized(
-        xtdata.get_stock_list_in_sector,
+        market_data.get_stock_list_in_sector,
         "沪深转债",
     )
     return {"count": len(stock_list), "stocks": stock_list}
@@ -101,7 +101,7 @@ def get_cb_detail(
     stock: str = Query(..., description="可转债代码"),
 ):
     """Get detailed convertible bond information."""
-    raw = _call_xtdata_serialized(xtdata.get_cb_info, stock)
+    raw = _call_xtdata_serialized(market_data.get_cb_info, stock)
     return {"stock": stock, "data": _numpy_to_python(raw)}
 
 
@@ -110,7 +110,7 @@ def get_cb_conversion_price(
     stock: str = Query(..., description="可转债代码"),
 ):
     """Get convertible bond conversion price info."""
-    raw = _call_xtdata_serialized(xtdata.get_cb_info, stock)
+    raw = _call_xtdata_serialized(market_data.get_cb_info, stock)
     data = _numpy_to_python(raw)
     return {"stock": stock, "data": data}
 
@@ -120,5 +120,5 @@ def get_bond_info(
     stock: str = Query(..., description="可转债代码"),
 ):
     """Get bond-specific information for a convertible bond."""
-    raw = _call_xtdata_serialized(xtdata.get_cb_info, stock)
+    raw = _call_xtdata_serialized(market_data.get_cb_info, stock)
     return {"stock": stock, "data": _numpy_to_python(raw)}

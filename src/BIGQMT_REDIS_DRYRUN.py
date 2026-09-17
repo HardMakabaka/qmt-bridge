@@ -227,7 +227,8 @@ except Exception as account_config_error:
 try:
     qmt_extra = {}
     for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
+        "download_history_data", "get_history_trade_detail_data",
+        "get_value_by_order_id", "get_last_order_id",
         "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
         "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
         "get_debt_contract", "get_option_subject_position", "get_comb_option",

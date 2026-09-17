@@ -171,11 +171,7 @@ class PositionSnapshot:
 
 
 class AssetSnapshot:
-    """Account funds, mirroring MiniQMT's ``XtAsset``.
-
-    Field names follow ``xtquant.xttype.XtAsset(account_id, cash, frozen_cash,
-    market_value, total_asset)`` so ``query_stock_asset`` can hand callers the
-    same attributes they get from MiniQMT.
+    """Account funds reported by the Big QMT account snapshot.
 
     ``cash`` is 可用 (available), NOT the full 资金余额:
     ``total_asset == cash + frozen_cash + market_value``. New fields are

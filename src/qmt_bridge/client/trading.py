@@ -132,45 +132,7 @@ class TradingMixin:
     # Async order/cancel
     # ------------------------------------------------------------------
 
-    def place_order_async(
-        self,
-        stock_code: str,
-        order_type: int,
-        order_volume: int,
-        price_type: int = 5,
-        price: float = 0.0,
-        strategy_name: str = "",
-        order_remark: str = "",
-        account_id: str = "",
-    ) -> dict:
-        """Place an order asynchronously (result via WebSocket callback)."""
-        return self._post("/api/trading/order_async", {
-            "stock_code": stock_code,
-            "order_type": order_type,
-            "order_volume": order_volume,
-            "price_type": price_type,
-            "price": price,
-            "strategy_name": strategy_name,
-            "order_remark": order_remark,
-            "account_id": account_id,
-        })
 
-    def cancel_order_async(
-        self,
-        order_id: int = 0,
-        account_id: str = "",
-        order_sysid: str = "",
-        market: int | str = "",
-    ) -> dict:
-        """Cancel an order asynchronously (result via WebSocket callback)."""
-        payload = {
-            "order_id": order_id,
-            "account_id": account_id,
-        }
-        if order_sysid:
-            payload["order_sysid"] = order_sysid
-            payload["market"] = market
-        return self._post("/api/trading/cancel_async", payload)
 
     # ------------------------------------------------------------------
     # Single-item queries
@@ -220,44 +182,13 @@ class TradingMixin:
     # COM queries (期权/期货)
     # ------------------------------------------------------------------
 
-    def query_com_fund(self, account_id: str = "") -> dict:
-        """Query COM fund (option/future account funds)."""
-        return self._get("/api/trading/com_fund", {"account_id": account_id})
 
-    def query_com_position(self, account_id: str = "") -> dict:
-        """Query COM positions (option/future account positions)."""
-        return self._get("/api/trading/com_position", {"account_id": account_id})
 
     # ------------------------------------------------------------------
     # Data export / external sync
     # ------------------------------------------------------------------
 
-    def export_data(
-        self, data_type: str = "orders", file_path: str = "", account_id: str = ""
-    ) -> dict:
-        """Export trading data to file."""
-        return self._post("/api/trading/export_data", {
-            "data_type": data_type,
-            "file_path": file_path,
-            "account_id": account_id,
-        })
 
-    def query_data(
-        self,
-        data_type: str = "orders",
-        result_path: str = "",
-        start_time: str | None = None,
-        end_time: str | None = None,
-        account_id: str = "",
-    ) -> dict:
-        """Query exported trading data."""
-        return self._get("/api/trading/query_data", {
-            "data_type": data_type,
-            "result_path": result_path,
-            "start_time": start_time,
-            "end_time": end_time,
-            "account_id": account_id,
-        })
 
     def sync_transaction_from_external(
         self,

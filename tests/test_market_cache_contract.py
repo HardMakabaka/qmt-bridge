@@ -1,5 +1,6 @@
 import pickle
 import sys
+from threading import Event, Thread
 from importlib import import_module
 from types import ModuleType, SimpleNamespace
 
@@ -8,9 +9,6 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-xtquant_stub = ModuleType("xtquant")
-xtquant_stub.xtdata = SimpleNamespace()
-sys.modules.setdefault("xtquant", xtquant_stub)
 
 binary_cache = import_module("qmt_bridge.server.binary_cache")
 helpers = import_module("qmt_bridge.server.helpers")
@@ -18,6 +16,7 @@ market = import_module("qmt_bridge.server.routers.market")
 BinaryCache = binary_cache.BinaryCache
 reset_binary_cache = binary_cache.reset_binary_cache
 XtdataTransportStuckError = helpers.XtdataTransportStuckError
+LocalMarketCache = import_module("bigqmt_signal_trader.local_cache").LocalMarketCache
 
 
 def _expected_status(status, reason, function, **extra):
@@ -107,7 +106,7 @@ def test_mutable_market_reads_refresh_by_default(
     reset_binary_cache(
         BinaryCache(enabled=True, cache_dir=tmp_path, ttl_seconds=86400, max_bytes=10_000_000)
     )
-    monkeypatch.setattr(market, "xtdata", SimpleNamespace(**{function_name: provider}))
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(**{function_name: provider}))
 
     try:
         # When the same open-ended HTTP read is repeated after the provider changes.
@@ -137,8 +136,6 @@ def test_mutable_market_reads_refresh_by_default(
         ("get_market_data", "/api/market/market_data?stocks=000001.SZ&cache=false"),
         ("get_market_data3", "/api/market/market_data3?stocks=000001.SZ&cache=false"),
         ("get_full_kline", "/api/market/full_kline?stock=000001.SZ"),
-        ("get_fullspeed_orderbook", "/api/market/fullspeed_orderbook?stock=000001.SZ"),
-        ("get_transactioncount", "/api/market/transactioncount?stock=000001.SZ"),
         ("get_all_subscription", "/api/market/subscriptions"),
     ],
 )
@@ -152,7 +149,7 @@ def test_market_read_provider_errors_are_structured(
     def provider(*_args, **_kwargs):
         raise RuntimeError("provider offline")
 
-    monkeypatch.setattr(market, "xtdata", SimpleNamespace(**{function_name: provider}))
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(**{function_name: provider}))
 
     # When the route is invoked through HTTP.
     response = market_client.get(path)
@@ -184,7 +181,7 @@ def test_market_transport_stuck_is_structured_unavailable(
     def provider(*_args, **_kwargs):
         raise XtdataTransportStuckError("blocked by timed-out native call")
 
-    monkeypatch.setattr(market, "xtdata", SimpleNamespace(**{function_name: provider}))
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(**{function_name: provider}))
 
     # When any market read enters the shared response boundary.
     response = market_client.get(path)
@@ -211,8 +208,6 @@ def test_market_transport_stuck_is_structured_unavailable(
         ("get_market_data", "/api/market/market_data?stocks=000001.SZ&cache=false"),
         ("get_market_data3", "/api/market/market_data3?stocks=000001.SZ&cache=false"),
         ("get_full_kline", "/api/market/full_kline?stock=000001.SZ"),
-        ("get_fullspeed_orderbook", "/api/market/fullspeed_orderbook?stock=000001.SZ"),
-        ("get_transactioncount", "/api/market/transactioncount?stock=000001.SZ"),
     ],
 )
 def test_market_read_none_payloads_are_unavailable(
@@ -224,7 +219,7 @@ def test_market_read_none_payloads_are_unavailable(
     # Given a market provider that returns no payload.
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(**{function_name: lambda *_args, **_kwargs: None}),
     )
 
@@ -261,7 +256,7 @@ def test_mapping_market_reads_reject_wrong_shapes(
     # Given a QMT function returning the wrong container type.
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(**{function_name: lambda *_args, **_kwargs: []}),
     )
 
@@ -318,3 +313,50 @@ def test_binary_cache_recovers_from_wrong_shaped_pickle(tmp_path, bad_envelope):
     assert second[1]["hit"] is True
     with path.open("rb") as handle:
         assert isinstance(pickle.load(handle), dict)
+
+
+def test_binary_cache_singleflight_wait_is_bounded(tmp_path):
+    cache = BinaryCache(enabled=True, cache_dir=tmp_path, ttl_seconds=3600,
+                        max_bytes=10_000_000, singleflight_wait_seconds=0.01)
+    entered, release = Event(), Event()
+    result = []
+
+    def loader():
+        entered.set()
+        assert release.wait(1)
+        return {"value": 1}
+
+    owner = Thread(target=lambda: result.append(cache.cached_call("bounded", {}, loader)))
+    owner.start()
+    assert entered.wait(1)
+    with pytest.raises(TimeoutError, match="singleflight_wait_timeout"):
+        cache.cached_call("bounded", {}, lambda: pytest.fail("waiter must not load"))
+    release.set()
+    owner.join(timeout=1)
+    assert result[0][0] == {"value": 1}
+
+
+def test_local_market_cache_filters_epoch_milliseconds_by_shanghai_date(tmp_path):
+    cache = LocalMarketCache(cache_dir=tmp_path, fmt="pkl")
+    frame = pd.DataFrame(
+        {
+            "time": [
+                1786896000000,
+                1786982400000,
+                1787068800000,
+                1787155200000,
+                1787241600000,
+            ],
+            "close": [9.0, 10.0, 11.0, 12.0, 13.0],
+        }
+    )
+    cache.write("000001.SZ", "1d", frame)
+
+    result = cache.read(
+        "000001.SZ",
+        "1d",
+        start_time="20260818",
+        end_time="20260820",
+    )
+
+    assert result["close"].tolist() == [10.0, 11.0, 12.0]

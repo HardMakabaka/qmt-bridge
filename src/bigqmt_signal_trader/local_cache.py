@@ -10,6 +10,8 @@ back to pickle when pyarrow is unavailable. A cache written in one format is rea
 
 import os
 
+from .telemetry import emit, span
+
 
 # Candidate time-column names produced by the RPC market-data path.
 _TIME_COLS = ("stime", "time", "index", "date", "datetime", "timetag")
@@ -111,17 +113,24 @@ class LocalMarketCache:
         a new dividend re-scales history. Returns total rows stored.
         """
         if df is None or not hasattr(df, "shape") or df.shape[0] == 0:
+            emit("market.local_cache.write", outcome="empty", period=period)
             return 0
         import pandas as pd
 
-        incoming = _drop_placeholder_rows(df.copy())
+        with span("market.local_cache.write", period=period,
+                  dividend_type=dividend_type) as result:
+            incoming = _drop_placeholder_rows(df.copy())
+            result["incoming_rows"] = int(getattr(incoming, "shape", (0,))[0])
         primary = self.path(code, period, dividend_type)
         existing = self._existing_path(code, period, dividend_type)
         if incoming.shape[0] == 0:
             # Nothing real to add (all 0-fill placeholders); keep existing cache.
             if existing:
                 try:
-                    return self._read_file(existing).shape[0]
+                    rows = self._read_file(existing).shape[0]
+                    emit("market.local_cache.write", outcome="empty", period=period,
+                         existing_rows=rows)
+                    return rows
                 except Exception:
                     return 0
             return 0
@@ -150,24 +159,45 @@ class LocalMarketCache:
                 os.remove(existing)
             except Exception:
                 pass
-        return merged.shape[0]
+        rows = merged.shape[0]
+        emit("market.local_cache.write", outcome="success", period=period,
+             rows=rows, merged_existing=bool(existing))
+        return rows
 
     def read(self, code, period, start_time="", end_time="", count=-1, dividend_type="none"):
         """Return the cached DataFrame for (code, period, dividend_type), filtered."""
+        import pandas as pd
+
         existing = self._existing_path(code, period, dividend_type)
         if not existing:
+            emit("market.local_cache.read", outcome="empty", period=period,
+                 reason="miss")
             return None
         try:
             df = self._read_file(existing)
         except Exception:
+            emit("market.local_cache.read", outcome="unknown", period=period,
+                 reason="read_error")
             return None
         tcol = _time_col(df)
         if tcol and tcol in df.columns:
-            series = df[tcol].astype(str)
+            raw_series = df[tcol]
+            numeric_series = pd.to_numeric(raw_series, errors="coerce")
+            median_abs = numeric_series.abs().median() if not numeric_series.empty else 0
+            if numeric_series.notna().all() and 100_000_000_000 <= median_abs < 100_000_000_000_000:
+                series = (
+                    pd.to_datetime(numeric_series, unit="ms", utc=True)
+                    .dt.tz_convert("Asia/Shanghai")
+                    .dt.strftime("%Y%m%d%H%M%S")
+                )
+            else:
+                series = raw_series.astype(str)
+            mask = pd.Series(True, index=df.index)
             if start_time:
-                df = df[series >= str(start_time)]
+                mask &= series >= str(start_time)
             if end_time:
-                df = df[series <= _pad_end(end_time)]
+                mask &= series <= _pad_end(end_time)
+            df = df[mask]
             df = df.sort_values(tcol).reset_index(drop=True)
         try:
             n = int(count)
@@ -175,6 +205,8 @@ class LocalMarketCache:
             n = -1
         if n > 0 and df.shape[0] > n:
             df = df.tail(n).reset_index(drop=True)
+        emit("market.local_cache.read", outcome="success" if df.shape[0] else "empty",
+             period=period, rows=int(df.shape[0]))
         return df
 
     def covered(self, code, period, dividend_type="none"):

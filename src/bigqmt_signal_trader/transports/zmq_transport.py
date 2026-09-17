@@ -14,9 +14,9 @@ Wire framing is a single JSON payload per message. The original b64 stock-code
 obfuscation (``encode_rpc_request_payload``) is applied too, so payloads stay
 opaque even though ZMQ does not need it — keeps the wire uniform with Redis.
 
-Two threads on the server: the ROUTER recv loop, and a per-client is implicit
-(ZMQ handles multiplexing). One thread on the client for recv is avoided by
-using DEALER + ``poll`` (synchronous request/response fits the RPC model).
+The client uses one dedicated I/O owner thread. Public callers enqueue a
+single-shot exchange with an absolute monotonic deadline; only that owner
+thread creates, uses, rebuilds, and closes the DEALER socket.
 """
 
 import json
@@ -30,6 +30,7 @@ from ..redis_rpc import (
     decode_rpc_request_payload,
     encode_rpc_request_payload,
 )
+from ..telemetry import bind_context, current_context, emit, extract_trace, span
 from .base import RpcTransport, TransportError, TransportTimeout
 
 
@@ -40,6 +41,39 @@ from .base import RpcTransport, TransportError, TransportTimeout
 DEFAULT_ZMQ_HOST = "127.0.0.1"
 DEFAULT_ZMQ_BASE_PORT = 15560
 DEFAULT_ZMQ_PORT_RANGE = 100  # derived port = base + (account_id_int mod range)
+_CLIENT_STOP = object()
+
+
+class _ClientCall(object):
+    def __init__(self, request, deadline):
+        self.request = request
+        self.deadline = float(deadline)
+        self.event = threading.Event()
+        self.response = None
+        self.error = None
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._done = False
+        self.trace_context = current_context()
+
+    def cancel(self):
+        with self._lock:
+            if not self._done:
+                self._cancelled = True
+
+    def is_cancelled(self):
+        with self._lock:
+            return self._cancelled
+
+    def complete(self, response=None, error=None):
+        with self._lock:
+            if self._done or self._cancelled:
+                return False
+            self.response = response
+            self.error = error
+            self._done = True
+            self.event.set()
+            return True
 
 
 def _default_zmq_port(account_id):
@@ -134,7 +168,12 @@ class ZmqTransport(RpcTransport):
         self._sent_response_count = 0
         # client state
         self._dealer = None
-        self._client_lock = threading.Lock()
+        self._client_state_lock = threading.Lock()
+        self._client_thread = None
+        self._client_queue = None
+        self._client_stop_event = None
+        self._client_stopping = False
+        self._client_owner_ident = None
 
     # -- construction helper ----------------------------------------------
     @classmethod
@@ -294,12 +333,21 @@ class ZmqTransport(RpcTransport):
         request_id = str(request.get("request_id") or uuid.uuid4().hex)
         with self._identity_lock:
             self._pending_identities[request_id] = identity
+        trace = extract_trace(request)
+        emit("rpc.transport.zmq.server.receive", rpc_request_id=request_id,
+             method=str(request.get("method") or ""), outcome="success",
+             has_trace=bool(trace))
         return request
 
     def _deliver_request(self, request):
         started = time.perf_counter()
         try:
-            self.deliver(request)
+            with bind_context(**extract_trace(request)):
+                with span("rpc.transport.zmq.server.dispatch",
+                          rpc_request_id=str(request.get("request_id") or ""),
+                          method=str(request.get("method") or "")) as observed:
+                    self.deliver(request)
+                    observed["outcome"] = "success"
         except Exception as exc:
             print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -389,45 +437,222 @@ class ZmqTransport(RpcTransport):
         return text or None
 
     def _ensure_dealer(self):
+        self._assert_client_owner()
         zmq, ctx = self._ensure_zmq()
         if self._dealer is None:
             address = self._resolve_connect_address()
             sock = ctx.socket(zmq.DEALER)
-            # Unique identity so ROUTER can route replies back to us.
-            sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
-            sock.setsockopt(zmq.LINGER, self.client_linger_ms)
-            sock.connect(address)
+            try:
+                # Unique identity so ROUTER can route replies back to us.
+                sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
+                sock.setsockopt(zmq.LINGER, self.client_linger_ms)
+                sock.connect(address)
+            except Exception:
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+                raise
             self._dealer = sock
             self.connect_address = address
         return self._dealer
 
-    def send_request(self, request, timeout_seconds, **_kwargs):
-        zmq = self._zmq or self._ensure_zmq()[0]
-        with self._client_lock:
-            dealer = self._ensure_dealer()
-            request = dict(request)
-            request.setdefault("request_id", uuid.uuid4().hex)
-            request_id = request["request_id"]
-            payload = encode_rpc_request_payload(request)
+    def _assert_client_owner(self):
+        if self._client_owner_ident != threading.get_ident():
+            raise TransportError("zmq DEALER socket operation must run on its I/O owner thread")
+
+    def _reset_dealer(self, discard_pending=False):
+        self._assert_client_owner()
+        dealer = self._dealer
+        self._dealer = None
+        if dealer is not None:
             try:
-                dealer.send(payload.encode("utf-8"))
-            except Exception as exc:
-                raise TransportError("zmq send failed: %s" % exc)
-            deadline = time.time() + float(timeout_seconds)
+                dealer.close(
+                    linger=0 if discard_pending else self.client_linger_ms
+                )
+            except Exception:
+                pass
+
+    def _enqueue_client_call(self, call):
+        remaining = call.deadline - time.monotonic()
+        if remaining <= 0 or not self._client_state_lock.acquire(timeout=remaining):
+            raise self._client_timeout(call.request)
+        try:
+            thread = self._client_thread
+            if self._client_stopping:
+                raise TransportError("zmq client is stopping")
+            if time.monotonic() >= call.deadline:
+                raise self._client_timeout(call.request)
+            if thread is None or not thread.is_alive():
+                client_queue = queue.Queue()
+                stop_event = threading.Event()
+                thread = threading.Thread(
+                    target=self._client_io_loop,
+                    args=(client_queue, stop_event),
+                    name="bigqmt-zmq-client",
+                    daemon=True,
+                )
+                self._client_queue = client_queue
+                self._client_stop_event = stop_event
+                self._client_thread = thread
+                thread.start()
+            self._client_queue.put_nowait(call)
+            emit("rpc.transport.zmq.client.queued",
+                 rpc_request_id=str(call.request.get("request_id") or ""),
+                 method=str(call.request.get("method") or ""),
+                 queue_depth=self._client_queue.qsize())
+        finally:
+            self._client_state_lock.release()
+
+    def _client_io_loop(self, client_queue, stop_event):
+        self._client_owner_ident = threading.get_ident()
+        try:
+            while not stop_event.is_set():
+                try:
+                    call = client_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if call is _CLIENT_STOP:
+                    break
+                with bind_context(**call.trace_context):
+                    emit("rpc.transport.zmq.client.dequeued",
+                         rpc_request_id=str(call.request.get("request_id") or ""),
+                         method=str(call.request.get("method") or ""),
+                         queue_depth=client_queue.qsize())
+                    if call.is_cancelled() or time.monotonic() >= call.deadline:
+                        emit("rpc.transport.zmq.client.expired", critical=True,
+                             rpc_request_id=str(call.request.get("request_id") or ""),
+                             method=str(call.request.get("method") or ""), outcome="timeout")
+                        call.complete(error=self._client_timeout(call.request))
+                        continue
+                    try:
+                        response = self._exchange_client_call(call, stop_event)
+                    except Exception as exc:
+                        emit("rpc.transport.zmq.client.exchange_failed", critical=True,
+                             rpc_request_id=str(call.request.get("request_id") or ""),
+                             method=str(call.request.get("method") or ""), outcome="timeout"
+                             if isinstance(exc, TransportTimeout) else "unknown",
+                             error_type=type(exc).__name__)
+                        call.complete(error=exc)
+                    else:
+                        emit("rpc.transport.zmq.client.response",
+                             rpc_request_id=str(call.request.get("request_id") or ""),
+                             method=str(call.request.get("method") or ""),
+                             outcome="success" if response.get("ok") else "rejected")
+                        call.complete(response=response)
+        finally:
+            self._reset_dealer()
+            while True:
+                try:
+                    call = client_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if call is not _CLIENT_STOP:
+                    call.complete(error=TransportError("zmq client stopped"))
+            self._client_owner_ident = None
+
+    def _exchange_client_call(self, call, stop_event):
+        self._assert_client_owner()
+        request = call.request
+        request_id = request["request_id"]
+        payload = encode_rpc_request_payload(request).encode("utf-8")
+        dealer = self._ensure_dealer()
+        if self._client_call_expired(call, stop_event):
+            self._reset_dealer(discard_pending=True)
+            raise self._client_timeout(request)
+        try:
+            emit("rpc.transport.zmq.client.wire_send", rpc_request_id=request_id,
+                 method=str(request.get("method") or ""))
+            self._send_client_payload(dealer, payload, call, stop_event)
             poller = self._zmq.Poller()
             poller.register(dealer, self._zmq.POLLIN)
             while True:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                events = dict(poller.poll(timeout=int(remaining * 1000)))
-                if dealer in events:
-                    frames = dealer.recv_multipart()
-                    raw = frames[-1]
-                    response = _loads(raw)
-                    if response.get("request_id") == request_id:
-                        return response
-            raise TransportTimeout("zmq rpc timeout: %s" % request.get("method"))
+                if self._client_call_expired(call, stop_event):
+                    self._reset_dealer(discard_pending=True)
+                    raise self._client_timeout(request)
+                remaining = call.deadline - time.monotonic()
+                events = dict(poller.poll(timeout=max(1, min(int(remaining * 1000), 50))))
+                if not (events.get(dealer, 0) & self._zmq.POLLIN):
+                    continue
+                self._assert_client_owner()
+                frames = dealer.recv_multipart(flags=self._zmq.NOBLOCK)
+                response = _loads(frames[-1])
+                if time.monotonic() >= call.deadline or call.is_cancelled():
+                    self._reset_dealer(discard_pending=True)
+                    raise self._client_timeout(request)
+                if response.get("request_id") == request_id:
+                    emit("rpc.transport.zmq.client.wire_receive", rpc_request_id=request_id,
+                         method=str(request.get("method") or ""),
+                         response_ok=bool(response.get("ok")))
+                    return response
+        except (TransportError, TransportTimeout):
+            raise
+        except self._zmq.Again:
+            self._reset_dealer(discard_pending=True)
+            raise self._client_timeout(request)
+        except Exception as exc:
+            self._reset_dealer(discard_pending=True)
+            raise TransportError("zmq client exchange failed: %s" % exc)
+
+    def _send_client_payload(self, dealer, payload, call, stop_event):
+        self._assert_client_owner()
+        poller = self._zmq.Poller()
+        poller.register(dealer, self._zmq.POLLOUT)
+        while True:
+            if self._client_call_expired(call, stop_event):
+                self._reset_dealer(discard_pending=True)
+                raise self._client_timeout(call.request)
+            remaining = call.deadline - time.monotonic()
+            events = dict(poller.poll(timeout=max(1, min(int(remaining * 1000), 50))))
+            if not (events.get(dealer, 0) & self._zmq.POLLOUT):
+                continue
+            if self._client_call_expired(call, stop_event):
+                self._reset_dealer(discard_pending=True)
+                raise self._client_timeout(call.request)
+            try:
+                self._assert_client_owner()
+                dealer.send(payload, flags=self._zmq.NOBLOCK)
+                return
+            except self._zmq.Again:
+                continue
+            except Exception as exc:
+                self._reset_dealer(discard_pending=True)
+                raise TransportError("zmq send failed: %s" % exc)
+
+    @staticmethod
+    def _client_call_expired(call, stop_event):
+        return (
+            stop_event.is_set()
+            or call.is_cancelled()
+            or time.monotonic() >= call.deadline
+        )
+
+    @staticmethod
+    def _client_timeout(request):
+        return TransportTimeout("zmq rpc timeout: %s" % request.get("method"))
+
+    def send_request(self, request, timeout_seconds, **_kwargs):
+        timeout_seconds = max(float(timeout_seconds), 0.0)
+        deadline = time.monotonic() + timeout_seconds
+        request = dict(request)
+        request.setdefault("request_id", uuid.uuid4().hex)
+        # The server cannot compare our monotonic clock, so include an
+        # additive absolute deadline.  Its deferred worker will reject a
+        # request that waited past the caller's budget before native/QMT work.
+        request.setdefault(
+            "deadline_epoch_ms", int((time.time() + timeout_seconds) * 1000)
+        )
+        call = _ClientCall(request, deadline)
+        if time.monotonic() >= deadline:
+            raise self._client_timeout(request)
+        self._enqueue_client_call(call)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not call.event.wait(remaining):
+            call.cancel()
+            raise self._client_timeout(request)
+        if call.error is not None:
+            raise call.error
+        return call.response
 
     # -- lifecycle --------------------------------------------------------
     def stop(self):
@@ -449,11 +674,22 @@ class ZmqTransport(RpcTransport):
         if self._actual_bind_address is not None:
             self._clear_discovery()
             self._actual_bind_address = None
-        with self._client_lock:
-            if self._dealer is not None:
-                try:
-                    self._dealer.close(linger=self.client_linger_ms)
-                except Exception:
-                    pass
-                self._dealer = None
+        with self._client_state_lock:
+            client_thread = self._client_thread
+            client_queue = self._client_queue
+            client_stop_event = self._client_stop_event
+            if client_thread is not None and client_thread.is_alive():
+                self._client_stopping = True
+                client_stop_event.set()
+                client_queue.put_nowait(_CLIENT_STOP)
+        if client_thread is not None and client_thread.is_alive():
+            client_thread.join(2.0)
+        if client_thread is not None and client_thread.is_alive():
+            raise TransportError("zmq client I/O thread did not stop")
+        with self._client_state_lock:
+            if self._client_thread is client_thread:
+                self._client_thread = None
+                self._client_queue = None
+                self._client_stop_event = None
+            self._client_stopping = False
         # Do NOT terminate the shared context — other sockets/users may rely on it.

@@ -40,6 +40,12 @@ import struct
 import threading
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor, wait
+
+try:
+    from .telemetry import bind_context, current_context, emit, span
+except ImportError:  # standalone embedded-module loading in legacy tests
+    from bigqmt_signal_trader.telemetry import bind_context, current_context, emit, span
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -68,6 +74,16 @@ class FormulaServerError(RuntimeError):
 
 class FormulaServerUnavailable(RuntimeError):
     """The FormulaServer could not be reached (connect/IO/protocol failure)."""
+
+
+def _remaining_timeout(deadline_monotonic, default_timeout):
+    """Return a per-operation timeout without changing the client default."""
+    if deadline_monotonic is None:
+        return float(default_timeout)
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if remaining <= 0.0:
+        raise FormulaServerUnavailable("FormulaServer request deadline exhausted")
+    return min(float(default_timeout), remaining)
 
 
 # ---------------------------------------------------------------------------
@@ -268,12 +284,13 @@ class FormulaServerClient(object):
         self._seq = 0
 
     # -- wire ------------------------------------------------------------
-    def _connect_locked(self):
+    def _connect_locked(self, timeout_seconds=None):
         if self._socket is not None:
             return self._socket
         try:
-            sock = socket.create_connection((self.host, self.port), self.timeout_seconds)
-            sock.settimeout(self.timeout_seconds)
+            timeout_seconds = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+            sock = socket.create_connection((self.host, self.port), timeout_seconds)
+            sock.settimeout(timeout_seconds)
         except Exception as exc:
             raise FormulaServerUnavailable(
                 "connect %s:%s failed: %s" % (self.host, self.port, exc)
@@ -293,10 +310,11 @@ class FormulaServerClient(object):
         with self._lock:
             self._close_locked()
 
-    def _recv_exactly(self, sock, length):
+    def _recv_exactly(self, sock, length, deadline_monotonic=None):
         chunks = []
         remaining = length
         while remaining > 0:
+            sock.settimeout(_remaining_timeout(deadline_monotonic, self.timeout_seconds))
             more = sock.recv(remaining)
             if not more:
                 raise FormulaServerUnavailable("socket closed mid-message")
@@ -304,8 +322,10 @@ class FormulaServerClient(object):
             remaining -= len(more)
         return b"".join(chunks)
 
-    def _request_locked(self, func, params):
-        sock = self._connect_locked()
+    def _request_locked(self, func, params, deadline_monotonic=None):
+        sock = self._connect_locked(
+            _remaining_timeout(deadline_monotonic, self.timeout_seconds)
+        )
         self._seq += 1
         seq = self._seq
         body = bson_encode({"func": str(func), "params": dict(params or {})})
@@ -319,15 +339,16 @@ class FormulaServerClient(object):
             body,
         )
         try:
+            sock.settimeout(_remaining_timeout(deadline_monotonic, self.timeout_seconds))
             sock.sendall(packet)
         except Exception as exc:
             raise FormulaServerUnavailable("send failed: %s" % exc)
         # Subscription pushes share the socket; skip anything that is not our seq.
         while True:
             try:
-                header = self._recv_exactly(sock, 4)
+                header = self._recv_exactly(sock, 4, deadline_monotonic)
                 pack_len = struct.unpack_from("!I", header, 0)[0]
-                rest = self._recv_exactly(sock, pack_len - 4)
+                rest = self._recv_exactly(sock, pack_len - 4, deadline_monotonic)
             except FormulaServerUnavailable:
                 raise
             except Exception as exc:
@@ -355,20 +376,33 @@ class FormulaServerClient(object):
                 "%s failed: %r" % (func, detail), error_id=error_id
             )
 
-    def request(self, func, params=None):
+    def request(self, func, params=None, deadline_monotonic=None):
         """Call ``func`` and return its ``params`` payload.
 
         Retries once on a transport failure, since QMT restarts (or an idle
         socket reaped by the server) show up as a dead socket on first use.
         """
-        with self._lock:
+        if deadline_monotonic is None:
+            self._lock.acquire()
+        else:
+            lock_timeout = _remaining_timeout(deadline_monotonic, self.timeout_seconds)
+            if not self._lock.acquire(True, lock_timeout):
+                raise FormulaServerUnavailable("FormulaServer lock wait exceeded request deadline")
+        try:
             try:
-                return self._request_locked(func, params)
+                return self._request_locked(func, params, deadline_monotonic)
             except FormulaServerError:
                 raise
             except FormulaServerUnavailable:
                 self._close_locked()
-                return self._request_locked(func, params)
+                return self._request_locked(func, params, deadline_monotonic)
+        finally:
+            if self._socket is not None:
+                try:
+                    self._socket.settimeout(self.timeout_seconds)
+                except Exception:
+                    pass
+            self._lock.release()
 
     def ping(self):
         """Cheap liveness probe. True when FormulaServer answers at all.
@@ -598,6 +632,13 @@ class FormulaServerRouter(object):
                 host=host, port=port, timeout_seconds=timeout, print_prefix=print_prefix
             )
         self.client = client
+        self.history_read_workers = int((config or {}).get("history_read_workers", 1))
+        if self.history_read_workers not in (1, 2):
+            raise ValueError("history_read_workers must be 1 or 2")
+        self._history_lock = threading.Lock()
+        self._history_executor = None
+        self._history_second_client = None
+        self.parallel_history_calls = 0
         if methods:
             self.methods = set(str(name) for name in methods) & set(METHOD_MAP)
         else:
@@ -628,10 +669,11 @@ class FormulaServerRouter(object):
             and self._available()
         )
 
-    def call(self, method, params=None):
+    def call(self, method, params=None, deadline_monotonic=None):
         """Serve ``method`` from FormulaServer, or raise :class:`Unroutable`."""
         method = str(method)
         if not self.supports(method):
+            emit("formula.router.declined", method=method, outcome="unsupported")
             raise Unroutable(method)
         func, build_params, adapt_result = METHOD_MAP[method]
         try:
@@ -642,7 +684,9 @@ class FormulaServerRouter(object):
             self.misses += 1
             raise Unroutable("%s: %s" % (method, exc))
         try:
-            raw = self.client.request(func, wire_params)
+            with span("formula.router.native", method=method) as observed:
+                raw = self._request(method, func, wire_params, deadline_monotonic)
+                observed["outcome"] = "success"
         except FormulaServerError as exc:
             self.misses += 1
             if exc.error_id == ERROR_METHOD_NOT_FOUND:
@@ -651,14 +695,20 @@ class FormulaServerRouter(object):
                     "%s %s not implemented by this terminal, using RPC from now on"
                     % (self.print_prefix, method)
                 )
+            emit("formula.router.fallback", method=method, outcome="unsupported",
+                 reason_type=type(exc).__name__)
             raise Unroutable("%s: %s" % (method, exc))
         except FormulaServerUnavailable as exc:
             self.misses += 1
             self._mark_unavailable(str(exc))
+            emit("formula.router.fallback", method=method, outcome="timeout",
+                 reason_type=type(exc).__name__)
             raise Unroutable("%s: %s" % (method, exc))
         except Exception as exc:
             self.misses += 1
             self._mark_unavailable("%s: %s" % (exc.__class__.__name__, exc))
+            emit("formula.router.fallback", method=method, outcome="unknown",
+                 reason_type=type(exc).__name__)
             raise Unroutable("%s: %s" % (method, exc))
         try:
             result = adapt_result(raw, dict(params or {}))
@@ -666,6 +716,7 @@ class FormulaServerRouter(object):
             self.misses += 1
             raise Unroutable("%s: result adaptation failed: %s" % (method, exc))
         self.hits += 1
+        emit("formula.router.success", method=method, outcome="success")
         if not self._announced:
             self._announced = True
             print(
@@ -673,6 +724,88 @@ class FormulaServerRouter(object):
                 % (self.print_prefix, self.client.host, self.client.port, len(self.methods))
             )
         return result
+
+    @staticmethod
+    def _call_client(client, func, params, deadline_monotonic):
+        """Keep optional deadline support additive for injected test clients."""
+        _remaining_timeout(deadline_monotonic, getattr(client, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        if deadline_monotonic is None:
+            return client.request(func, params)
+        try:
+            return client.request(func, params, deadline_monotonic=deadline_monotonic)
+        except TypeError as exc:
+            if "deadline_monotonic" not in str(exc):
+                raise
+            # A third-party injected client predating this optional argument is
+            # still bounded before invocation; it cannot receive the deadline.
+            return client.request(func, params)
+
+    def _request(self, method, func, wire_params, deadline_monotonic=None):
+        codes = wire_params.get("stockCodes") or []
+        if (
+            method != "get_market_data_ex"
+            or self.history_read_workers != 2
+            or len(codes) < 2
+            or wire_params.get("period") not in ("1m", "5m", "15m", "30m", "60m", "1h", "1d")
+        ):
+            return self._call_client(self.client, func, wire_params, deadline_monotonic)
+
+        # Keep the outer bridge/ZMQ/download locks intact. Only split this
+        # read-only batch, with one socket per lane and at most two in flight.
+        if deadline_monotonic is None:
+            self._history_lock.acquire()
+        else:
+            lock_timeout = _remaining_timeout(deadline_monotonic, DEFAULT_TIMEOUT_SECONDS)
+            if not self._history_lock.acquire(True, lock_timeout):
+                raise FormulaServerUnavailable("FormulaServer history lock wait exceeded request deadline")
+        try:
+            if self._history_executor is None:
+                self._history_second_client = FormulaServerClient(
+                    host=self.client.host,
+                    port=self.client.port,
+                    timeout_seconds=self.client.timeout_seconds,
+                    print_prefix=self.print_prefix,
+                )
+                self._history_executor = ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="qmt-formula-history",
+                )
+            split = (len(codes) + 1) // 2
+            clients = (self.client, self._history_second_client)
+            chunks = (codes[:split], codes[split:])
+            trace_context = current_context()
+
+            def request_chunk(client, chunk):
+                # This runs in the worker, so a job that sat queued past the
+                # deadline cannot touch FormulaServer after its caller left.
+                with bind_context(**trace_context):
+                    with span("formula.history.lane", method=method,
+                              lane_codes=len(chunk)) as observed:
+                        result = self._call_client(
+                            client, func, dict(wire_params, stockCodes=chunk), deadline_monotonic
+                        )
+                        observed["outcome"] = "success"
+                        return result
+
+            futures = [self._history_executor.submit(request_chunk, client, chunk)
+                       for client, chunk in zip(clients, chunks)]
+            # A failed lane must not leave its sibling running during the
+            # caller's existing serial RPC fallback, nor return partial success.
+            if deadline_monotonic is None:
+                _done, pending = wait(futures)
+            else:
+                timeout = _remaining_timeout(deadline_monotonic, DEFAULT_TIMEOUT_SECONDS)
+                _done, pending = wait(futures, timeout=timeout)
+            if pending:
+                for future in pending:
+                    future.cancel()
+                raise FormulaServerUnavailable("FormulaServer history request deadline exhausted")
+            raw = {"result": []}
+            for future in futures:
+                raw["result"].extend((future.result() or {}).get("result") or [])
+            self.parallel_history_calls += 1
+            return raw
+        finally:
+            self._history_lock.release()
 
     def stats(self):
         return {
@@ -682,18 +815,28 @@ class FormulaServerRouter(object):
             "available": self._available(),
             "unimplemented": sorted(self._unimplemented),
             "methods": sorted(self.methods),
+            "history_read_workers": self.history_read_workers,
+            "parallel_history_calls": self.parallel_history_calls,
         }
 
     def close(self):
-        if self.client is not None:
-            self.client.close()
+        with self._history_lock:
+            if self._history_executor is not None:
+                self._history_executor.shutdown(wait=True)
+                self._history_executor = None
+            if self._history_second_client is not None:
+                self._history_second_client.close()
+                self._history_second_client = None
+            if self.client is not None:
+                self.client.close()
 
 
 def build_router(config=None, print_prefix="[bigqmt_formula]"):
     """Build a router from a ``formula_server`` config dict.
 
     Recognised keys: ``enabled`` (default True), ``host``, ``port``,
-    ``qmt_root``, ``timeout_seconds``, ``methods``, ``failure_cooldown_seconds``.
+    ``qmt_root``, ``timeout_seconds``, ``methods``, ``failure_cooldown_seconds``,
+    ``history_read_workers`` (1 or 2; default 1).
     ``enabled=False`` yields a router that declines everything, so callers need
     no None checks.
     """

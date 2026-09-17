@@ -4,15 +4,12 @@ import os
 from pathlib import Path
 
 from fastapi import APIRouter, Query
-from ..bigqmt import xtdata
+from ..bigqmt import market_data
 
-from ..helpers import _call_xtdata_optional, _call_xtdata_serialized, _numpy_to_python
+from ..helpers import _call_xtdata_serialized, _numpy_to_python
 from ..models import (
     AddSectorStocksRequest,
-    CreateSectorFolderRequest,
     CreateSectorRequest,
-    RemoveSectorStocksRequest,
-    ResetSectorRequest,
 )
 from ..qmt_sector_cache import (
     read_qmt_sector_names,
@@ -36,7 +33,7 @@ def _current_sector_names() -> tuple[list[str], str]:
             return sectors, "qmt_local_sector"
     sectors = [
         str(sector)
-        for sector in _call_xtdata_serialized(xtdata.get_sector_list) or []
+        for sector in _call_xtdata_serialized(market_data.get_sector_list) or []
     ]
     return sectors, "qmt_rpc_sector"
 
@@ -56,7 +53,7 @@ def _sector_stocks(
         else sector_name
     )
     stocks = _call_xtdata_serialized(
-        xtdata.get_stock_list_in_sector,
+        market_data.get_stock_list_in_sector,
         rpc_sector_name,
         real_timetag=real_timetag,
     )
@@ -188,7 +185,7 @@ def get_stock_sector_memberships(
 def get_sector_info(
     sector: str = Query("", description="板块名称，为空返回所有板块信息"),
 ):
-    raw = _call_xtdata_serialized(xtdata.get_sector_info, sector_name=sector)
+    raw = _call_xtdata_serialized(market_data.get_sector_info, sector_name=sector)
     return {"data": _numpy_to_python(raw)}
 
 
@@ -197,17 +194,11 @@ def get_sector_info(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/create_folder")
-def create_sector_folder(req: CreateSectorFolderRequest):
-    """Create a new sector folder."""
-    return _call_xtdata_optional(xtdata, "create_sector_folder", req.folder_name)
-
-
 @router.post("/create")
 def create_sector(req: CreateSectorRequest):
     """Create a new sector under a folder."""
     result = _call_xtdata_serialized(
-        xtdata.create_sector,
+        market_data.create_sector,
         req.sector_name,
         req.parent_node,
     )
@@ -218,22 +209,11 @@ def create_sector(req: CreateSectorRequest):
 def add_sector_stocks(req: AddSectorStocksRequest):
     """Add stocks to a sector."""
     result = _call_xtdata_serialized(
-        xtdata.add_sector,
+        market_data.add_sector,
         req.sector_name,
         req.stocks,
     )
     return {"status": "ok", "data": _numpy_to_python(result)}
-
-
-@router.post("/remove_stocks")
-def remove_sector_stocks(req: RemoveSectorStocksRequest):
-    """Remove stocks from a sector."""
-    return _call_xtdata_optional(
-        xtdata,
-        "remove_stock_from_sector",
-        req.sector_name,
-        req.stocks,
-    )
 
 
 @router.delete("/remove")
@@ -241,16 +221,5 @@ def remove_sector(
     sector_name: str = Query(..., description="板块名称"),
 ):
     """Remove an entire sector."""
-    result = _call_xtdata_serialized(xtdata.remove_sector, sector_name)
+    result = _call_xtdata_serialized(market_data.remove_sector, sector_name)
     return {"status": "ok", "data": _numpy_to_python(result)}
-
-
-@router.post("/reset")
-def reset_sector(req: ResetSectorRequest):
-    """Reset sector stocks (replace all stocks)."""
-    return _call_xtdata_optional(
-        xtdata,
-        "reset_sector",
-        req.sector_name,
-        req.stocks,
-    )

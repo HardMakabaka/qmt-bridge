@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import importlib
 import threading
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 from urllib.parse import urlparse
+
+from bigqmt_signal_trader.data_client import BigQmtDataClient
+from bigqmt_signal_trader.rpc_client import BigQmtRpcClient
+from bigqmt_signal_trader.trading_client import BigQmtTradingClient
 
 from .config import Settings
 
@@ -19,12 +21,16 @@ class BigQmtRuntimeUnavailable(RuntimeError):
     pass
 
 
+class BigQmtConfigurationError(ValueError):
+    """A static bridge configuration error; retrying cannot repair it."""
+
+
 def _require_loopback_endpoint(endpoint: str) -> None:
     parsed = urlparse(endpoint)
     if parsed.scheme != "tcp" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("QMT_BRIDGE_ZMQ_ENDPOINT must use tcp loopback")
+        raise BigQmtConfigurationError("QMT_BRIDGE_ZMQ_ENDPOINT must use tcp loopback")
     if not parsed.port:
-        raise ValueError("QMT_BRIDGE_ZMQ_ENDPOINT must include a port")
+        raise BigQmtConfigurationError("QMT_BRIDGE_ZMQ_ENDPOINT must include a port")
 
 
 def _read_log_tail(path: Path, byte_limit: int) -> bytes:
@@ -73,29 +79,29 @@ def _attest_terminal_trade_mode(qmt_root: str, request_id: str) -> str:
 
 
 class BigQmtRuntime:
-    def __init__(self, settings: Settings, compat_module: ModuleType | Any | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        rpc_client_factory=BigQmtRpcClient,
+        data_client_factory=BigQmtDataClient,
+        trading_client_factory=BigQmtTradingClient,
+    ):
         self.settings = settings
-        self._compat_module = compat_module
+        self._rpc_client_factory = rpc_client_factory
+        self._data_client_factory = data_client_factory
+        self._trading_client_factory = trading_client_factory
         self.client = None
-        self.xtdata = None
+        self.market_data = None
+        self._minute_client = None
+        self._minute_data_client = None
+        self._minute_client_lock = threading.Lock()
+        self._transport_failure_callback = None
         self.ping_payload: dict[str, Any] = {}
         self.last_error = ""
 
-    @property
-    def compat_module(self):
-        if self._compat_module is None:
-            try:
-                self._compat_module = importlib.import_module(
-                    "bigqmt_signal_trader.xtquant_compat"
-                )
-            except Exception as exc:
-                raise BigQmtRuntimeUnavailable(
-                    "xtquant-big-convert is not installed"
-                ) from exc
-        return self._compat_module
-
     def _client_config(self) -> dict[str, Any]:
-        return {
+        config = {
             "transport": "zmq",
             "zmq": {
                 "connect_address": self.settings.zmq_endpoint,
@@ -111,37 +117,60 @@ class BigQmtRuntime:
                 "enabled": self.settings.formula_enabled,
                 "host": self.settings.formula_host,
                 "port": self.settings.formula_port,
+                "history_read_workers": self.settings.formula_history_read_workers,
             },
             "full_tick_cache_enabled": False,
             "local_cache_enabled": False,
         }
+        if self.settings.local_cache_enabled:
+            cache_dir = self.settings.local_cache_dir.strip()
+            if not cache_dir:
+                raise BigQmtConfigurationError(
+                    "QMT_BRIDGE_LOCAL_CACHE_DIR is required when local cache is enabled"
+                )
+            config.update(
+                {
+                    "local_cache_enabled": True,
+                    "local_cache_dir": cache_dir,
+                    "local_cache_fallback_rpc": False,
+                    "local_cache_format": self.settings.local_cache_format,
+                }
+            )
+        return config
 
     def connect(self) -> dict[str, Any]:
         if self.settings.runtime != "bigqmt":
-            raise ValueError("QMT_BRIDGE_RUNTIME must be bigqmt")
+            raise BigQmtConfigurationError("QMT_BRIDGE_RUNTIME must be bigqmt")
         if self.settings.rpc_transport != "zmq":
-            raise ValueError("QMT_BRIDGE_RPC_TRANSPORT must be zmq")
+            raise BigQmtConfigurationError("QMT_BRIDGE_RPC_TRANSPORT must be zmq")
         _require_loopback_endpoint(self.settings.zmq_endpoint)
         _require_loopback_endpoint(self.settings.event_zmq_endpoint)
         if self.settings.zmq_endpoint.strip().lower() == self.settings.event_zmq_endpoint.strip().lower():
-            raise ValueError(
+            raise BigQmtConfigurationError(
                 "QMT_BRIDGE_EVENT_ZMQ_ENDPOINT must differ from QMT_BRIDGE_ZMQ_ENDPOINT"
             )
         if self.settings.formula_host not in {"127.0.0.1", "localhost", "::1"}:
-            raise ValueError("QMT_BRIDGE_FORMULA_HOST must be loopback")
+            raise BigQmtConfigurationError("QMT_BRIDGE_FORMULA_HOST must be loopback")
+        if self.settings.formula_history_read_workers not in (1, 2):
+            raise BigQmtConfigurationError("QMT_BRIDGE_FORMULA_HISTORY_READ_WORKERS must be 1 or 2")
         account_id = self.settings.trading_account_id.strip()
         if not account_id:
-            raise ValueError("QMT_BRIDGE_TRADING_ACCOUNT_ID is required")
+            raise BigQmtConfigurationError("QMT_BRIDGE_TRADING_ACCOUNT_ID is required")
 
-        compat = self.compat_module
         config = self._client_config()
-        self.client = compat.BigQmtRpcClient(
+        client = self._rpc_client_factory(
             account_id=account_id,
             redis_config=config,
             timeout_seconds=self.settings.rpc_timeout_seconds,
         )
-        self.xtdata = compat.BigQmtXtData(self.client)
-        return self.probe()
+        self.client = client
+        self.market_data = self._data_client_factory(client)
+        try:
+            return self.probe()
+        except Exception:
+            # A client created before ping failure owns sockets/threads too.
+            self.close()
+            raise
 
     def probe(self) -> dict[str, Any]:
         if self.client is None:
@@ -174,19 +203,26 @@ class BigQmtRuntime:
             raise
 
     def new_account(self, account_id: str = ""):
-        target = str(account_id or self.settings.trading_account_id).strip()
-        return self.compat_module.StockAccount(target)
+        return str(account_id or self.settings.trading_account_id).strip()
 
     def new_trader(self):
         if self.client is None:
             raise BigQmtRuntimeUnavailable("Big QMT RPC client is not initialized")
-        trader = self.compat_module.BigQmtXtTrader(
+        trader = self._trading_client_factory(
             account_id=self.settings.trading_account_id,
             redis_config=self._client_config(),
             timeout_seconds=self.settings.rpc_timeout_seconds,
         )
         trader.client = self.client
         return trader
+
+    def set_transport_failure_callback(self, callback) -> None:
+        """Bind lifecycle recovery to genuine native transport failures."""
+        self._transport_failure_callback = callback
+        for client in (self.client, self._minute_client):
+            setter = getattr(client, "set_transport_failure_callback", None)
+            if callable(setter):
+                setter(callback)
 
     def readiness(self) -> dict[str, Any]:
         ping = dict(self.ping_payload)
@@ -199,6 +235,14 @@ class BigQmtRuntime:
             "event_zmq_endpoint": self.settings.event_zmq_endpoint,
             "formula_endpoint": f"{self.settings.formula_host}:{self.settings.formula_port}",
             "formula_enabled": self.settings.formula_enabled,
+            "formula_history_read_workers": self.settings.formula_history_read_workers,
+            "local_cache_enabled": self.settings.local_cache_enabled,
+            "local_cache_dir": self.settings.local_cache_dir or None,
+            "local_cache_format": (
+                self.settings.local_cache_format
+                if self.settings.local_cache_enabled
+                else None
+            ),
             "qmt_root": self.settings.qmt_root,
             "account_id": account_id,
             "rpc_revision": ping.get("rpc_revision"),
@@ -213,8 +257,35 @@ class BigQmtRuntime:
             "last_error": self.last_error or None,
         }
 
-    def close(self) -> None:
-        client = self.client
+    def minute_data_client(self):
+        """One owned read-only RPC lane, independent of account/bulk queues."""
+        with self._minute_client_lock:
+            if self.client is None:
+                raise BigQmtRuntimeUnavailable("Big QMT runtime is not initialized")
+            if self._minute_client is None:
+                config = self._client_config()
+                config["formula_server"] = {"enabled": False}
+                config["local_cache_enabled"] = False
+                self._minute_client = self._rpc_client_factory(
+                    account_id=self.settings.trading_account_id.strip(),
+                    redis_config=config,
+                    timeout_seconds=self.settings.rpc_timeout_seconds,
+                )
+                self._minute_data_client = self._data_client_factory(self._minute_client)
+                setter = getattr(self._minute_client, "set_transport_failure_callback", None)
+                if callable(setter):
+                    setter(self._transport_failure_callback)
+            return self._minute_data_client
+
+    @staticmethod
+    def _close_client(client) -> None:
+        formula_router = getattr(client, "_formula_router_instance", None)
+        close_formula_router = getattr(formula_router, "close", None)
+        if callable(close_formula_router):
+            close_formula_router()
+        stop_quote_listener = getattr(client, "stop_quote_event_listener", None)
+        if callable(stop_quote_listener):
+            stop_quote_listener()
         transport = getattr(client, "_transport_instance", None)
         if transport is not None:
             stop = getattr(transport, "stop", None)
@@ -223,8 +294,20 @@ class BigQmtRuntime:
                 stop()
             elif callable(close):
                 close()
-        self.client = None
-        self.xtdata = None
+
+    def close(self) -> None:
+        with self._minute_client_lock:
+            for client in (self._minute_client, self.client):
+                setter = getattr(client, "set_transport_failure_callback", None)
+                if callable(setter):
+                    setter(None)
+            self._close_client(self._minute_client)
+            self._minute_client = None
+            self._minute_data_client = None
+            self._close_client(self.client)
+            self.client = None
+            self.market_data = None
+            self._transport_failure_callback = None
         self.ping_payload = {}
 
 
@@ -234,11 +317,23 @@ _runtime_lock = threading.Lock()
 
 def initialize_bigqmt_runtime(
     settings: Settings,
-    compat_module: ModuleType | Any | None = None,
+    *,
+    rpc_client_factory=BigQmtRpcClient,
+    data_client_factory=BigQmtDataClient,
+    trading_client_factory=BigQmtTradingClient,
 ) -> BigQmtRuntime:
     global _runtime
-    runtime = BigQmtRuntime(settings, compat_module=compat_module)
-    runtime.connect()
+    runtime = BigQmtRuntime(
+        settings,
+        rpc_client_factory=rpc_client_factory,
+        data_client_factory=data_client_factory,
+        trading_client_factory=trading_client_factory,
+    )
+    try:
+        runtime.connect()
+    except Exception:
+        runtime.close()
+        raise
     with _runtime_lock:
         previous = _runtime
         _runtime = runtime
@@ -263,12 +358,25 @@ def reset_bigqmt_runtime() -> None:
         runtime.close()
 
 
-class _XtDataProxy:
+def discard_bigqmt_runtime(runtime: BigQmtRuntime) -> bool:
+    """Close a runtime only if it is still the active module-proxy owner."""
+    global _runtime
+    with _runtime_lock:
+        if _runtime is not runtime:
+            return False
+        _runtime = None
+    runtime.close()
+    return True
+
+
+class _MarketDataProxy:
     def __getattr__(self, name: str):
         runtime = get_bigqmt_runtime()
-        if runtime.xtdata is None:
+        if runtime.market_data is None:
             raise BigQmtRuntimeUnavailable("Big QMT data facade is not initialized")
-        return getattr(runtime.xtdata, name)
+        if name == "get_market_data_ex_scoped":
+            return getattr(runtime.minute_data_client(), name)
+        return getattr(runtime.market_data, name)
 
 
-xtdata = _XtDataProxy()
+market_data = _MarketDataProxy()

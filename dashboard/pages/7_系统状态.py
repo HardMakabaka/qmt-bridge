@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _sidebar import require_client
 
 st.set_page_config(page_title="系统状态 - QMT Bridge", layout="wide")
-st.title("系统状态")
+st.title("系统状态（Big QMT）")
 
 client = require_client()
 
@@ -39,31 +39,31 @@ with col1:
         st.error(f"获取服务端版本失败: {e}")
 
 with col2:
-    try:
-        xtdata_ver = client.get_xtdata_version()
-        st.metric("xtquant / xtdata 版本", xtdata_ver)
-    except Exception as e:
-        st.error(f"获取 xtdata 版本失败: {e}")
+    if st.button("读取 Big QMT 就绪状态", key="btn_readiness"):
+        try:
+            st.json(client.get_readiness())
+        except Exception as e:
+            st.error(f"获取就绪状态失败: {e}")
 
 st.markdown("---")
 
 # ── 连接状态 ──────────────────────────────────────────────────────
 
-st.header("连接状态")
+st.header("运行时与恢复状态")
 
-if st.button("刷新连接状态", key="btn_conn_status"):
+if st.button("刷新运行时状态", key="btn_conn_status"):
     try:
         status = client.get_connection_status()
         st.json(status)
     except Exception as e:
-        st.error(f"获取连接状态失败: {e}")
+        st.error(f"获取运行时状态失败: {e}")
 
-if st.button("行情服务器状态", key="btn_quote_status"):
+if st.button("读取恢复保护状态", key="btn_recovery_status"):
     try:
-        status = client.get_quote_server_status()
+        status = client.get_recovery_status()
         st.json(status)
     except Exception as e:
-        st.error(f"获取行情服务器状态失败: {e}")
+        st.error(f"获取恢复保护状态失败: {e}")
 
 st.markdown("---")
 

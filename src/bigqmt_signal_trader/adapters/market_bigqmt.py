@@ -26,13 +26,19 @@ The split matters. Per the official docs and the ContextInfo IDE stub
 This module does not make trading decisions.
 """
 
+import datetime
 import importlib
+import json
 import importlib.util
+import threading
+import time
 
 from ..code_utils import normalize_stock_code
+from ..telemetry import emit, span
 
 
 MARKET_CODES = {"SH", "SZ", "BJ", "HK"}
+_MINUTE_SUBSCRIPTION_LOCK = threading.Lock()
 
 
 def normalize_market_or_stock_code(code):
@@ -141,10 +147,20 @@ def _load_native_xtdata():
 
 
 class BigQmtMarketDataProvider:
-    def __init__(self, context_info, native_xtdata=None):
+    def __init__(self, context_info, native_xtdata=None, native_history_downloader=None):
         self.context_info = context_info
         # Allow injection for tests; otherwise resolve lazily on first use.
         self._native_xtdata = native_xtdata
+        # Full Big QMT exposes history supplementation as a runtime-injected
+        # global function.  It is not a ContextInfo method and must not fall
+        # back to MiniQMT's xtdata transport from the embedded process.
+        self._native_history_downloader = (
+            native_history_downloader if callable(native_history_downloader) else None
+        )
+
+    @property
+    def native_history_download_available(self):
+        return self._native_history_downloader is not None
 
     def _context_method(self, method_name):
         method = getattr(self.context_info, method_name, None)
@@ -180,13 +196,19 @@ class BigQmtMarketDataProvider:
             fn = getattr(module, func_name, None)
             if fn is not None:
                 try:
-                    return fn(*args, **kwargs)
+                    value = fn(*args, **kwargs)
+                    emit("market.native_sdk_call", outcome="success", function=func_name)
+                    return value
                 except Exception as exc:
                     # Big QMT path: SDK present but no quote service to talk
                     # to ("无法连接行情服务"). Don't crash — let the ContextInfo
                     # fallback have a turn.
-                    pass
-        return context_caller()
+                    emit("market.native_sdk_fallback", outcome="unknown", function=func_name,
+                         error_type=exc.__class__.__name__)
+        with span("market.context_call", function=func_name) as result:
+            value = context_caller()
+            result["outcome"] = "success" if value is not None else "empty"
+            return value
 
     def _call_first_supported(self, shapes):
         last_error = None
@@ -204,6 +226,13 @@ class BigQmtMarketDataProvider:
         raise NotImplementedError("none of the ContextInfo methods is available")
 
     def _market_data_shapes(self, method_name, **params):
+        """Return the one supported Big QMT ContextInfo call shape.
+
+        The embedded runtime is Big QMT only.  Trying MiniQMT keyword spellings
+        after a TypeError hides real signature errors and can accidentally
+        change a local read into a different data source.  Kept as a small
+        helper because a few callers share the canonical bar arguments.
+        """
         field_list = list(params.get("field_list") or params.get("fields") or [])
         stock_list = list(params.get("stock_list") or params.get("stock_code") or [])
         period = params.get("period", "1d")
@@ -212,19 +241,8 @@ class BigQmtMarketDataProvider:
         count = params.get("count", -1)
         dividend_type = params.get("dividend_type", "none")
         fill_data = params.get("fill_data", True)
-        data_dir = params.get("data_dir")
-
-        mini_kwargs = {
-            "field_list": field_list,
-            "stock_list": stock_list,
-            "period": period,
-            "start_time": start_time,
-            "end_time": end_time,
-            "count": count,
-            "dividend_type": dividend_type,
-            "fill_data": fill_data,
-        }
-        big_kwargs = {
+        args = ()
+        kwargs = {
             "fields": field_list,
             "stock_code": stock_list,
             "period": period,
@@ -232,60 +250,79 @@ class BigQmtMarketDataProvider:
             "end_time": end_time,
             "count": count,
             "dividend_type": dividend_type,
+            "fill_data": fill_data,
         }
-        if method_name == "get_local_data" and data_dir is not None:
-            mini_kwargs["data_dir"] = data_dir
-            big_kwargs["data_dir"] = data_dir
-        positional_tail_kwargs = {
-            "period": period,
-            "start_time": start_time,
-            "end_time": end_time,
-            "count": count,
-            "dividend_type": dividend_type,
-        }
-        if method_name == "get_local_data" and data_dir is not None:
-            positional_tail_kwargs["data_dir"] = data_dir
-
-        return [
-            (method_name, (), big_kwargs),
-            (method_name, (), mini_kwargs),
-            (
-                method_name,
-                (field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data),
-                {},
-            ),
-            (method_name, (field_list, stock_list), positional_tail_kwargs),
-            (
-                method_name,
-                (field_list,),
-                {
-                    "stock_code": stock_list,
-                    "period": period,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "count": count,
-                    "dividend_type": dividend_type,
-                },
-            ),
-            (
-                method_name,
-                (field_list,),
-                {
-                    "stock_list": stock_list,
-                    "period": period,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "count": count,
-                    "dividend_type": dividend_type,
-                    "fill_data": fill_data,
-                },
-            ),
-        ]
+        if method_name in ("get_market_data_ex", "get_market_data_ex_ori") and "subscribe" in params:
+            kwargs["subscribe"] = bool(params["subscribe"])
+        return [(method_name, args, kwargs)]
 
     def get_ticks(self, codes):
         normalized_codes = [normalize_market_or_stock_code(code) for code in codes]
         data = self.context_info.get_full_tick(normalized_codes)
         return data or {}
+
+    def subscribe_quote(self, stock_code, period="tick"):
+        subscribe = self._context_method("subscribe_quote")
+        code = normalize_market_or_stock_code(stock_code)
+
+        def publish_callback(raw):
+            event = self._normalize_quote_callback(code, raw)
+            if event is None:
+                return
+            from bigqmt_signal_trader.exec_events import publish_transient_zmq_event
+
+            publish_transient_zmq_event(event)
+
+        return subscribe(
+            code,
+            period=period,
+            dividend_type="follow",
+            result_type="",
+            callback=publish_callback,
+        )
+
+    def unsubscribe_quote(self, seq):
+        return self._context_method("unsubscribe_quote")(int(seq))
+
+    @staticmethod
+    def _normalize_quote_callback(code, raw):
+        try:
+            if raw is None:
+                return None
+            if hasattr(raw, "to_dict"):
+                raw = raw.to_dict()
+            if isinstance(raw, (list, tuple)):
+                if not raw:
+                    return None
+                raw = raw[-1]
+            if not isinstance(raw, dict) or not raw:
+                return None
+            data = raw.get(code)
+            if data is None:
+                upper = str(code).upper()
+                for key, value in raw.items():
+                    if str(key).upper() == upper:
+                        data = value
+                        break
+            if data is None:
+                data = raw
+            if hasattr(data, "to_dict"):
+                data = data.to_dict()
+            if isinstance(data, (list, tuple)):
+                if not data:
+                    return None
+                data = data[-1]
+            if not isinstance(data, dict) or not data:
+                return None
+            safe_data = json.loads(json.dumps(data, ensure_ascii=False, default=str))
+            return {
+                "event_type": "quote",
+                "code": code,
+                "data": safe_data,
+                "source_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def get_instrument(self, code):
         normalized = normalize_stock_code(code)
@@ -342,26 +379,174 @@ class BigQmtMarketDataProvider:
         )
 
     def get_market_data_ex(self, **kwargs):
-        raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
-        if callable(raw_method):
-            raw_data = self._call_first_supported(
-                self._market_data_shapes("get_market_data_ex_ori", **kwargs)
+        if "subscribe" not in kwargs and str(kwargs.get("end_time") or "").strip():
+            # Explicit-window reads are historical/cache reads. They must never
+            # consume QMT's finite implicit live-subscription quota, including
+            # when the requested window is earlier today.
+            kwargs["subscribe"] = False
+        codes = kwargs.get("stock_list") or kwargs.get("stock_code") or []
+        with span("market.context_market_data_ex", period=kwargs.get("period", "1d"),
+                  code_count=len(codes), explicit_window=bool(kwargs.get("end_time"))) as result:
+            raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
+            if callable(raw_method):
+                raw_data = self._call_first_supported(
+                    self._market_data_shapes("get_market_data_ex_ori", **kwargs)
+                )
+                value = _raw_market_data_payload(
+                    raw_data, kwargs.get("field_list") or kwargs.get("fields"), codes,
+                )
+                result.update({"outcome": "success" if value else "empty", "source": "ori"})
+                return value
+            value = self._call_first_supported(
+                self._market_data_shapes("get_market_data_ex", **kwargs)
             )
-            return _raw_market_data_payload(
-                raw_data,
-                kwargs.get("field_list") or kwargs.get("fields"),
-                kwargs.get("stock_list") or kwargs.get("stock_code"),
+            result.update({"outcome": "success" if value else "empty", "source": "context"})
+            return value
+
+    def get_market_data_ex_scoped(self, stock_list, start_time, end_time, count=3):
+        """Read a short 1m window with owned native subscriptions, then release.
+
+        DAT is historical storage, not the intraday stream. The current-day read
+        must keep subscribe=True while explicit subscriptions are alive; False
+        reads only DAT. Never retain unnumbered implicit subscriptions here.
+        """
+        codes = list(dict.fromkeys(normalize_stock_code(code) for code in stock_list))
+        if not codes or len(codes) > 20:
+            emit("market.minute_subscription", outcome="rejected", reason="batch_limit")
+            raise ValueError("minute_subscription_batch_limit:1..20")
+        start = datetime.datetime.strptime(str(start_time), "%Y%m%d%H%M%S")
+        end = datetime.datetime.strptime(str(end_time), "%Y%m%d%H%M%S")
+        if start.date() != end.date() or start > end or not 1 <= int(count) <= 60:
+            raise ValueError("invalid_minute_subscription_window")
+        def _covers_end(payload, code):
+            frame = payload.get(code) if isinstance(payload, dict) else None
+            if isinstance(frame, dict):
+                rows = frame.get("records") or []
+                return any(
+                    isinstance(row, dict) and str(row.get("stime")) == end_time
+                    for row in rows
+                )
+            return (
+                frame is not None
+                and not frame.empty
+                and (
+                    end_time in set(frame["stime"].astype(str))
+                    if "stime" in frame
+                    else end_time in set(frame.index.astype(str))
+                )
             )
-        shapes = self._market_data_shapes("get_market_data_ex", **kwargs)
-        if hasattr(self.context_info, "get_market_data"):
-            shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
-        return self._call_first_supported(shapes)
+
+        emit("market.minute_subscription", outcome="started", phase="cache_read",
+             code_count=len(codes), requested_count=count)
+        cached = self.get_market_data_ex(
+            field_list=[], stock_list=codes, period="1m", start_time=start_time,
+            end_time=end_time, count=int(count), dividend_type="none",
+            fill_data=False, subscribe=False,
+        )
+        missing = [code for code in codes if not _covers_end(cached, code)]
+        if not missing:
+            emit("market.minute_subscription", outcome="success", phase="cache_hit",
+                 code_count=len(codes))
+            return cached
+
+        subscribe = self._context_method("subscribe_quote")
+        unsubscribe = self._context_method("unsubscribe_quote")
+        if not _MINUTE_SUBSCRIPTION_LOCK.acquire(False):
+            emit("market.minute_subscription", outcome="overloaded", phase="lock_wait",
+                 critical=True)
+            raise RuntimeError("minute_subscription_busy")
+        owned = []
+        try:
+            for code in missing:
+                seq = int(subscribe(code, period="1m", dividend_type="none", callback=None) or 0)
+                if seq <= 0:
+                    emit("market.minute_subscription", outcome="unsupported", phase="create")
+                    raise RuntimeError("native_minute_subscription_unavailable:%s" % code)
+                owned.append(seq)
+            emit("market.minute_subscription", outcome="started", phase="subscribed",
+                 subscription_count=len(owned))
+            deadline = time.monotonic() + 2.0
+            while True:
+                data = self.get_market_data_ex(
+                    field_list=[], stock_list=missing, period="1m", start_time=start_time,
+                    end_time=end_time, count=int(count), dividend_type="none",
+                    fill_data=False, subscribe=True,
+                )
+                complete = all(_covers_end(data, code) for code in missing)
+                if complete or time.monotonic() >= deadline:
+                    result = dict(cached or {}) if isinstance(cached, dict) else {}
+                    if isinstance(data, dict):
+                        for code in missing:
+                            result[code] = data.get(code)
+                    emit("market.minute_subscription",
+                         outcome="success" if complete else "partial", phase="poll_complete",
+                         subscription_count=len(owned))
+                    return result
+                time.sleep(0.05)
+        finally:
+            cleanup_errors = []
+            for seq in owned:
+                try:
+                    unsubscribe(seq)
+                except Exception as exc:
+                    cleanup_errors.append(str(exc))
+            _MINUTE_SUBSCRIPTION_LOCK.release()
+            emit("market.minute_subscription",
+                 outcome="success" if not cleanup_errors else "unknown", phase="released",
+                 subscription_count=len(owned))
+            if cleanup_errors:
+                raise RuntimeError("minute_subscription_release_failed:%s" % ";".join(cleanup_errors))
 
     def get_local_data(self, **kwargs):
-        shapes = self._market_data_shapes("get_local_data", **kwargs)
-        if hasattr(self.context_info, "get_market_data"):
-            shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
-        return self._call_first_supported(shapes)
+        """Read ContextInfo local bars using the documented scalar-code API.
+
+        ``ContextInfo.get_local_data(stock_code, start_time, end_time, period,
+        divid_type, count)`` returns a time-keyed mapping.  Convert each scalar
+        response to the bridge's established ``{stock: DataFrame}`` shape here,
+        rather than pretending it accepts MiniQMT's batch ``field_list`` and
+        ``stock_list`` keywords.
+        """
+        import pandas as pd
+
+        requested_codes = kwargs.get("stock_list") or kwargs.get("stock_code") or []
+        if isinstance(requested_codes, str):
+            requested_codes = [requested_codes]
+        codes = [normalize_stock_code(code) for code in requested_codes]
+        start_time = kwargs.get("start_time", "")
+        end_time = kwargs.get("end_time", "")
+        period = kwargs.get("period", "1d")
+        divid_type = kwargs.get("dividend_type", kwargs.get("divid_type", "none"))
+        count = kwargs.get("count", -1)
+        requested_fields = [str(field) for field in (kwargs.get("field_list") or kwargs.get("fields") or [])]
+        method = self._context_method("get_local_data")
+        result = {}
+        with span("market.context_local_data", period=period, code_count=len(codes),
+                  requested_count=count) as telemetry_result:
+            for code in codes:
+                raw = method(code, start_time, end_time, period, divid_type, count)
+                if hasattr(raw, "columns") and hasattr(raw, "index"):
+                    frame = raw.copy()
+                else:
+                    if isinstance(raw, dict) and code in raw and isinstance(raw[code], dict):
+                        raw = raw[code]
+                    rows = []
+                    for timestamp, values in (raw or {}).items() if isinstance(raw, dict) else ():
+                        row = dict(values) if isinstance(values, dict) else {"value": values}
+                        row.setdefault("stime", str(timestamp))
+                        rows.append(row)
+                    frame = pd.DataFrame(rows)
+                    if not frame.empty and "stime" in frame.columns:
+                        frame = frame.set_index("stime")
+                if requested_fields and not frame.empty:
+                    keep = [name for name in frame.columns if name in requested_fields]
+                    if keep:
+                        frame = frame[keep]
+                result[code] = frame
+            telemetry_result["returned_rows"] = sum(
+                int(getattr(frame, "shape", (0,))[0]) for frame in result.values()
+            )
+            telemetry_result["outcome"] = "success" if telemetry_result["returned_rows"] else "empty"
+        return result
 
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
         # ContextInfo stub: get_divid_factors(marketAndStock, date='') — only 2
@@ -396,29 +581,21 @@ class BigQmtMarketDataProvider:
         )
 
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None):
-        def _via_context():
-            kwargs = {"stock_code": stock_code, "period": period, "start_time": start_time, "end_time": end_time}
-            if incrementally is not None:
-                kwargs["incrementally"] = incrementally
-            return self._call_context("download_history_data", **kwargs)
-
-        sdk_kwargs = {"incrementally": incrementally} if incrementally is not None else {}
-        return self._download(
-            "download_history_data", (stock_code, period, start_time, end_time), sdk_kwargs, _via_context
+        if self._native_history_downloader is None:
+            raise NotImplementedError(
+                "bigqmt_global_download_history_data_unavailable"
+            )
+        # Official full Big QMT contract: exactly four positional arguments.
+        # ``incrementally`` belongs to other runtimes and is intentionally not
+        # forwarded or used to select an SDK fallback here.
+        return self._native_history_downloader(
+            stock_code, period, start_time, end_time
         )
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="", incrementally=None):
-        stock_list = list(stock_list or [])
-
-        def _via_context():
-            kwargs = {"stock_list": stock_list, "period": period, "start_time": start_time, "end_time": end_time}
-            if incrementally is not None:
-                kwargs["incrementally"] = incrementally
-            return self._call_context("download_history_data2", **kwargs)
-
-        sdk_kwargs = {"incrementally": incrementally} if incrementally is not None else {}
-        return self._download(
-            "download_history_data2", (stock_list, period, start_time, end_time), sdk_kwargs, _via_context
+        raise NotImplementedError(
+            "bigqmt_download_history_data2_unavailable: use the single-symbol "
+            "Big QMT global download_history_data contract"
         )
 
     def get_trading_dates(self, market, start_time="", end_time="", count=-1):

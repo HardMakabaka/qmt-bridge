@@ -1,12 +1,71 @@
 """WebSocketMixin — WebSocket subscription client methods."""
 
 import json
+import inspect
+import time
+import uuid
 from typing import Callable
-from urllib.parse import urlencode
+from bigqmt_signal_trader import telemetry
+
+
+def _connection_options(connect, headers):
+    name = "additional_headers" if "additional_headers" in inspect.signature(connect).parameters else "extra_headers"
+    return {name: headers}
 
 
 class WebSocketMixin:
     """Client methods for WebSocket endpoints."""
+
+    async def _consume_subscription(self, connect, path, callback, payload=None):
+        """Observe the existing single-connection/synchronous-callback contract."""
+        with telemetry.bind_context(service_role="sdk", ws_session_id=uuid.uuid4().hex):
+            with telemetry.span("sdk.ws", route=path) as observation:
+                received = handled = 0
+                callback_ms = 0.0
+                report_at = time.monotonic()
+                connection = None
+                try:
+                    async with connect(f"{self.ws_url}{path}", **_connection_options(connect, self._headers())) as ws:
+                        connection = ws
+                        telemetry.emit("sdk.ws.open")
+                        if payload is not None:
+                            await ws.send(json.dumps(payload))
+                            telemetry.emit("sdk.ws.subscribe_sent")
+                        async for message in ws:
+                            received += 1
+                            try:
+                                data = json.loads(message)
+                            except (ValueError, UnicodeError) as exc:
+                                telemetry.emit("sdk.ws.decode_failed", outcome="error", error_type=type(exc).__name__)
+                                raise
+                            if isinstance(data, dict) and data.get("status") in {
+                                "unsupported", "unavailable", "error", "partial", "stale", "timeout",
+                            }:
+                                telemetry.emit("sdk.ws.message_status", outcome=data["status"])
+                            started = time.monotonic()
+                            try:
+                                callback(data)
+                            except Exception as exc:
+                                telemetry.emit("sdk.ws.callback_failed", critical=path == "/ws/trade",
+                                               outcome="error", error_type=type(exc).__name__)
+                                raise
+                            finally:
+                                callback_ms += (time.monotonic() - started) * 1000
+                            handled += 1
+                            if path == "/ws/trade" and isinstance(data, dict):
+                                body = data.get("data") if isinstance(data.get("data"), dict) else {}
+                                telemetry.emit("sdk.ws.trade_consumed", critical=True, event_type=data.get("type"),
+                                               order_sys_id=body.get("order_sys_id") or body.get("order_sysid"),
+                                               trade_id=body.get("trade_id") or body.get("traded_id"),
+                                               evidence_source="sdk_callback_return")
+                            if time.monotonic() - report_at >= 10:
+                                telemetry.emit("sdk.ws.messages", received_count=received, handled_count=handled,
+                                               callback_ms=round(callback_ms, 3))
+                                report_at = time.monotonic()
+                finally:
+                    observation.update(received_count=received, handled_count=handled,
+                                       callback_ms=round(callback_ms, 3),
+                                       close_code=getattr(connection, "close_code", None))
 
     async def subscribe_realtime(
         self,
@@ -43,12 +102,8 @@ class WebSocketMixin:
                 "Install it with: pip install websockets"
             )
 
-        url = f"{self.ws_url}/ws/realtime"
-        async with websockets.connect(url) as ws:
-            await ws.send(json.dumps({"stocks": stocks, "period": period}))
-            async for message in ws:
-                data = json.loads(message)
-                callback(data)
+        await self._consume_subscription(websockets.connect, "/ws/realtime", callback,
+                                         {"stocks": stocks, "period": period})
 
     async def subscribe_whole_quote(
         self,
@@ -66,12 +121,7 @@ class WebSocketMixin:
                 "websockets package is required. Install with: pip install websockets"
             )
 
-        url = f"{self.ws_url}/ws/whole_quote"
-        async with websockets.connect(url) as ws:
-            await ws.send(json.dumps({"codes": codes}))
-            async for message in ws:
-                data = json.loads(message)
-                callback(data)
+        await self._consume_subscription(websockets.connect, "/ws/whole_quote", callback, {"codes": codes})
 
     async def subscribe_trade_events(
         self,
@@ -88,12 +138,7 @@ class WebSocketMixin:
                 "websockets package is required. Install with: pip install websockets"
             )
 
-        params = f"?{urlencode({'api_key': self.api_key})}" if self.api_key else ""
-        url = f"{self.ws_url}/ws/trade{params}"
-        async with websockets.connect(url) as ws:
-            async for message in ws:
-                data = json.loads(message)
-                callback(data)
+        await self._consume_subscription(websockets.connect, "/ws/trade", callback)
 
     async def subscribe_formula(
         self,
@@ -110,37 +155,7 @@ class WebSocketMixin:
                 "websockets package is required. Install with: pip install websockets"
             )
 
-        url = f"{self.ws_url}/ws/formula"
-        async with websockets.connect(url) as ws:
-            await ws.send(json.dumps({
-                "action": "subscribe",
-                "formula_name": formula_name,
-                "stock_code": stock_code,
-                "period": period,
-            }))
-            async for message in ws:
-                data = json.loads(message)
-                callback(data)
-
-    async def subscribe_l2_thousand(
-        self,
-        stocks: list[str],
-        callback: Callable[[dict], None],
-    ):
-        """Subscribe to L2 thousand-level data via WebSocket.
-
-        Requires the ``websockets`` package.
-        """
-        try:
-            import websockets
-        except ImportError:
-            raise ImportError(
-                "websockets package is required. Install with: pip install websockets"
-            )
-
-        url = f"{self.ws_url}/ws/l2_thousand"
-        async with websockets.connect(url) as ws:
-            await ws.send(json.dumps({"stocks": stocks}))
-            async for message in ws:
-                data = json.loads(message)
-                callback(data)
+        await self._consume_subscription(websockets.connect, "/ws/formula", callback, {
+            "action": "subscribe", "formula_name": formula_name,
+            "stock_code": stock_code, "period": period,
+        })

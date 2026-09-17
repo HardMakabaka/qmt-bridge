@@ -4,10 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType, SimpleNamespace
 
 import pandas as pd
+import pytest
 
-xtquant_stub = ModuleType("xtquant")
-xtquant_stub.xtdata = SimpleNamespace()
-sys.modules.setdefault("xtquant", xtquant_stub)
 
 from qmt_bridge import QMTClient
 from qmt_bridge.server.binary_cache import BinaryCache, reset_binary_cache
@@ -24,7 +22,7 @@ from qmt_bridge.server.routers import (
     sector,
     utility,
 )
-from qmt_bridge.server.trading.manager import XtTraderManager
+from qmt_bridge.server.trading.manager import BigQmtTradingManager
 
 
 def setup_function():
@@ -44,7 +42,7 @@ def test_default_client_and_server_port_is_fixed_13543(monkeypatch):
 
 
 def test_instrument_total_share_reports_missing_xtdata_function(monkeypatch):
-    monkeypatch.setattr(instrument, "xtdata", SimpleNamespace())
+    monkeypatch.setattr(instrument, "market_data", SimpleNamespace())
 
     payload = instrument.get_total_share(stocks="000001.SZ")
 
@@ -57,7 +55,7 @@ def test_instrument_total_share_calls_xtdata_function(monkeypatch):
     def get_total_share(stock):
         return {"stock": stock, "total_share": 123}
 
-    monkeypatch.setattr(instrument, "xtdata", SimpleNamespace(get_total_share=get_total_share))
+    monkeypatch.setattr(instrument, "market_data", SimpleNamespace(get_total_share=get_total_share))
 
     payload = instrument.get_total_share(stocks="000001.SZ")
 
@@ -66,7 +64,7 @@ def test_instrument_total_share_calls_xtdata_function(monkeypatch):
 
 
 def test_fund_iopv_reports_per_symbol_unsupported(monkeypatch):
-    monkeypatch.setattr(etf, "xtdata", SimpleNamespace())
+    monkeypatch.setattr(etf, "market_data", SimpleNamespace())
 
     payload = etf.get_fund_iopv(stocks="510300.SH")
 
@@ -84,7 +82,7 @@ def test_utility_industry_name_invokes_qmt_argument_order(monkeypatch):
 
     monkeypatch.setattr(
         utility,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_industry_name_of_stock=get_industry_name_of_stock),
     )
 
@@ -108,7 +106,7 @@ def test_sector_stocks_preserves_yyyymmdd_real_timetag(monkeypatch):
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_stock_list_in_sector=get_stock_list_in_sector),
     )
 
@@ -135,7 +133,7 @@ def test_sector_stock_memberships_filters_keyword_and_preserves_date(monkeypatch
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(
             get_sector_list=get_sector_list,
             get_stock_list_in_sector=get_stock_list_in_sector,
@@ -167,7 +165,7 @@ def test_sector_stock_memberships_reports_keyword_cache_miss(monkeypatch):
 
     monkeypatch.setattr(
         sector,
-        "xtdata",
+        "market_data",
         SimpleNamespace(
             get_sector_list=get_sector_list,
             get_stock_list_in_sector=get_stock_list_in_sector,
@@ -199,7 +197,7 @@ def test_market_subscribe_warmup_unsubscribes_by_default(monkeypatch):
 
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(subscribe_quote=subscribe_quote, unsubscribe_quote=unsubscribe_quote),
     )
 
@@ -221,7 +219,7 @@ def test_market_unsubscribe_allows_zero_seq_for_live_validation(monkeypatch):
         calls.append(seq)
         return False
 
-    monkeypatch.setattr(market, "xtdata", SimpleNamespace(unsubscribe_quote=unsubscribe_quote))
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(unsubscribe_quote=unsubscribe_quote))
 
     payload = market.unsubscribe_quote({"seq": 0})
 
@@ -244,13 +242,14 @@ def test_market_history_ex_uses_local_binary_cache(monkeypatch, tmp_path):
     reset_binary_cache(
         BinaryCache(enabled=True, cache_dir=tmp_path, ttl_seconds=3600, max_bytes=10_000_000)
     )
-    monkeypatch.setattr(market, "xtdata", SimpleNamespace(get_market_data_ex=get_market_data_ex))
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(get_market_data_ex=get_market_data_ex))
     try:
         first = market.get_history_ex(
             stocks="000001.SZ",
             period="1d",
             start_time="20260623",
             end_time="20260623",
+            count=-1,
             use_cache=True,
         )
         second = market.get_history_ex(
@@ -258,13 +257,16 @@ def test_market_history_ex_uses_local_binary_cache(monkeypatch, tmp_path):
             period="1d",
             start_time="20260623",
             end_time="20260623",
+            count=-1,
             use_cache=True,
         )
     finally:
         reset_binary_cache(None)
 
     assert len(calls) == 1
-    assert first == second
+    assert first["data"] == second["data"]
+    assert first["source"] == "qmt_rpc.1d"
+    assert second["source"] == "qmt_rpc_cache.1d"
     assert first["data"]["000001.SZ"][0]["open"] == 1.0
     assert list(tmp_path.rglob("*.pkl"))
 
@@ -279,7 +281,7 @@ def test_market_history_ex_does_not_cache_empty_history(monkeypatch, tmp_path):
     reset_binary_cache(
         BinaryCache(enabled=True, cache_dir=tmp_path, ttl_seconds=3600, max_bytes=10_000_000)
     )
-    monkeypatch.setattr(market, "xtdata", SimpleNamespace(get_market_data_ex=get_market_data_ex))
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(get_market_data_ex=get_market_data_ex))
     try:
         market.get_history_ex(stocks="000001.SZ", start_time="20260623", end_time="20260623", use_cache=True)
         market.get_history_ex(stocks="000001.SZ", start_time="20260623", end_time="20260623", use_cache=True)
@@ -348,12 +350,12 @@ def test_market_and_download_xtdata_calls_are_serialized(monkeypatch):
 
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_market_data_ex=get_market_data_ex),
     )
     monkeypatch.setattr(
         download,
-        "xtdata",
+        "market_data",
         SimpleNamespace(download_index_weight=download_index_weight),
     )
 
@@ -375,7 +377,9 @@ def test_market_and_download_xtdata_calls_are_serialized(monkeypatch):
             assert not download_call_started.wait(0.1)
         finally:
             release_market_call.set()
-        assert market_result.result(timeout=1) == {"data": {}}
+        market_payload = market_result.result(timeout=1)
+        assert market_payload["data"] == {}
+        assert market_payload["source"] == "qmt_rpc.1d"
         assert download_result.result(timeout=1) == {"status": "ok"}
 
     assert download_call_started.is_set()
@@ -397,12 +401,12 @@ def test_market_and_calendar_xtdata_calls_are_serialized(monkeypatch):
 
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_market_data_ex=get_market_data_ex),
     )
     monkeypatch.setattr(
         calendar,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_trading_dates=get_trading_dates),
     )
 
@@ -430,7 +434,9 @@ def test_market_and_calendar_xtdata_calls_are_serialized(monkeypatch):
             assert not calendar_call_started.wait(0.1)
         finally:
             release_market_call.set()
-        assert market_result.result(timeout=1) == {"data": {}}
+        market_payload = market_result.result(timeout=1)
+        assert market_payload["data"] == {}
+        assert market_payload["source"] == "qmt_rpc.1d"
         assert calendar_result.result(timeout=1) == {
             "market": "SH",
             "dates": [20260721],
@@ -442,7 +448,7 @@ def test_market_and_calendar_xtdata_calls_are_serialized(monkeypatch):
 def test_market_history_ex_reports_none_payload_as_unavailable(monkeypatch):
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_market_data_ex=lambda **_kwargs: None),
     )
 
@@ -467,7 +473,7 @@ def test_market_history_ex_reports_none_payload_as_unavailable(monkeypatch):
 def test_market_local_data_reports_non_mapping_payload_as_error(monkeypatch):
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_local_data=lambda **_kwargs: []),
     )
 
@@ -500,7 +506,7 @@ def test_market_divid_factors_caches_nonempty_dataframe(monkeypatch, tmp_path):
     reset_binary_cache(
         BinaryCache(enabled=True, cache_dir=tmp_path, ttl_seconds=3600, max_bytes=10_000_000)
     )
-    monkeypatch.setattr(market, "xtdata", SimpleNamespace(get_divid_factors=get_divid_factors))
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(get_divid_factors=get_divid_factors))
     try:
         first = market.get_divid_factors(
             stock="000001.SZ",
@@ -526,7 +532,7 @@ def test_option_list_reports_missing_option_sector_data_as_unavailable(monkeypat
     def get_option_list(*_args, **_kwargs):
         raise TypeError("unsupported operand type(s) for +: 'NoneType' and 'str'")
 
-    monkeypatch.setattr(option, "xtdata", SimpleNamespace(get_option_list=get_option_list))
+    monkeypatch.setattr(option, "market_data", SimpleNamespace(get_option_list=get_option_list))
 
     payload = option.get_option_list(undl_code="510050.SH", dedate="202606")
 
@@ -534,10 +540,12 @@ def test_option_list_reports_missing_option_sector_data_as_unavailable(monkeypat
     assert payload["reason"].startswith("qmt_option_sector_data_unavailable:")
 
 
-def test_singleton_does_not_stop_current_wrapper_parent(monkeypatch):
+def test_legacy_singleton_guard_never_stops_other_port_processes(monkeypatch):
     stopped_commands = []
+    scanned = []
 
     def fake_processes(script):
+        scanned.append(script)
         if "ParentProcessId" in script:
             return [
                 {"ProcessId": 11, "ParentProcessId": 10},
@@ -555,62 +563,43 @@ def test_singleton_does_not_stop_current_wrapper_parent(monkeypatch):
         stopped_commands.append(cmd)
         return SimpleNamespace(returncode=0, stderr="")
 
-    monkeypatch.setattr(singleton.os, "getpid", lambda: 11)
-    monkeypatch.setattr(singleton.os, "getppid", lambda: 10)
-    monkeypatch.setattr(singleton, "_powershell_json", fake_processes)
-    monkeypatch.setattr(singleton.subprocess, "run", fake_run)
+    monkeypatch.setattr(singleton, "_powershell_json", fake_processes, raising=False)
+    monkeypatch.setattr(singleton, "subprocess", SimpleNamespace(run=fake_run), raising=False)
 
     stopped = singleton.stop_existing_qmt_servers(port=13543, enabled=True)
 
-    assert [item["pid"] for item in stopped] == [20]
-    assert len(stopped_commands) == 1
-    assert stopped_commands[0][-1] == (
-        "Stop-Process -Id 20 -Force; "
-        "Wait-Process -Id 20 -Timeout 10 -ErrorAction SilentlyContinue"
-    )
+    assert stopped == []
+    assert scanned == []
+    assert stopped_commands == []
 
 
-def test_trader_manager_uses_current_credit_query_names():
+def test_non_destructive_singleton_guard_rejects_an_occupied_port(monkeypatch):
+    class OccupiedSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def bind(self, _address):
+            raise OSError("address already in use")
+
+    monkeypatch.setattr(singleton.socket, "socket", lambda *_args: OccupiedSocket())
+
+    with pytest.raises(singleton.QmtServerPortInUse, match="13543"):
+        singleton.ensure_qmt_server_port_available(port=13543, enabled=True)
+
+
+def test_trader_manager_keeps_unverified_extensions_explicit():
     calls = []
 
     class Trader:
-        def query_stk_compacts(self, account):
-            calls.append(("query_stk_compacts", account))
-            return ["debt"]
+        def query_extension(self, method, params, account_id=""):
+            calls.append((method, params, account_id))
+            return ["rate"]
 
-        def query_credit_slo_code(self, account):
-            calls.append(("query_credit_slo_code", account))
-            return ["slo"]
-
-    manager = XtTraderManager(account_id="acct-1")
+    manager = BigQmtTradingManager(account_id="acct-1")
     manager._trader = Trader()
-    manager._account = "account-object"
 
-    assert manager.query_credit_debt() == ["debt"]
-    assert manager.query_slo_stocks() == ["slo"]
-    assert calls == [
-        ("query_stk_compacts", "account-object"),
-        ("query_credit_slo_code", "account-object"),
-    ]
-
-
-def test_trader_manager_reports_missing_credit_available_as_unsupported():
-    manager = XtTraderManager(account_id="acct-1")
-    manager._trader = SimpleNamespace()
-    manager._account = "account-object"
-
-    payload = manager.query_credit_available(stock_code="000001.SZ")
-
-    assert payload["status"] == "unsupported"
-    assert payload["function"] == "query_credit_available"
-
-
-def test_trader_manager_query_data_requires_result_path():
-    manager = XtTraderManager(account_id="acct-1")
-    manager._trader = SimpleNamespace()
-    manager._account = "account-object"
-
-    payload = manager.query_data(data_type="orders")
-
-    assert payload["status"] == "unsupported"
-    assert payload["reason"] == "xttrader_query_data_requires_result_path"
+    assert manager.query_extension("query_smt_secu_rate", {"stock_code": "600000.SH"}) == ["rate"]
+    assert calls == [("query_smt_secu_rate", {"stock_code": "600000.SH"}, "acct-1")]

@@ -35,6 +35,8 @@ import threading
 import time
 import uuid
 
+from ..telemetry import emit, extract_trace, span
+
 from ..adapters.redis_common import decode_text
 from ..redis_rpc import encode_rpc_request_payload, decode_rpc_request_payload
 from .base import RpcTransport, TransportError, TransportTimeout
@@ -263,6 +265,9 @@ class MysqlTransport(RpcTransport):
         request = dict(request)
         request.setdefault("request_id", uuid.uuid4().hex)
         request_id = str(request["request_id"])
+        trace = extract_trace(request)
+        trace.setdefault("rpc_request_id", request_id)
+        emit("rpc.transport.mysql.send", method=str(request.get("method") or ""), **trace)
         request.setdefault("account_id", self.account_id)
         payload = encode_rpc_request_payload(request)
         conn = self._connect()
@@ -283,32 +288,36 @@ class MysqlTransport(RpcTransport):
                 pass
 
         deadline = time.time() + float(timeout_seconds)
-        while time.time() < deadline:
-            conn = self._connect()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    self._sql("SELECT payload FROM {responses} WHERE request_id = __PH__"),
-                    (request_id,),
-                )
-                row = cur.fetchone()
-                if row:
-                    payload = row[0]
+        with span("rpc.transport.mysql.roundtrip", rpc_request_id=request_id,
+                  method=str(request.get("method") or "")) as observed:
+            while time.time() < deadline:
+                conn = self._connect()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        self._sql("SELECT payload FROM {responses} WHERE request_id = __PH__"),
+                        (request_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        payload = row[0]
+                        try:
+                            cur.execute(
+                                self._sql("DELETE FROM {responses} WHERE request_id = __PH__"),
+                                (request_id,),
+                            )
+                            conn.commit()
+                        except Exception:
+                            pass
+                        response = _loads(payload)
+                        observed["outcome"] = "success" if response.get("ok") else "rejected"
+                        return response
+                finally:
                     try:
-                        cur.execute(
-                            self._sql("DELETE FROM {responses} WHERE request_id = __PH__"),
-                            (request_id,),
-                        )
-                        conn.commit()
+                        conn.close()
                     except Exception:
                         pass
-                    return _loads(payload)
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            time.sleep(self.poll_interval_seconds)
+                time.sleep(self.poll_interval_seconds)
         raise TransportTimeout("mysql rpc timeout: %s" % request.get("method"))
 
     # -- server side ------------------------------------------------------

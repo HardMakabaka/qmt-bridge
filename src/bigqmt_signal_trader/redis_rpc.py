@@ -19,9 +19,10 @@ import uuid
 from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
 from .models import AccountSnapshot, OrderRef, OrderRequest
+from .telemetry import bind_context, emit, extract_trace, span
 
 
-RPC_REVISION = "20260811-zmq-events-v2"
+RPC_REVISION = "20260812-order-reconcile-v3"
 
 
 READ_METHODS = {
@@ -31,6 +32,7 @@ READ_METHODS = {
     "get_instrument_type",
     "get_market_data",
     "get_market_data_ex",
+    "get_market_data_ex_scoped",
     "get_local_data",
     "get_stock_list_in_sector",
     "get_sector_list",
@@ -65,7 +67,9 @@ READ_METHODS = {
     "query_position_statistics",
     "get_event_cursor",
     "get_events_since",
-    "query_stock_position",
+    "subscribe_quote",
+    "unsubscribe_quote",
+    "get_position",
     "sync_positions",
     # 账户 / 融资融券 / 交易扩展查询（官方全局函数 + detail types）
     "query_account_infos",
@@ -111,7 +115,7 @@ LISTENER_DEFERRED_METHODS = {
     # data. Asset queries use the same QMT detail API and must follow this rule.
     "get_asset",
     "get_positions",
-    "query_stock_position",
+    "get_position",
     "query_position_statistics",
     "query_orders",
     "query_trades",
@@ -149,14 +153,6 @@ METHOD_ALIASES = {
     "get_instrument_detail": "get_instrument",
     "get_instrumentdetail": "get_instrument",
     "getDividFactors": "get_divid_factors",
-    "query_stock_asset": "get_asset",
-    "query_stock_positions": "get_positions",
-    "query_stock_orders": "query_orders",
-    "query_stock_trades": "query_trades",
-    "order_stock": "submit_order",
-    "order_stock_batch": "submit_orders_batch",
-    "cancel_order_stock": "cancel_order",
-    "cancel_order_stock_sysid": "cancel_order",
 }
 
 BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
@@ -169,6 +165,7 @@ MARKET_DATA_METHODS = {
     "get_instrument_type",
     "get_market_data",
     "get_market_data_ex",
+    "get_market_data_ex_scoped",
     "get_local_data",
     "get_stock_list_in_sector",
     "get_sector_list",
@@ -364,16 +361,36 @@ class BigQmtRpcHandlers:
         # 融资融券查询等)。由 strategy._build_config 解析注入。
         self.qmt_api = dict(qmt_api or {})
         self._submit_journal = {}
-        # Server-side diagnostic for silent failures (e.g. passorder submitted
-        # but order not found in system). Surfaced to client via server_error.
-        self._last_server_error = ""
+        # A handler instance can be used by the listener and the strategy
+        # thread concurrently.  Diagnostics therefore belong to a request,
+        # not to the shared handler instance.
+        self._request_local = threading.local()
         if allowed_methods is None:
             allowed = set(READ_METHODS)
             if self.allow_order_methods:
                 allowed.update(ORDER_METHODS)
-            self.allowed_methods = allowed
         else:
-            self.allowed_methods = {str(method) for method in allowed_methods}
+            allowed = {str(method) for method in allowed_methods}
+        # Full Big QMT has only the runtime-injected, single-symbol global
+        # downloader. Advertise it only when that callable was captured;
+        # never advertise MiniQMT's batch download_history_data2 contract.
+        allowed.discard("download_history_data2")
+        if not bool(
+            getattr(market_data, "native_history_download_available", False)
+        ):
+            allowed.discard("download_history_data")
+        self.allowed_methods = allowed
+
+    @property
+    def _last_server_error(self):
+        return getattr(self._request_local, "server_error", "")
+
+    @_last_server_error.setter
+    def _last_server_error(self, value):
+        self._request_local.server_error = str(value or "")
+
+    def clear_server_error(self):
+        self._last_server_error = ""
 
     def _request_account_id(self, params):
         params = params or {}
@@ -411,6 +428,14 @@ class BigQmtRpcHandlers:
             "account_id": self.account_id,
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
+            "native_history_download_available": bool(
+                "download_history_data" in self.allowed_methods
+                and getattr(
+                    self.market_data,
+                    "native_history_download_available",
+                    False,
+                )
+            ),
             "server_time": _dt.datetime.now(),
         }
 
@@ -440,7 +465,7 @@ class BigQmtRpcHandlers:
     def _handle_get_positions(self, params):
         return self.position_provider.get_positions(self._request_account_id(params))
 
-    def _handle_query_stock_position(self, params):
+    def _handle_get_position(self, params):
         stock_code = str(params.get("stock_code") or params.get("code") or "").strip()
         if not stock_code:
             raise ValueError("stock_code is required")
@@ -513,6 +538,22 @@ class BigQmtRpcHandlers:
         from .exec_events import get_events_since
 
         return get_events_since(params.get("cursor"))
+
+    def _handle_subscribe_quote(self, params):
+        stock_code = str(params.get("stock_code") or "").strip()
+        if not stock_code:
+            raise ValueError("stock_code is required")
+        period = str(params.get("period") or "tick")
+        seq = self.market_data.subscribe_quote(stock_code, period=period)
+        if int(seq or 0) <= 0:
+            raise RuntimeError("native quote subscription unavailable")
+        return int(seq)
+
+    def _handle_unsubscribe_quote(self, params):
+        seq = int(params.get("seq") or 0)
+        if seq <= 0:
+            raise ValueError("positive seq is required")
+        return self.market_data.unsubscribe_quote(seq)
 
     def _handle_sync_positions(self, params):
         account_id = self._request_account_id(params)
@@ -621,14 +662,20 @@ class BigQmtRpcHandlers:
             raise ValueError("operation is required")
         if not data_type:
             raise ValueError("data_type is required")
-        return self._call_qmt_global(
-            "sync_transaction_from_external",
-            operation,
-            data_type,
-            account_id,
-            account_type,
-            data_list,
-        )
+        audit = {"critical": True, "account_id": account_id, "operation": operation,
+                 "data_type": data_type, "item_count": len(data_list)}
+        emit("rpc.trade.external_sync.begin", outcome="started", **audit)
+        try:
+            result = self._call_qmt_global(
+                "sync_transaction_from_external", operation, data_type, account_id,
+                account_type, data_list,
+            )
+        except Exception as exc:
+            emit("rpc.trade.external_sync.return", outcome="unknown", error_type=type(exc).__name__, **audit)
+            raise
+        # Synchronization is not a fill and must never be reported as one.
+        emit("rpc.trade.external_sync.return", outcome="success", filled=False, **audit)
+        return result
 
     # 官方交易查询函数（直接暴露）
     def _handle_get_value_by_order_id(self, params):
@@ -695,8 +742,127 @@ class BigQmtRpcHandlers:
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
         price = params.get("price")
-        request = OrderRequest(
-            signal_id=str(params.get("signal_id") or "rpc-%s" % uuid.uuid4().hex),
+        signal_id = str(params.get("signal_id") or "rpc-%s" % uuid.uuid4().hex)
+        request = self._build_order_request(params, signal_id)
+        audit = {"critical": True, "account_id": request.account_id,
+                 "client_submit_id": request.remark, "stock_code": request.stock_code,
+                 "action": request.action, "volume": request.volume, "price": request.price,
+                 "strategy_name": request.strategy_name}
+        emit("rpc.trade.submit.gate", outcome="started", **audit)
+        if request.action not in ("BUY", "SELL"):
+            emit("rpc.trade.submit.gate", outcome="rejected", reason="invalid_action", **audit)
+            raise ValueError("action must be BUY or SELL")
+        if not request.stock_code:
+            emit("rpc.trade.submit.gate", outcome="rejected", reason="stock_code_required", **audit)
+            raise ValueError("stock_code is required")
+        if request.volume <= 0:
+            emit("rpc.trade.submit.gate", outcome="rejected", reason="positive_volume_required", **audit)
+            raise ValueError("volume must be positive")
+
+        journal_key = (request.account_id, request.remark)
+        journal = self._submit_journal.get(journal_key)
+        if journal is not None:
+            try:
+                self._validate_journal_request(request, journal)
+            except Exception as exc:
+                emit("rpc.trade.submit.identity_conflict", outcome="rejected",
+                     error_type=type(exc).__name__, **audit)
+                raise
+        if journal is not None and journal.get("order_sys_id"):
+            emit("rpc.trade.submit.journal", order_sys_id=journal.get("order_sys_id"),
+                 outcome="success", **audit)
+            return self._known_submit_result(
+                request.remark,
+                journal.get("order_sys_id"),
+                "IDEMPOTENT",
+            )
+
+        lookup_required = _bool_value(params.get("require_idempotency_check"), False)
+        try:
+            emit("rpc.trade.submit.strict_precheck", outcome="started", **audit)
+            known = self._find_order_by_identity(request)
+        except Exception as exc:
+            emit("rpc.trade.submit.strict_precheck", outcome="unknown", error_type=type(exc).__name__, **audit)
+            if lookup_required:
+                raise RuntimeError("IDEMPOTENCY_CHECK_UNAVAILABLE")
+            known = None
+        if known is not None:
+            try:
+                self._validate_known_order(request, known)
+            except Exception as exc:
+                emit("rpc.trade.submit.identity_conflict", outcome="rejected",
+                     error_type=type(exc).__name__, **audit)
+                raise
+            if journal is not None:
+                journal["order_sys_id"] = str(
+                    getattr(known, "order_sys_id", "") or ""
+                )
+            emit("rpc.trade.submit.strict_reconcile", order_sys_id=getattr(known, "order_sys_id", None),
+                 outcome="success", **audit)
+            return self._known_submit_result(
+                request.remark,
+                getattr(known, "order_sys_id", None),
+                "IDEMPOTENT",
+            )
+
+        if journal is None:
+            emit("rpc.trade.submit.native_begin", outcome="started", **audit)
+            try:
+                with span("rpc.trade.submit.native", **audit) as trace:
+                    result = self.order_gateway.submit(request)
+                    trace["outcome"] = "success"
+            except Exception as exc:
+                emit("rpc.trade.submit.native_return", outcome="unknown", error_type=type(exc).__name__, **audit)
+                raise
+            emit("rpc.trade.submit.native_return", order_sys_id=getattr(result, "order_sys_id", None),
+                 outcome="success", **audit)
+            self._submit_journal[journal_key] = {
+                "order_sys_id": str(getattr(result, "order_sys_id", "") or ""),
+                "stock_code": normalize_stock_code(request.stock_code),
+                "action": request.action,
+                "volume": request.volume,
+                "price": request.price,
+                "price_type": str(request.price_type),
+                "strategy_name": request.strategy_name,
+            }
+        else:
+            result = self._known_submit_result(
+                request.remark,
+                None,
+                "SUBMITTED_UNCONFIRMED",
+            )
+        self._last_server_error = ""
+        for delay_seconds in (0, 0.25, 0.5):
+            if delay_seconds:
+                time.sleep(delay_seconds)
+            try:
+                known = self._find_order_by_identity(request)
+            except Exception:
+                continue
+            if known is not None:
+                self._validate_known_order(request, known)
+                result.order_sys_id = str(getattr(known, "order_sys_id", "") or "") or None
+                result.status = "CONFIRMED"
+                result.message = "broker order reconciled by user_order_id"
+                self._submit_journal[journal_key]["order_sys_id"] = result.order_sys_id or ""
+                emit("rpc.trade.submit.strict_reconcile", order_sys_id=result.order_sys_id,
+                     outcome="success", **audit)
+                return result
+        result.status = "SUBMITTED_UNCONFIRMED"
+        self._last_server_error = (
+            "passorder submitted but exact user_order_id was not found "
+            "(user_order_id=%s)" % request.remark
+        )
+        emit("rpc.trade.submit.receipt", outcome="unknown", **audit)
+        return result
+
+    def _build_order_request(self, params, signal_id=None):
+        """Build the one canonical order identity used by all submit paths."""
+        params = params or {}
+        price = params.get("price")
+        signal_id = str(signal_id or params.get("signal_id") or "rpc-%s" % uuid.uuid4().hex)
+        return OrderRequest(
+            signal_id=signal_id,
             account_id=self._request_account_id(params),
             action=self._order_action_from_params(params),
             stock_code=str(params.get("stock_code") or ""),
@@ -704,39 +870,83 @@ class BigQmtRpcHandlers:
             price=float(price if price not in (None, "") else 0),
             price_type=params.get("price_type") or "LIMIT",
             strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
-            remark=str(params.get("remark") or params.get("order_remark") or "redis_rpc"),
+            remark=str(params.get("remark") or params.get("order_remark") or signal_id),
         )
-        if request.action not in ("BUY", "SELL"):
-            raise ValueError("action must be BUY or SELL")
-        if not request.stock_code:
-            raise ValueError("stock_code is required")
-        if request.volume <= 0:
-            raise ValueError("volume must be positive")
 
-        result = self.order_gateway.submit(request)
+    def _find_order_by_identity(self, request):
+        identity_query = getattr(
+            self.order_gateway,
+            "query_submission_identities_strict",
+            None,
+        )
+        trades = []
+        if callable(identity_query):
+            try:
+                orders, _trades = identity_query(request.account_id, "")
+                trades = _trades or []
+            except Exception:
+                query = getattr(self.order_gateway, "query_orders_strict", None)
+                if not callable(query):
+                    raise
+                orders = query(request.account_id, "")
+        else:
+            query = getattr(self.order_gateway, "query_orders_strict", None)
+            if callable(query):
+                orders = query(request.account_id, "")
+            else:
+                orders = self.order_gateway.query_orders(request.account_id, "")
+        for order in list(orders or []) + list(trades):
+            identity = str(
+                getattr(order, "user_order_id", "")
+                or getattr(order, "remark", "")
+                or ""
+            )
+            if identity == request.remark:
+                return order
+        return None
 
-        # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
-        # 系统时（静默失败），记录 server_error 让客户端知道。
-        self._last_server_error = ""
-        try:
-            import time as _time
-            _time.sleep(0.5)  # 给 QMT 处理委托的时间
-            orders = self.order_gateway.query_orders(request.account_id, "")
-            if not any(
-                str(o.get("stock_code") or "").upper() == request.stock_code.upper()
-                and str(o.get("action") or "").upper() == request.action.upper()
-                for o in (orders or [])
-            ):
-                self._last_server_error = (
-                    "passorder submitted but order not found in system "
-                    "(stock=%s action=%s price=%.2f volume=%d). "
-                    "QMT may have silently rejected it (check price range / permissions)."
-                    % (request.stock_code, request.action, request.price, request.volume)
-                )
-        except Exception:
-            # 校验失败不影响主流程（委托已提交）
-            pass
-        return result
+    def _validate_known_order(self, request, order):
+        known_code = normalize_stock_code(getattr(order, "stock_code", ""))
+        request_code = normalize_stock_code(request.stock_code)
+        known_action = str(getattr(order, "action", "") or "").upper()
+        known_volume = int(getattr(order, "volume", 0) or 0)
+        known_price = float(getattr(order, "price", 0) or 0)
+        known_strategy = str(getattr(order, "strategy_name", "") or "")
+        is_order_snapshot = hasattr(order, "status")
+        if (
+            known_code != request_code
+            or known_action != request.action
+            or (is_order_snapshot and known_volume != request.volume)
+            or (
+                is_order_snapshot
+                and known_price > 0
+                and request.price > 0
+                and abs(known_price - request.price) > 0.00000001
+            )
+            or (known_strategy and known_strategy != request.strategy_name)
+        ):
+            raise ValueError("CLIENT_SUBMIT_ID_CONFLICT")
+
+    def _validate_journal_request(self, request, journal):
+        if (
+            journal.get("stock_code") != normalize_stock_code(request.stock_code)
+            or journal.get("action") != request.action
+            or journal.get("volume") != request.volume
+            or abs(float(journal.get("price") or 0) - request.price) > 0.00000001
+            or journal.get("price_type") != str(request.price_type)
+            or journal.get("strategy_name") != request.strategy_name
+        ):
+            raise ValueError("CLIENT_SUBMIT_ID_CONFLICT")
+
+    def _known_submit_result(self, user_order_id, order_sys_id, status):
+        from .models import OrderSubmitResult
+
+        return OrderSubmitResult(
+            status=status,
+            user_order_id=user_order_id,
+            order_sys_id=str(order_sys_id or "") or None,
+            message="existing broker order reconciled by user_order_id",
+        )
 
     def _handle_submit_orders_batch(self, params):
         orders = params.get("orders") or []
@@ -751,34 +961,16 @@ class BigQmtRpcHandlers:
             or (orders[0] or {}).get("strategy_name")
             or "bigqmt_rpc"
         )
-        existing_by_tag = {}
-        lookup_ok = True
-        requires_lookup = any(bool((item or {}).get("require_idempotency_check")) for item in orders)
-        if requires_lookup:
-            try:
-                identity_query = getattr(self.order_gateway, "query_submission_identities_strict", None)
-                if callable(identity_query):
-                    existing, trades = identity_query(account_id, strategy_name)
-                else:
-                    query = getattr(self.order_gateway, "query_orders_strict", None)
-                    existing = query(account_id, strategy_name) if callable(query) else self.order_gateway.query_orders(account_id, strategy_name)
-                    trades = []
-                existing_by_tag = {
-                    str(getattr(order, "user_order_id", "") or ""): order
-                    for order in existing or []
-                    if str(getattr(order, "user_order_id", "") or "")
-                }
-                for trade in trades or []:
-                    tag = str(getattr(trade, "user_order_id", "") or "")
-                    if tag and tag not in existing_by_tag:
-                        existing_by_tag[tag] = trade
-            except Exception:
-                lookup_ok = False
+        emit("rpc.trade.batch.begin", critical=True, account_id=account_id, batch_id=batch_id,
+             item_count=len(orders), outcome="started")
         results = []
+        item_outcomes = []
         for index, item in enumerate(orders):
             item = dict(item or {})
             order_tag = str(item.get("order_remark") or item.get("remark") or item.get("signal_id") or "")
             if not order_tag:
+                emit("rpc.trade.batch_item", critical=True, account_id=account_id, batch_id=batch_id,
+                     item_index=index, outcome="rejected", reason="ORDER_TAG_REQUIRED")
                 results.append({
                     "index": index,
                     "batch_id": batch_id,
@@ -789,36 +981,28 @@ class BigQmtRpcHandlers:
                     "error": "ORDER_TAG_REQUIRED",
                     "user_order_id": "",
                 })
-                continue
-            known = existing_by_tag.get(order_tag)
-            journal_key = (account_id, strategy_name, order_tag)
-            journal = self._submit_journal.get(journal_key)
-            if known is not None or journal is not None:
-                results.append({
-                    "index": index,
-                    "batch_id": batch_id,
-                    "success": True,
-                    "accepted": True,
-                    "confirmed": known is not None,
-                    "idempotent": True,
-                    "code": 0,
-                    "order_sys_id": str(getattr(known, "order_sys_id", "") or (journal or {}).get("order_sys_id") or ""),
-                    "user_order_id": order_tag,
-                })
-                continue
-            if bool(item.get("require_idempotency_check")) and not lookup_ok:
-                results.append({
-                    "index": index,
-                    "batch_id": batch_id,
-                    "success": False,
-                    "accepted": False,
-                    "explicit_failure": False,
-                    "code": -2,
-                    "error": "IDEMPOTENCY_CHECK_UNAVAILABLE",
-                    "user_order_id": order_tag,
-                })
+                item_outcomes.append("rejected")
                 continue
             try:
+                item_account = item.get("account_id") or item.get("account")
+                if isinstance(item_account, dict):
+                    item_account = (
+                        item_account.get("account_id")
+                        or item_account.get("accountID")
+                        or item_account.get("id")
+                    )
+                if item_account and str(item_account) != account_id:
+                    raise ValueError("BATCH_ACCOUNT_ID_CONFLICT")
+                item_strategy = item.get("strategy_name")
+                if item_strategy and str(item_strategy) != strategy_name:
+                    raise ValueError("BATCH_STRATEGY_NAME_CONFLICT")
+                # Feed every batch item through the single-submit identity
+                # gate.  Do not replace its detailed journal with a shallow
+                # batch receipt: retries must compare stock/action/volume/
+                # price/strategy before being considered idempotent.
+                item["account_id"] = account_id
+                item["strategy_name"] = strategy_name
+                item["remark"] = order_tag
                 result = self._handle_submit_order(item)
                 response = {
                     "index": index,
@@ -826,15 +1010,27 @@ class BigQmtRpcHandlers:
                     "success": True,
                     "accepted": True,
                     "confirmed": False,
-                    "idempotent": False,
+                    "idempotent": str(getattr(result, "status", "")) == "IDEMPOTENT",
                     "code": 0,
                     "order_sys_id": str(getattr(result, "order_sys_id", None) or ""),
                     "user_order_id": str(getattr(result, "user_order_id", None) or ""),
                 }
-                if order_tag:
-                    self._submit_journal[journal_key] = dict(response)
                 results.append(response)
+                result_status = str(getattr(result, "status", "")).upper()
+                if result_status in ("IDEMPOTENT", "CONFIRMED"):
+                    item_outcome = "success"
+                elif result_status in ("SUBMITTED_UNCONFIRMED", "SUBMIT_UNKNOWN", "UNKNOWN"):
+                    item_outcome = "unknown"
+                else:
+                    item_outcome = "unknown"
+                item_outcomes.append(item_outcome)
+                emit("rpc.trade.batch_item", critical=True, account_id=account_id, batch_id=batch_id,
+                     item_index=index, client_submit_id=order_tag, order_sys_id=response["order_sys_id"],
+                     outcome=item_outcome, status=result_status)
             except Exception as exc:
+                emit("rpc.trade.batch_item", critical=True, account_id=account_id, batch_id=batch_id,
+                     item_index=index, client_submit_id=order_tag, outcome="rejected",
+                     error_type=type(exc).__name__)
                 results.append({
                     "index": index,
                     "batch_id": batch_id,
@@ -845,6 +1041,17 @@ class BigQmtRpcHandlers:
                     "error": "%s: %s" % (exc.__class__.__name__, exc),
                     "user_order_id": order_tag,
                 })
+                item_outcomes.append("rejected")
+        if item_outcomes and all(value == "success" for value in item_outcomes):
+            batch_outcome = "success"
+        elif item_outcomes and all(value == "rejected" for value in item_outcomes):
+            batch_outcome = "rejected"
+        elif item_outcomes and all(value == "unknown" for value in item_outcomes):
+            batch_outcome = "unknown"
+        else:
+            batch_outcome = "partial"
+        emit("rpc.trade.batch.return", critical=True, account_id=account_id, batch_id=batch_id,
+             item_count=len(results), outcome=batch_outcome)
         return results
 
     def _handle_cancel_order(self, params):
@@ -853,9 +1060,45 @@ class BigQmtRpcHandlers:
         order_sys_id = str(params.get("order_sys_id") or params.get("order_sysid") or params.get("order_id") or "")
         if not order_sys_id:
             raise ValueError("order_sys_id or order_id is required")
-        return self.order_gateway.cancel(
-            OrderRef(order_sys_id=order_sys_id, user_order_id=str(params.get("user_order_id") or ""))
-        )
+        audit = {"critical": True, "account_id": self._request_account_id(params),
+                 "order_sys_id": order_sys_id,
+                 "client_submit_id": str(params.get("user_order_id") or "")}
+        emit("rpc.trade.cancel.precheck", outcome="started", **audit)
+        query = getattr(self.order_gateway, "query_orders_strict", None)
+        if callable(query):
+            try:
+                orders = query(self._request_account_id(params), "")
+                for order in orders or []:
+                    known_id = str(getattr(order, "order_sys_id", "") or "")
+                    known_status = str(getattr(order, "status", "") or "")
+                    if known_id == order_sys_id and known_status in {"51", "52", "53", "54"}:
+                        from .models import CancelResult
+
+                        emit("rpc.trade.cancel.terminal", outcome="success", order_status=known_status, **audit)
+                        return CancelResult(
+                            success=True,
+                            message="order already cancel-acknowledged",
+                        )
+                    if known_id == order_sys_id and known_status in {"56", "57"}:
+                        from .models import CancelResult
+
+                        emit("rpc.trade.cancel.terminal", outcome="rejected", order_status=known_status, **audit)
+                        return CancelResult(
+                            success=False,
+                            message="order is terminal and not cancelable: %s" % known_status,
+                        )
+            except Exception:
+                pass
+        emit("rpc.trade.cancel.native_begin", outcome="started", **audit)
+        try:
+            result = self.order_gateway.cancel(
+                OrderRef(order_sys_id=order_sys_id, user_order_id=str(params.get("user_order_id") or ""))
+            )
+        except Exception as exc:
+            emit("rpc.trade.cancel.native_return", outcome="unknown", error_type=type(exc).__name__, **audit)
+            raise
+        emit("rpc.trade.cancel.native_return", outcome="success" if getattr(result, "success", False) else "rejected", **audit)
+        return result
 
 
 def _bool_value(value, default=False):
@@ -1091,7 +1334,12 @@ class RedisPubSubRpcService:
 
     def enqueue_payload(self, raw_payload):
         payload = self._loads(raw_payload)
+        trace = extract_trace(payload)
+        trace.setdefault("rpc_request_id", str(payload.get("request_id") or ""))
+        emit("rpc.server.received", method=str(payload.get("method") or ""), source="listener",
+             queue_depth=self.pending.qsize(), **trace)
         if self._should_process_in_listener(payload):
+            emit("rpc.server.inline", method=str(payload.get("method") or ""), **trace)
             self.process_request(payload)
             return
         self._deferred_count += 1
@@ -1100,7 +1348,18 @@ class RedisPubSubRpcService:
                 "%s deferred method=%s pending_before=%s"
                 % (self.print_prefix, payload.get("method"), self.pending.qsize())
             )
-        self.pending.put_nowait(payload)
+        try:
+            self.pending.put_nowait(payload)
+            emit("rpc.server.queued", method=str(payload.get("method") or ""),
+                 queue_depth=self.pending.qsize(), **trace)
+        except queue.Full:
+            # The request was never accepted.  Reply immediately instead of
+            # letting the caller mistake an overload for an ambiguous timeout.
+            self._publish_response(payload, self._terminal_response(
+                payload, "OVERLOADED", "deferred request queue is full"
+            ))
+            emit("rpc.server.rejected", critical=True,
+                 method=str(payload.get("method") or ""), outcome="overloaded", **trace)
 
     def _should_process_in_listener(self, payload):
         if not self.process_in_listener:
@@ -1170,6 +1429,16 @@ class RedisPubSubRpcService:
         request_id = str(request.get("request_id") or request.get("id") or uuid.uuid4().hex)
         account_id = str(request.get("account_id") or self.account_id or "")
         method = str(request.get("method") or "")
+        trace = extract_trace(request)
+        trace.setdefault("rpc_request_id", request_id)
+        if self._request_expired(request):
+            response = self._terminal_response(
+                request, "DEADLINE_EXCEEDED", "request deadline elapsed before execution"
+            )
+            self._publish_response(request, response)
+            emit("rpc.server.rejected", critical=True, method=method,
+                 outcome="timeout", **trace)
+            return response
         response = {
             "schema_version": 1,
             "request_id": request_id,
@@ -1186,24 +1455,85 @@ class RedisPubSubRpcService:
             "server_error": "",
             "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        try:
-            if self.account_id and account_id and account_id != self.account_id:
-                raise PermissionError("account_id mismatch")
-            result = self.handlers.handle(method, request.get("params") or {})
-            response["data"] = to_jsonable(result)
-            response["ok"] = True
-            # Surface server-side diagnostics when the handler recorded one.
-            server_error = getattr(self.handlers, "_last_server_error", None)
-            if server_error:
-                response["server_error"] = str(server_error)
-        except Exception as exc:
-            response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
-            response["error_type"] = exc.__class__.__name__
+        with bind_context(**trace):
+            try:
+                with span("rpc.server.handler", method=method,
+                          rpc_request_id=request_id) as observed:
+                    if self.account_id and account_id and account_id != self.account_id:
+                        raise PermissionError("account_id mismatch")
+                    clear_error = getattr(self.handlers, "clear_server_error", None)
+                    if callable(clear_error):
+                        clear_error()
+                    result = self.handlers.handle(method, request.get("params") or {})
+                    response["data"] = to_jsonable(result)
+                    response["ok"] = True
+                    observed["outcome"] = "success"
+                    # Surface server-side diagnostics when the handler recorded one.
+                    server_error = getattr(self.handlers, "_last_server_error", None)
+                    if server_error:
+                        response["server_error"] = str(server_error)
+            except Exception as exc:
+                response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+                response["error_type"] = exc.__class__.__name__
         self._publish_response(request, response)
+        emit("rpc.server.response", critical=True, method=method,
+             outcome=self._response_outcome(response), **trace)
         self._processed_count += 1
         if self._processed_count <= self.debug_log_limit:
             print("%s responded method=%s ok=%s" % (self.print_prefix, method, response["ok"]))
         return response
+
+    @staticmethod
+    def _response_outcome(response):
+        """Classify evidence, not whether a handler merely raised.
+
+        A generic RuntimeError may follow a native submission or a strict
+        reconciliation check, so it must remain ``unknown`` rather than being
+        misreported as a pre-execution rejection.
+        """
+        if response.get("ok"):
+            return "success"
+        error_type = str(response.get("error_type") or "")
+        status = str(response.get("status") or "")
+        if error_type in ("NotImplementedError", "AttributeError"):
+            return "unsupported"
+        if error_type in ("TimeoutError", "TransportTimeout") or status == "DEADLINE_EXCEEDED":
+            return "timeout"
+        if error_type in ("PermissionError", "ValueError", "TypeError"):
+            return "rejected"
+        if status == "OVERLOADED":
+            return "overloaded"
+        return "unknown"
+
+    @staticmethod
+    def _request_expired(request):
+        """Return true only for a valid absolute client deadline.
+
+        ``deadline_epoch_ms`` is additive to the existing wire envelope.  It
+        lets a deferred request spend the caller's budget while queued, not
+        just while the native call is running.
+        """
+        try:
+            deadline_ms = float((request or {}).get("deadline_epoch_ms"))
+        except (TypeError, ValueError):
+            return False
+        return deadline_ms > 0 and time.time() * 1000.0 >= deadline_ms
+
+    def _terminal_response(self, request, error_type, message):
+        request = request or {}
+        return {
+            "schema_version": 1,
+            "request_id": str(request.get("request_id") or request.get("id") or uuid.uuid4().hex),
+            "account_id": str(request.get("account_id") or self.account_id or ""),
+            "method": str(request.get("method") or ""),
+            "ok": False,
+            "data": None,
+            "error": str(message),
+            "error_type": str(error_type),
+            "status": str(error_type),
+            "server_error": "",
+            "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
     def _format_response_target(self, template, account_id, request_id):
         if not template:
@@ -1287,10 +1617,12 @@ def call_redis_rpc(
     timeout_seconds=3.0,
     ttl_seconds=60,
     transport="queue",
+    request_id=None,
+    trace=None,
 ):
     """Small external client helper for tests and admin scripts."""
 
-    request_id = uuid.uuid4().hex
+    request_id = str(request_id or uuid.uuid4().hex)
     request_channel = request_channel_template.format(account_id=account_id)
     request_queue = request_queue_template.format(account_id=account_id)
     response_channel = response_channel_template.format(account_id=account_id, request_id=request_id)
@@ -1306,7 +1638,13 @@ def call_redis_rpc(
         "reply_list": response_list,
         "reply_key": response_key,
         "ttl_seconds": ttl_seconds,
+        # Absolute wall deadline is required because service and caller do
+        # not share a monotonic clock.  It is intentionally additive for
+        # older servers that ignore it.
+        "deadline_epoch_ms": int((time.time() + float(timeout_seconds)) * 1000),
     }
+    if isinstance(trace, dict):
+        request["trace"] = dict(trace)
     payload = encode_rpc_request_payload(request)
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):
         redis_client.rpush(request_queue, payload)

@@ -11,9 +11,6 @@ from fastapi.testclient import TestClient
 import pandas as pd
 
 
-xtquant_stub = ModuleType("xtquant")
-xtquant_stub.xtdata = SimpleNamespace()
-sys.modules.setdefault("xtquant", xtquant_stub)
 
 
 def _expected_times() -> tuple[int, ...]:
@@ -116,6 +113,60 @@ def test_read_complete_qmt_local_dat_day(tmp_path: Path) -> None:
     }
 
 
+def test_read_complete_qmt_local_dat_day_with_intraday_bounds(
+    tmp_path: Path,
+) -> None:
+    from qmt_bridge.server.qmt_local_dat import read_qmt_local_dat_1m
+
+    _write_day(tmp_path, "600000.SH", _expected_times())
+
+    frames = read_qmt_local_dat_1m(
+        tmp_path,
+        ("600000.SH",),
+        start_time="20260210093000",
+        end_time="20260210160000",
+        count=-1,
+    )
+
+    frame = frames["600000.SH"]
+    assert len(frame) == 241
+    assert frame.index[0] == "20260210093000"
+    assert frame.index[-1] == "20260210150000"
+
+
+def test_history_ex_uses_complete_local_day_for_post_close_bound(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from qmt_bridge.server.routers import market
+
+    _write_day(tmp_path, "600000.SH", _expected_times())
+    monkeypatch.setenv("QMT_BRIDGE_LOCAL_DAT_ROOT", str(tmp_path))
+
+    def unexpected_xtdata_call(*_args, **_kwargs):
+        raise AssertionError("a complete local day must not call xtdata")
+
+    monkeypatch.setattr(
+        market,
+        "market_data",
+        SimpleNamespace(get_market_data_ex=unexpected_xtdata_call),
+    )
+
+    app = FastAPI()
+    app.include_router(market.router)
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/market/history_ex?stocks=600000.SH&period=1m"
+            "&start_time=20260210093000&end_time=20260210160000"
+            "&dividend_type=none"
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "qmt_local_dat.1m"
+    assert len(payload["data"]["600000.SH"]) == 241
+
+
 def test_incomplete_qmt_local_dat_day_is_not_returned(tmp_path: Path) -> None:
     from qmt_bridge.server.qmt_local_dat import read_qmt_local_dat_1m
 
@@ -167,7 +218,7 @@ def test_history_ex_prefers_configured_local_dat(
 
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_market_data_ex=unexpected_xtdata_call),
     )
 
@@ -214,7 +265,7 @@ def test_history_ex_falls_back_to_bigqmt_when_local_dat_has_no_requested_rows(
 
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_market_data_ex=get_market_data_ex),
     )
 
@@ -238,6 +289,62 @@ def test_history_ex_falls_back_to_bigqmt_when_local_dat_has_no_requested_rows(
     assert "index" not in payload["data"]["000001.SZ"][0]
 
 
+def test_history_ex_open_ended_request_never_treats_dat_as_latest(monkeypatch, tmp_path):
+    """A non-empty old DAT file is historical storage, not a live snapshot."""
+    from qmt_bridge.server.routers import market
+
+    monkeypatch.setenv("QMT_BRIDGE_LOCAL_DAT_ROOT", str(tmp_path))
+    calls = []
+    stale = pd.DataFrame({"close": [1.0]}, index=["20240102150000"])
+    live = pd.DataFrame({"stime": ["20260917150000"], "close": [2.0]})
+    monkeypatch.setattr(market, "read_qmt_local_dat_1m", lambda *_a, **_kw: {"000001.SZ": stale})
+
+    def rpc(**kwargs):
+        calls.append(kwargs)
+        return {"000001.SZ": live}
+
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(get_market_data_ex=rpc))
+    monkeypatch.setattr(market, "_call_xtdata_serialized", lambda fn, **kwargs: fn(**kwargs))
+    app = FastAPI()
+    app.include_router(market.router)
+    with TestClient(app) as client:
+        payload = client.get("/api/market/history_ex?stocks=000001.SZ&period=1m").json()
+
+    assert len(calls) == 1
+    assert payload["source_by_stock"] == {"000001.SZ": "qmt_rpc_fallback.1m"}
+    assert payload["coverage_by_stock"]["000001.SZ"]["last_bar"] == "20260917150000"
+
+
+def test_history_ex_multiday_local_final_bar_only_falls_back_to_rpc(monkeypatch, tmp_path):
+    """One final daily DAT row cannot prove an unlimited multi-day request."""
+    from qmt_bridge.server.routers import market
+
+    monkeypatch.setenv("QMT_BRIDGE_LOCAL_DAT_ROOT", str(tmp_path))
+    local = pd.DataFrame({"close": [10.0]}, index=["20260910"])
+    native = pd.DataFrame({"time": ["20260901", "20260910"], "close": [9.0, 11.0]})
+    monkeypatch.setattr(market, "read_qmt_local_dat_1d", lambda *_a, **_kw: {"000001.SZ": local})
+    calls = []
+
+    def rpc(**kwargs):
+        calls.append(kwargs)
+        return {"000001.SZ": native}
+
+    monkeypatch.setattr(market, "market_data", SimpleNamespace(get_market_data_ex=rpc))
+    monkeypatch.setattr(market, "_call_xtdata_serialized", lambda fn, **kwargs: fn(**kwargs))
+    app = FastAPI()
+    app.include_router(market.router)
+    with TestClient(app) as client:
+        payload = client.get(
+            "/api/market/history_ex?stocks=000001.SZ&period=1d"
+            "&start_time=20260901&end_time=20260910&count=-1"
+        ).json()
+
+    assert len(calls) == 1
+    assert payload["source"] == "qmt_rpc_fallback.1d"
+    assert payload["data"]["000001.SZ"][0]["close"] == 9.0
+    assert payload["coverage_by_stock"]["000001.SZ"]["covers_requested_range"] is True
+
+
 def test_history_ex_prefers_configured_local_daily_dat(
     monkeypatch,
     tmp_path: Path,
@@ -254,7 +361,7 @@ def test_history_ex_prefers_configured_local_daily_dat(
 
     monkeypatch.setattr(
         market,
-        "xtdata",
+        "market_data",
         SimpleNamespace(get_market_data_ex=unexpected_xtdata_call),
     )
 
@@ -271,3 +378,52 @@ def test_history_ex_prefers_configured_local_daily_dat(
     assert payload["source"] == "qmt_local_dat.1d"
     assert len(payload["data"]["512890.SH"]) == 2
     assert payload["data"]["512890.SH"][0]["time"] == "20190118"
+
+
+def test_history_ex_falls_back_when_local_daily_dat_is_stale(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from qmt_bridge.server.routers import market
+
+    root = tmp_path / "datadir"
+    root.mkdir()
+    _write_daily_history(root, "512890.SH")
+    monkeypatch.setenv("QMT_BRIDGE_LOCAL_DAT_ROOT", str(root))
+    calls: list[list[str]] = []
+
+    def get_market_data_ex(*_args, **kwargs):
+        calls.append(list(kwargs["stock_list"]))
+        return {
+            "512890.SH": pd.DataFrame(
+                [
+                    {
+                        "time": 1787155200000,
+                        "open": 1.1,
+                        "high": 1.2,
+                        "low": 1.0,
+                        "close": 1.15,
+                    }
+                ]
+            )
+        }
+
+    monkeypatch.setattr(
+        market,
+        "market_data",
+        SimpleNamespace(get_market_data_ex=get_market_data_ex),
+    )
+
+    app = FastAPI()
+    app.include_router(market.router)
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/market/history_ex?stocks=512890.SH&period=1d"
+            "&start_time=20190118&end_time=20260821&dividend_type=none"
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert calls == [["512890.SH"]]
+    assert payload["source"] == "qmt_rpc_fallback.1d"
+    assert payload["data"]["512890.SH"][0]["time"] == 1787155200000

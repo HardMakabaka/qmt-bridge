@@ -1,6 +1,7 @@
 # WebSocket 客户端
 
-实时行情订阅、全市场行情、L2 千档、交易回报推送等 WebSocket 方法。
+实时行情订阅、全市场行情、公式状态和交易回报推送等 WebSocket 方法。3.0 已移除
+`subscribe_l2_thousand`；没有兼容替代。
 
 !!! tip "依赖"
     WebSocket 功能需要安装 `websockets` 包：`pip install "qmt-bridge[client]"`

@@ -1,82 +1,61 @@
-"""XtTraderManager — lifecycle management for XtQuantTrader."""
+"""Big QMT trading lifecycle and domain operations."""
+
+from __future__ import annotations
 
 import logging
 
-from ..helpers import _status_payload
+from bigqmt_signal_trader.telemetry import emit, span
+from bigqmt_signal_trader.trading_client import _batch_outcome, _receipt_outcome
 
 logger = logging.getLogger("qmt_bridge.trading")
 
 
 class TradingWriteDisabled(PermissionError):
-    def __init__(self, blocker: str):
+    def __init__(self, blocker):
         self.blocker = blocker
         super().__init__(blocker)
 
 
-class XtTraderManager:
-    """Manages an XtQuantTrader instance.
+class BigQmtTradingManager:
+    """Own a direct Big QMT trading client; account identities are strings."""
 
-    Created during FastAPI lifespan startup when trading is enabled.
-    """
-
-    def __init__(
-        self,
-        runtime=None,
-        account_id: str = "",
-        order_writes_enabled: bool = True,
-    ):
+    def __init__(self, runtime=None, account_id="", order_writes_enabled=True):
         self.runtime = runtime
-        self.account_id = account_id
+        self.account_id = str(account_id or "")
         self.order_writes_enabled = bool(order_writes_enabled)
         self._trader = None
-        self._account = None
+        self._callback = None
 
     def connect(self, event_loop=None):
-        """Initialize and connect the XtQuantTrader instance."""
         from .callbacks import BridgeTraderCallback
 
         if self.runtime is None:
             raise RuntimeError("Big QMT runtime is required")
         self._trader = self.runtime.new_trader()
-        self._account = self.runtime.new_account(self.account_id)
         self._callback = BridgeTraderCallback()
         if event_loop is not None:
             self._callback.set_event_loop(event_loop)
-
         self._trader.register_callback(self._callback)
-        start_result = self._trader.start()
-        if start_result != 0:
-            raise RuntimeError(f"Big QMT RPC event listener failed to start: {start_result}")
-        result = self._trader.connect()
-        if result != 0:
-            raise RuntimeError(f"Big QMT RPC connect failed: {result}")
-        subscribe_result = self._trader.subscribe(self._account)
-        if subscribe_result != 0:
-            raise RuntimeError(
-                f"Big QMT RPC account subscription failed: {subscribe_result}"
-            )
-
-        logger.info("Big QMT RPC trader connected, account=%s", self.account_id)
+        self._trader.start()
+        self._trader.connect()
+        logger.info("Big QMT trading client connected, account=%s", self.account_id)
 
     def disconnect(self):
-        """Disconnect and clean up."""
         if self._trader is not None:
             try:
                 self._trader.stop()
             except Exception:
-                logger.exception("Error stopping XtQuantTrader")
+                logger.exception("Error stopping Big QMT trading client")
             self._trader = None
 
-    def _resolve_account(self, account_id: str = ""):
-        """Get the StockAccount — use provided or default."""
-        if account_id and account_id != self.account_id:
-            if self.runtime is None:
-                raise RuntimeError("Big QMT runtime is required")
-            return self.runtime.new_account(account_id)
-        return self._account
+    def _account_id(self, account_id=""):
+        target = str(account_id or self.account_id or "").strip()
+        if not target:
+            raise RuntimeError("Big QMT account_id is required")
+        return target
 
     @property
-    def write_blockers(self) -> list[str]:
+    def write_blockers(self):
         blockers = []
         if self.runtime is not None:
             try:
@@ -85,20 +64,18 @@ class XtTraderManager:
                 blockers.append("bigqmt_rpc_unavailable")
         if not self.order_writes_enabled:
             blockers.append("bridge_order_writes_disabled")
-        if self.runtime is None or not bool(
-            self.runtime.ping_payload.get("allow_order_methods", False)
-        ):
+        if self.runtime is None or not bool(self.runtime.ping_payload.get("allow_order_methods", False)):
             blockers.append("bigqmt_order_methods_disabled")
         if self.runtime is None or self.runtime.ping_payload.get("terminal_real_mode") is not True:
             blockers.append("bigqmt_terminal_real_mode_required")
         return blockers
 
     @property
-    def writes_enabled(self) -> bool:
+    def writes_enabled(self):
         return not self.write_blockers
 
     @property
-    def event_status(self) -> dict:
+    def event_status(self):
         from ..events import build_event_transport_status
 
         trader = self._trader
@@ -110,507 +87,140 @@ class XtTraderManager:
             listener_alive=bool(thread is not None and thread.is_alive()),
         )
 
-    def _require_writes_enabled(self) -> None:
+    def _require_writes_enabled(self):
         blockers = self.write_blockers
         if blockers:
+            emit("trading.write_gate", critical=True, account_id=self.account_id,
+                 outcome="rejected", blocker=blockers[0])
             raise TradingWriteDisabled(blockers[0])
+        emit("trading.write_gate", critical=True, account_id=self.account_id, outcome="success")
 
-    def _call_trader_optional(self, function_name: str, *args, **kwargs):
-        """Call an optional XtQuantTrader method without leaking 500 errors."""
+    def _client(self):
         if self._trader is None:
-            return _status_payload(
-                "unavailable",
-                reason="xttrader_not_connected",
-                function=function_name,
-            )
-        func = getattr(self._trader, function_name, None)
-        if not callable(func):
-            return _status_payload(
-                "unsupported",
-                reason=f"xttrader_{function_name}_missing",
-                function=function_name,
-            )
+            raise RuntimeError("Big QMT trading client is not connected")
+        return self._trader
+
+    def order(self, stock_code, order_type, order_volume, price_type=5, price=0.0,
+              strategy_name="", order_remark="", account_id=""):
+        self._require_writes_enabled()
+        target = self._account_id(account_id)
+        fields = {"critical": True, "account_id": target, "client_submit_id": order_remark,
+                  "stock_code": stock_code, "order_type": order_type,
+                  "volume": order_volume, "price": price, "strategy_name": strategy_name}
+        emit("trading.manager.submit.begin", outcome="started", **fields)
         try:
-            return func(*args, **kwargs)
-        except NotImplementedError as exc:
-            return _status_payload(
-                "unsupported",
-                reason=str(exc) or f"xttrader_{function_name}_unsupported",
-                function=function_name,
-                error_type=exc.__class__.__name__,
-            )
-        except (ConnectionError, OSError, TimeoutError) as exc:
-            return _status_payload(
-                "unavailable",
-                reason=str(exc) or f"xttrader_{function_name}_unavailable",
-                function=function_name,
-                error_type=exc.__class__.__name__,
+            with span("trading.manager.submit", **fields) as trace:
+                receipt = self._client().submit_order(
+                    stock_code=stock_code, order_type=order_type, order_volume=order_volume,
+                    price_type=price_type, price=price, strategy_name=strategy_name,
+                    order_remark=order_remark, account_id=target,
+                )
+                trace["outcome"] = _receipt_outcome(receipt)
+        except Exception as exc:
+            emit("trading.manager.submit.return", outcome="unknown", error_type=type(exc).__name__, **fields)
+            raise
+        emit("trading.manager.submit.return", outcome=_receipt_outcome(receipt), **fields)
+        if isinstance(receipt, dict):
+            return receipt.get("order_sys_id") or receipt.get("order_id") or receipt
+        return receipt
+
+    def submit_batch(self, orders, batch_id="", account_id=""):
+        self._require_writes_enabled()
+        target = self._account_id(account_id)
+        emit("trading.manager.batch.begin", critical=True, account_id=target, batch_id=batch_id,
+             item_count=len(orders or []), outcome="started")
+        try:
+            result = self._client().submit_batch(orders, batch_id=batch_id, account_id=target)
+        except Exception as exc:
+            emit("trading.manager.batch.return", critical=True, account_id=target, batch_id=batch_id,
+                 item_count=len(orders or []), outcome="unknown", error_type=type(exc).__name__)
+            raise
+        emit("trading.manager.batch.return", critical=True, account_id=target, batch_id=batch_id,
+             item_count=len(result or []), outcome=_batch_outcome(result))
+        return result
+
+    def cancel_order(self, order_id, account_id=""):
+        self._require_writes_enabled()
+        target = self._account_id(account_id)
+        emit("trading.manager.cancel.begin", critical=True, account_id=target,
+             order_sys_id=order_id, cancel_method="id", outcome="started")
+        try:
+            result = self._client().cancel_order(order_id, account_id=target)
+        except Exception as exc:
+            emit("trading.manager.cancel.return", critical=True, account_id=target,
+                 order_sys_id=order_id, cancel_method="id", outcome="unknown", error_type=type(exc).__name__)
+            raise
+        emit("trading.manager.cancel.return", critical=True, account_id=target,
+             order_sys_id=order_id, cancel_method="id",
+             outcome="success" if bool(result) else "rejected")
+        return result
+
+    def cancel_order_sysid(self, order_sysid, market, account_id=""):
+        self._require_writes_enabled()
+        target = self._account_id(account_id)
+        emit("trading.manager.cancel.begin", critical=True, account_id=target,
+             order_sys_id=order_sysid, market=market, cancel_method="sysid", outcome="started")
+        try:
+            result = self._client().cancel_order_sysid(order_sysid, market=market, account_id=target)
+        except Exception as exc:
+            emit("trading.manager.cancel.return", critical=True, account_id=target,
+                 order_sys_id=order_sysid, market=market, cancel_method="sysid",
+                 outcome="unknown", error_type=type(exc).__name__)
+            raise
+        emit("trading.manager.cancel.return", critical=True, account_id=target,
+             order_sys_id=order_sysid, market=market, cancel_method="sysid",
+             outcome="success" if bool(result) else "rejected")
+        return result
+
+    def sync_transaction_from_external(self, operation, data_type, data, account_type="STOCK", account_id=""):
+        self._require_writes_enabled()
+        target = self._account_id(account_id)
+        emit("trading.external_sync.begin", critical=True, account_id=target,
+             operation=operation, data_type=data_type, item_count=len(data or []), outcome="started")
+        try:
+            result = self._client().sync_transaction(
+                operation, data_type, data, account_type=account_type,
+                account_id=target,
             )
         except Exception as exc:
-            return _status_payload(
-                "error",
-                reason=str(exc) or f"xttrader_{function_name}_failed",
-                function=function_name,
-                error_type=exc.__class__.__name__,
-            )
+            emit("trading.external_sync.return", critical=True, account_id=target,
+                 operation=operation, data_type=data_type, outcome="unknown",
+                 error_type=type(exc).__name__, filled=False)
+            raise
+        # The external synchronizer is not a broker fill acknowledgement.
+        emit("trading.external_sync.return", critical=True, account_id=target,
+             operation=operation, data_type=data_type, outcome=_receipt_outcome(result), filled=False)
+        return result
 
-    # ------------------------------------------------------------------
-    # Order operations
-    # ------------------------------------------------------------------
-
-    def order(self, stock_code: str, order_type: int, order_volume: int,
-              price_type: int = 5, price: float = 0.0,
-              strategy_name: str = "", order_remark: str = "",
-              account_id: str = ""):
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._trader.order_stock(
-            account, stock_code, order_type, order_volume,
-            price_type, price, strategy_name, order_remark,
+    def query_orders(self, account_id="", cancelable_only=False, client_submit_id=""):
+        return self._client().query_orders(
+            account_id=self._account_id(account_id), cancelable_only=cancelable_only,
+            client_submit_id=client_submit_id,
         )
 
-    def cancel_order(self, order_id: int, account_id: str = ""):
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._trader.cancel_order_stock(account, order_id)
+    def query_order_detail(self, order_id=0, account_id=""):
+        return self._client().query_order(order_id, account_id=self._account_id(account_id))
 
-    def cancel_order_sysid(self, order_sysid: str, market, account_id: str = ""):
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._trader.cancel_order_stock_sysid(account, market, str(order_sysid))
+    def query_positions(self, account_id=""):
+        return self._client().query_positions(account_id=self._account_id(account_id))
 
-    # ------------------------------------------------------------------
-    # Query operations
-    # ------------------------------------------------------------------
+    def query_position(self, stock_code, account_id=""):
+        return self._client().query_position(stock_code, account_id=self._account_id(account_id))
 
-    def query_orders(
-        self,
-        account_id: str = "",
-        cancelable_only: bool = False,
-        client_submit_id: str = "",
-    ):
-        account = self._resolve_account(account_id)
-        if self.runtime is None:
-            orders = self._trader.query_stock_orders(account, cancelable_only)
-        else:
-            orders = self._trader.query_stock_orders(account, cancelable_only, "")
-        if not client_submit_id:
-            return orders
-        return [
-            order
-            for order in (orders or [])
-            if str(getattr(order, "order_remark", "") or "").strip() == client_submit_id
-        ]
+    def query_asset(self, account_id=""):
+        return self._client().query_asset(account_id=self._account_id(account_id))
 
-    def query_positions(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._trader.query_stock_positions(account)
+    def query_trades(self, account_id=""):
+        return self._client().query_trades(account_id=self._account_id(account_id))
 
-    def query_asset(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._trader.query_stock_asset(account)
+    def query_trade(self, trade_id, account_id=""):
+        return self._client().query_trade(trade_id, account_id=self._account_id(account_id))
 
-    def query_trades(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        if self.runtime is None:
-            return self._trader.query_stock_trades(account)
-        return self._trader.query_stock_trades(account, "")
-
-    def query_order_detail(self, order_id: int = 0, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        if self.runtime is None:
-            orders = self._trader.query_stock_orders(account, False)
-        else:
-            orders = self._trader.query_stock_orders(account, False, "")
-        if orders:
-            for o in orders:
-                if getattr(o, "order_id", None) == order_id:
-                    return o
-        return None
-
-    # ------------------------------------------------------------------
-    # Credit operations
-    # ------------------------------------------------------------------
-
-    def credit_order(self, stock_code: str, order_type: int, order_volume: int,
-                     price_type: int = 5, price: float = 0.0,
-                     credit_type: str = "fin_buy",
-                     strategy_name: str = "", order_remark: str = "",
-                     account_id: str = ""):
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "credit_order",
-            account, stock_code, order_type, order_volume,
-            price_type, price, credit_type, strategy_name, order_remark,
+    def query_execution_snapshot(self, account_id="", order_strategy_name="bigqmt_signal_trader", trade_strategy_name=""):
+        return self._client().query_execution_snapshot(
+            account_id=self._account_id(account_id), order_strategy_name=order_strategy_name,
+            trade_strategy_name=trade_strategy_name,
         )
 
-    def query_credit_positions(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._trader.query_stock_positions(account)
-
-    def query_credit_asset(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._trader.query_stock_asset(account)
-
-    def query_credit_debt(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_stk_compacts", account)
-
-    def query_credit_available(self, stock_code: str = "", account_id: str = ""):
-        return _status_payload(
-            "unsupported",
-            reason="xttrader_query_credit_available_missing",
-            function="query_credit_available",
-            stock_code=stock_code,
-        )
-
-    def query_slo_stocks(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_credit_slo_code", account)
-
-    def query_fin_stocks(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_credit_subjects", account)
-
-    # ------------------------------------------------------------------
-    # Fund operations
-    # ------------------------------------------------------------------
-
-    def fund_transfer(self, transfer_direction: int, amount: float, account_id: str = ""):
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "fund_transfer", account, transfer_direction, amount
-        )
-
-    def query_fund_transfer_records(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_fund_transfer", account)
-
-    def query_available_fund(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        asset = self._trader.query_stock_asset(account)
-        return asset
-
-    def ctp_fund_transfer(self, direction: int, amount: float, account_id: str = ""):
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "ctp_fund_transfer", account, direction, amount
-        )
-
-    def query_ctp_balance(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_ctp_balance", account)
-
-    # ------------------------------------------------------------------
-    # Bank operations
-    # ------------------------------------------------------------------
-
-    def bank_transfer(self, direction: int, amount: float, bank_code: str = "", account_id: str = ""):
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "bank_transfer", account, direction, amount, bank_code
-        )
-
-    def query_bank_balance(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_bank_balance", account)
-
-    def query_bank_transfer_records(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_bank_transfer_records", account)
-
-    def query_bound_banks(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_bound_banks", account)
-
-    def query_transfer_limit(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_transfer_limit", account)
-
-    def query_bank_available(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_bank_available", account)
-
-    def query_bank_transfer_status(self, transfer_id: str = "", account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "query_bank_transfer_status", account, transfer_id
-        )
-
-    # ------------------------------------------------------------------
-    # SMT operations (约定式交易 — real API)
-    # ------------------------------------------------------------------
-
-    def smt_order(self, stock_code: str, order_type: int, order_volume: int,
-                  price_type: int = 5, price: float = 0.0,
-                  smt_type: str = "", strategy_name: str = "", order_remark: str = "",
-                  account_id: str = ""):
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "smt_order",
-            account, stock_code, order_type, order_volume,
-            price_type, price, smt_type, strategy_name, order_remark,
-        )
-
-    def smt_negotiate_order_async(self, stock_code: str, order_type: int,
-                                  order_volume: int, price: float = 0.0,
-                                  compact_id: str = "",
-                                  strategy_name: str = "", order_remark: str = "",
-                                  account_id: str = ""):
-        """Async SMT negotiate order — result via on_smt_appointment_async_response callback."""
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "smt_negotiate_order_async",
-            account, stock_code, order_type, order_volume,
-            price, compact_id, strategy_name, order_remark,
-        )
-
-    def cancel_smt_order(self, order_id: int, account_id: str = ""):
-        """Cancel an SMT order."""
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("cancel_smt_order", account, order_id)
-
-    def smt_query_quoter(self, account_id: str = ""):
-        """Query SMT quoter information (报价方信息)."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("smt_query_quoter", account)
-
-    def smt_query_compact(self, account_id: str = ""):
-        """Query SMT compacts (约定合约)."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("smt_query_compact", account)
-
-    def query_appointment_info(self, account_id: str = ""):
-        """Query SMT appointment info (约定式预约信息)."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_appointment_info", account)
-
-    def query_smt_secu_info(self, account_id: str = ""):
-        """Query SMT security info (约定式证券信息)."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_smt_secu_info", account)
-
-    def query_smt_secu_rate(
-        self,
-        stock_code: str = "",
-        max_term: int = 0,
-        fare_way: int = 0,
-        credit_type: int = 0,
-        trade_type: int = 0,
-        account_id: str = "",
-    ):
-        """Query SMT security rates (约定式证券费率)."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "query_smt_secu_rate",
-            account,
-            stock_code,
-            max_term,
-            fare_way,
-            credit_type,
-            trade_type,
-        )
-
-    # ------------------------------------------------------------------
-    # Async order operations
-    # ------------------------------------------------------------------
-
-    def order_async(self, stock_code: str, order_type: int, order_volume: int,
-                    price_type: int = 5, price: float = 0.0,
-                    strategy_name: str = "", order_remark: str = "",
-                    account_id: str = ""):
-        """Async order — result delivered via on_order_stock_async_response callback."""
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "order_stock_async",
-            account, stock_code, order_type, order_volume,
-            price_type, price, strategy_name, order_remark,
-        )
-
-    def cancel_order_async(self, order_id: int, account_id: str = ""):
-        """Async cancel — result delivered via on_cancel_order_stock_async_response callback."""
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "cancel_order_stock_async", account, order_id
-        )
-
-    def cancel_order_sysid_async(self, order_sysid: str, market, account_id: str = ""):
-        """Async cancel by QMT order_sysid — result delivered via trading callback."""
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "cancel_order_stock_sysid_async", account, market, str(order_sysid)
-        )
-
-    # ------------------------------------------------------------------
-    # Single-item queries
-    # ------------------------------------------------------------------
-
-    def query_single_order(self, order_id: int, account_id: str = ""):
-        """Query a single order by order_id."""
-        account = self._resolve_account(account_id)
-        return self._trader.query_stock_order(account, order_id)
-
-    def query_single_trade(self, trade_id: int, account_id: str = ""):
-        """Query a single trade by trade_id."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_stock_trade", account, trade_id)
-
-    def query_single_position(self, stock_code: str, account_id: str = ""):
-        """Query position for a single stock."""
-        account = self._resolve_account(account_id)
-        return self._trader.query_stock_position(account, stock_code)
-
-    # ------------------------------------------------------------------
-    # Position statistics
-    # ------------------------------------------------------------------
-
-    def query_position_statistics(self, account_id: str = ""):
-        """Query position statistics summary."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_position_statistics", account)
-
-    # ------------------------------------------------------------------
-    # Credit extended queries
-    # ------------------------------------------------------------------
-
-    def query_credit_subjects(self, account_id: str = ""):
-        """Query credit subject list."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_credit_subjects", account)
-
-    def query_credit_assure(self, account_id: str = ""):
-        """Query credit assurance / collateral info."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_credit_assure", account)
-
-    # ------------------------------------------------------------------
-    # IPO queries
-    # ------------------------------------------------------------------
-
-    def query_new_purchase_limit(self, account_id: str = ""):
-        """Query IPO new purchase limit."""
-        account = self._resolve_account(account_id)
-        return self._trader.query_new_purchase_limit(account)
-
-    def query_ipo_data(self):
-        """Query IPO calendar data."""
-        return self._trader.query_ipo_data()
-
-    # ------------------------------------------------------------------
-    # Account info
-    # ------------------------------------------------------------------
-
-    def get_account_status(self, account_id: str = ""):
-        try:
-            return {"connected": self._trader is not None}
-        except Exception:
-            return {"connected": False}
-
-    def get_account_info(self, account_id: str = ""):
-        account = self._resolve_account(account_id)
-        return self._trader.query_stock_asset(account)
-
-    def query_account_infos(self):
-        """Query info for all registered accounts."""
-        return self._trader.query_account_infos()
-
-    # ------------------------------------------------------------------
-    # COM queries
-    # ------------------------------------------------------------------
-
-    def query_com_fund(self, account_id: str = ""):
-        """Query COM fund (期权/期货账户资金)."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_com_fund", account)
-
-    def query_com_position(self, account_id: str = ""):
-        """Query COM positions (期权/期货持仓)."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional("query_com_position", account)
-
-    # ------------------------------------------------------------------
-    # CTP cross-market transfers
-    # ------------------------------------------------------------------
-
-    def ctp_transfer_option_to_future(self, amount: float, account_id: str = ""):
-        """Transfer from option account to future account."""
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "ctp_transfer_option_to_future", account, amount
-        )
-
-    def ctp_transfer_future_to_option(self, amount: float, account_id: str = ""):
-        """Transfer from future account to option account."""
-        self._require_writes_enabled()
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "ctp_transfer_future_to_option", account, amount
-        )
-
-    # ------------------------------------------------------------------
-    # Data export / external sync
-    # ------------------------------------------------------------------
-
-    def export_data(self, data_type: str = "orders", file_path: str = "", account_id: str = ""):
-        """Export trading data to file."""
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "export_data", account, data_type, file_path
-        )
-
-    def query_data(
-        self,
-        data_type: str = "orders",
-        result_path: str = "",
-        start_time: str | None = None,
-        end_time: str | None = None,
-        account_id: str = "",
-    ):
-        """Query exported trading data."""
-        if not result_path:
-            return _status_payload(
-                "unsupported",
-                reason="xttrader_query_data_requires_result_path",
-                function="query_data",
-            )
-        account = self._resolve_account(account_id)
-        return self._call_trader_optional(
-            "query_data",
-            account,
-            result_path,
-            data_type,
-            start_time,
-            end_time,
-            {},
-        )
-
-    def sync_transaction_from_external(
-        self,
-        operation: str,
-        data_type: str,
-        data: list,
-        account_type: str = "STOCK",
-        account_id: str = "",
-    ):
-        """Sync external transaction records into the system."""
-        self._require_writes_enabled()
-        target_account_id = str(account_id or self.account_id)
-        return self._call_trader_optional(
-            "sync_transaction_from_external",
-            operation,
-            data_type,
-            target_account_id,
-            account_type,
-            data,
-        )
+    def query_extension(self, method, params=None, account_id=""):
+        return self._client().query_extension(method, params, account_id=self._account_id(account_id))

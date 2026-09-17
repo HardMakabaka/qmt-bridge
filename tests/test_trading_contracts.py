@@ -3,15 +3,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
-from bigqmt_signal_trader.xtquant_compat import BigQmtXtTrader, StockAccount
+from bigqmt_signal_trader.trading_client import BigQmtTradingClient
+from bigqmt_signal_trader.models import (
+    CancelResult,
+    OrderSnapshot,
+    OrderSubmitResult,
+    TradeSnapshot,
+)
 from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers
-from qmt_bridge.server.deps import get_trader_manager
-from qmt_bridge.server.routers.smt import router as smt_router
-from qmt_bridge.server.security import require_api_key
-from qmt_bridge.server.trading.manager import TradingWriteDisabled, XtTraderManager
+from qmt_bridge.server.routers import credit, fund, trading
+from qmt_bridge.server.trading.manager import BigQmtTradingManager, TradingWriteDisabled
 
 
 class RecordingTrader:
@@ -32,25 +34,13 @@ class RecordingTrader:
         self.calls.append(("connect",))
         return 0
 
-    def subscribe(self, account) -> int:
-        self.calls.append(("subscribe", account.account_id))
-        return 0
-
     def stop(self) -> int:
         self.calls.append(("stop",))
         return 0
 
-    def order_stock(self, *args):
-        self.calls.append(("order_stock", *args))
-        return "unsafe-normal-order"
-
-    def fund_transfer(self, *args):
-        self.calls.append(("fund_transfer", *args))
-        return "unsafe-generic-transfer"
-
-    def query_smt_secu_rate(self, *args):
-        self.calls.append(("query_smt_secu_rate", *args))
-        return ["rate"]
+    def submit_order(self, **kwargs):
+        self.calls.append(("submit_order", kwargs))
+        return {"order_sys_id": "9001"}
 
 
 class RecordingRuntime:
@@ -63,9 +53,6 @@ class RecordingRuntime:
 
     def new_trader(self) -> RecordingTrader:
         return self.trader
-
-    def new_account(self, account_id: str):
-        return SimpleNamespace(account_id=account_id)
 
     def probe(self):
         return self.ping_payload
@@ -85,149 +72,128 @@ class RecordingClient:
         return [{"method": method}]
 
 
-def _facade(client: RecordingClient) -> BigQmtXtTrader:
-    trader = BigQmtXtTrader(account_id="acct-1", redis_config={})
-    trader.client = client
-    return trader
+def _facade(client: RecordingClient) -> BigQmtTradingClient:
+    return BigQmtTradingClient(account_id="acct-1", client=client)
 
 
 def test_manager_binds_callback_loop_and_starts_zmq_event_subscription() -> None:
     # Given: a connected Big QMT runtime and an explicit FastAPI event loop token.
     trader = RecordingTrader()
-    manager = XtTraderManager(RecordingRuntime(trader), account_id="acct-1")
+    manager = BigQmtTradingManager(RecordingRuntime(trader), account_id="acct-1")
     event_loop = object()
 
     # When: the manager establishes the account bridge.
     manager.connect(event_loop=event_loop)
 
-    # Then: callbacks are bound before the ZMQ listener is started and subscribed.
+    # Then: callbacks are bound before the direct client starts and connects.
     assert trader.callback._loop is event_loop
     assert trader.calls == [
         ("register_callback",),
         ("start",),
         ("connect",),
-        ("subscribe", "acct-1"),
     ]
 
 
-@pytest.mark.parametrize(
-    ("method", "args"),
-    [
-        ("credit_order", ("000001.SZ", 23, 100)),
-        ("smt_order", ("000001.SZ", 23, 100)),
-        ("bank_transfer", (0, 1000.0)),
-        ("ctp_fund_transfer", (0, 1000.0)),
-    ],
-)
-def test_specialized_writes_never_fall_back_to_normal_order_or_generic_fund_transfer(
-    method: str,
-    args: tuple[object, ...],
-) -> None:
-    # Given: a provider exposing only the unsafe generic write methods.
+def test_normal_order_uses_the_native_submit_order_contract() -> None:
     trader = RecordingTrader()
-    manager = XtTraderManager(RecordingRuntime(trader), account_id="acct-1")
+    manager = BigQmtTradingManager(RecordingRuntime(trader), account_id="acct-1")
     manager._trader = trader
-    manager._account = SimpleNamespace(account_id="acct-1")
-
-    # When: a specialized write capability is requested.
-    result = getattr(manager, method)(*args)
-
-    # Then: the bridge reports unsupported and performs no provider write.
-    assert result["status"] == "unsupported"
-    assert result["retryable"] is False
-    assert not any(call[0] in {"order_stock", "fund_transfer"} for call in trader.calls)
-
-
-def test_normal_order_keeps_the_verified_order_stock_contract() -> None:
-    trader = RecordingTrader()
-    manager = XtTraderManager(RecordingRuntime(trader), account_id="acct-1")
-    manager._trader = trader
-    manager._account = SimpleNamespace(account_id="acct-1")
 
     result = manager.order("000001.SZ", 23, 100)
 
-    assert result == "unsafe-normal-order"
-    assert trader.calls[0][0] == "order_stock"
-
-
-def test_smt_rate_contract_forwards_all_provider_parameters() -> None:
-    # Given: an SMT-capable provider and the six-argument Big QMT contract.
-    trader = RecordingTrader()
-    manager = XtTraderManager(RecordingRuntime(trader), account_id="acct-1")
-    manager._trader = trader
-    manager._account = SimpleNamespace(account_id="acct-1")
-
-    # When: the bridge queries a security rate.
-    result = manager.query_smt_secu_rate(
-        stock_code="600000.SH",
-        max_term=30,
-        fare_way=1,
-        credit_type=2,
-        trade_type=3,
+    assert result == "9001"
+    assert trader.calls[0] == (
+        "submit_order",
+        {
+            "stock_code": "000001.SZ", "order_type": 23, "order_volume": 100,
+            "price_type": 5, "price": 0.0, "strategy_name": "", "order_remark": "",
+            "account_id": "acct-1",
+        },
     )
 
-    # Then: no parameter is dropped or reinterpreted.
-    assert result == ["rate"]
-    assert trader.calls == [
-        (
-            "query_smt_secu_rate",
-            manager._account,
-            "600000.SH",
-            30,
-            1,
-            2,
-            3,
-        )
-    ]
 
-
-def test_smt_cancel_http_contract_accepts_client_json_body() -> None:
-    calls = []
-    manager = SimpleNamespace(
-        cancel_smt_order=lambda **kwargs: calls.append(kwargs) or 0,
-    )
-    app = FastAPI()
-    app.include_router(smt_router)
-    app.dependency_overrides[get_trader_manager] = lambda: manager
-    app.dependency_overrides[require_api_key] = lambda: None
-
-    response = TestClient(app).post(
-        "/api/smt/cancel",
-        json={"order_id": 42, "account_id": "acct-1"},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok", "data": 0}
-    assert calls == [{"order_id": 42, "account_id": "acct-1"}]
-
-
-def test_bigqmt_facade_propagates_provider_failures_instead_of_returning_empty_data() -> None:
+def test_bigqmt_trading_client_propagates_provider_failures_instead_of_returning_empty_data() -> None:
     # Given: a transport timeout from the Big QMT provider.
     facade = _facade(RecordingClient(fail=True))
 
     # When/Then: the failure remains distinguishable from a valid empty account result.
     with pytest.raises(TimeoutError, match="provider offline"):
-        facade.query_account_infos(StockAccount("acct-1"))
+        facade.query_asset()
 
 
-def test_bigqmt_facade_uses_verified_ipo_methods() -> None:
-    # Given: a recording Big QMT provider client.
-    client = RecordingClient()
-    facade = _facade(client)
-    account = StockAccount("acct-1")
+def test_retained_account_routes_use_only_native_domain_methods() -> None:
+    class NativeClient:
+        def __init__(self):
+            self.calls = []
 
-    # When: IPO data and purchase limits are queried.
-    facade.query_ipo_data(account)
-    facade.query_new_purchase_limit(account)
+        def query_positions(self, *, account_id=""):
+            self.calls.append(("query_positions", account_id))
+            return []
 
-    # Then: each facade method targets its exact provider function.
-    assert [call[0] for call in client.calls] == [
-        "get_ipo_data",
-        "get_new_purchase_limit",
+        def query_asset(self, *, account_id=""):
+            self.calls.append(("query_asset", account_id))
+            return {"cash": 1000.0}
+
+        def query_order(self, order_id, *, account_id=""):
+            self.calls.append(("query_order", order_id, account_id))
+            return None
+
+        def query_trade(self, trade_id, *, account_id=""):
+            self.calls.append(("query_trade", trade_id, account_id))
+            return None
+
+        def query_position(self, stock_code, *, account_id=""):
+            self.calls.append(("query_position", stock_code, account_id))
+            return None
+
+        def query_extension(self, method, params=None, *, account_id=""):
+            self.calls.append(("query_extension", method, params or {}, account_id))
+            return []
+
+    client = NativeClient()
+    manager = BigQmtTradingManager(account_id="acct-1")
+    manager._trader = client
+
+    credit.query_credit_positions(manager=manager)
+    credit.query_credit_asset(manager=manager)
+    credit.query_credit_debt(manager=manager)
+    credit.query_slo_stocks(manager=manager)
+    credit.query_fin_stocks(manager=manager)
+    credit.query_credit_subjects(manager=manager)
+    credit.query_credit_assure(manager=manager)
+    fund.query_available_fund(manager=manager)
+    trading.get_account_status(manager=manager)
+    trading.get_account_info(manager=manager)
+    trading.query_single_order(1, manager=manager)
+    trading.query_single_trade(2, manager=manager)
+    trading.query_single_position("000001.SZ", manager=manager)
+    trading.query_position_statistics(manager=manager)
+    trading.query_new_purchase_limit(manager=manager)
+    trading.query_ipo_data(manager=manager)
+    trading.query_account_infos(manager=manager)
+
+    assert client.calls == [
+        ("query_positions", "acct-1"),
+        ("query_asset", "acct-1"),
+        ("query_extension", "query_stk_compacts", {}, "acct-1"),
+        ("query_extension", "query_credit_slo_code", {}, "acct-1"),
+        ("query_extension", "query_credit_subjects", {}, "acct-1"),
+        ("query_extension", "query_credit_subjects", {}, "acct-1"),
+        ("query_extension", "query_credit_assure", {}, "acct-1"),
+        ("query_asset", "acct-1"),
+        ("query_extension", "query_account_status", {}, "acct-1"),
+        ("query_extension", "query_account_infos", {}, "acct-1"),
+        ("query_order", 1, "acct-1"),
+        ("query_trade", 2, "acct-1"),
+        ("query_position", "000001.SZ", "acct-1"),
+        ("query_extension", "query_position_statistics", {}, "acct-1"),
+        ("query_extension", "get_new_purchase_limit", {}, "acct-1"),
+        ("query_extension", "get_ipo_data", {}, "acct-1"),
+        ("query_extension", "query_account_infos", {}, "acct-1"),
     ]
 
 
-def _handlers(*, qmt_api=None, order_gateway=None) -> BigQmtRpcHandlers:
+def _handlers(*, qmt_api=None, order_gateway=None, allow_order_methods=False) -> BigQmtRpcHandlers:
     position_provider = SimpleNamespace(
         get_asset=lambda _account_id: {},
         get_positions=lambda _account_id: {},
@@ -238,7 +204,241 @@ def _handlers(*, qmt_api=None, order_gateway=None) -> BigQmtRpcHandlers:
         position_provider=position_provider,
         order_gateway=order_gateway,
         qmt_api=qmt_api,
+        allow_order_methods=allow_order_methods,
     )
+
+
+class ReconciliationGateway:
+    def __init__(self, identity_results):
+        self.identity_results = iter(identity_results)
+        self.submit_calls = []
+
+    def query_submission_identities_strict(self, _account_id, _strategy_name):
+        return next(self.identity_results)
+
+    def submit(self, request):
+        self.submit_calls.append(request)
+        return OrderSubmitResult(
+            status="SUBMITTED",
+            user_order_id=request.remark,
+            order_sys_id=None,
+        )
+
+
+class CancelReconciliationGateway:
+    def __init__(self, order_results, cancel_result=None):
+        self.order_results = iter(order_results)
+        self.cancel_result = cancel_result or CancelResult(True)
+        self.cancel_calls = []
+
+    def query_orders_strict(self, _account_id, _strategy_name):
+        result = next(self.order_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def cancel(self, order_ref):
+        self.cancel_calls.append(order_ref)
+        if isinstance(self.cancel_result, Exception):
+            raise self.cancel_result
+        return self.cancel_result
+
+
+def _rpc_order_params():
+    return {
+        "account_id": "acct-1",
+        "stock_code": "300308.SZ",
+        "order_type": 23,
+        "order_volume": 100,
+        "price_type": 11,
+        "price": 10.0,
+        "strategy_name": "MeCoStock",
+        "order_remark": "meco00000000000000000001",
+        "require_idempotency_check": True,
+    }
+
+
+def _rpc_order(order_sys_id="9001", stock_code="300308.SZ"):
+    return OrderSnapshot(
+        order_sys_id=order_sys_id,
+        user_order_id="meco00000000000000000001",
+        stock_code=stock_code,
+        action="BUY",
+        volume=100,
+        traded_volume=0,
+        status="50",
+        price=10.0,
+        strategy_name="MeCoStock",
+        remark="meco00000000000000000001",
+    )
+
+
+def test_rpc_single_order_returns_the_exact_reconciled_broker_id() -> None:
+    # Given: passorder has no return receipt but QMT later exposes the exact remark.
+    gateway = ReconciliationGateway([([], []), ([_rpc_order()], [])])
+    handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+
+    # When: the RPC handles one guarded logical submission.
+    result = handlers.handle("submit_order", _rpc_order_params())
+
+    # Then: the broker id is written into the response after one provider write.
+    assert len(gateway.submit_calls) == 1
+    assert result.order_sys_id == "9001"
+    assert result.user_order_id == "meco00000000000000000001"
+    assert result.status == "CONFIRMED"
+
+
+def test_rpc_single_order_survives_process_restart_without_duplicate_submit() -> None:
+    # Given: QMT already contains an order from a previous server process.
+    gateway = ReconciliationGateway([([_rpc_order()], [])])
+    restarted_handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+
+    # When: the same stable submission is retried after restart.
+    result = restarted_handlers.handle("submit_order", _rpc_order_params())
+
+    # Then: the existing broker order is returned without calling passorder.
+    assert gateway.submit_calls == []
+    assert result.order_sys_id == "9001"
+    assert result.status == "IDEMPOTENT"
+
+
+def test_rpc_single_order_reconciles_from_trade_identity_after_restart() -> None:
+    # Given: the order row is gone but an execution retains the stable identity.
+    trade = TradeSnapshot(
+        trade_id="trade-1",
+        order_sys_id="9001",
+        stock_code="300308.SZ",
+        action="BUY",
+        volume=100,
+        price=10.0,
+        user_order_id="meco00000000000000000001",
+    )
+    gateway = ReconciliationGateway([([], [trade])])
+    handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+
+    # When: the logical order is retried after service recovery.
+    result = handlers.handle("submit_order", _rpc_order_params())
+
+    # Then: the execution proves prior submission and passorder is not replayed.
+    assert gateway.submit_calls == []
+    assert result.order_sys_id == "9001"
+    assert result.status == "IDEMPOTENT"
+
+
+def test_rpc_single_order_rejects_conflicting_reuse_of_client_identity() -> None:
+    # Given: the logical identity already belongs to a different security.
+    gateway = ReconciliationGateway([([_rpc_order(stock_code="510300.SH")], [])])
+    handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+
+    # When/Then: the conflict fails closed without calling passorder.
+    with pytest.raises(ValueError, match="CLIENT_SUBMIT_ID_CONFLICT"):
+        handlers.handle("submit_order", _rpc_order_params())
+
+    assert gateway.submit_calls == []
+
+
+def test_rpc_confirmed_journal_rejects_conflicting_reuse_in_same_process() -> None:
+    # Given: one handler has confirmed and journaled the first logical order.
+    gateway = ReconciliationGateway([([], []), ([_rpc_order()], [])])
+    handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+    handlers.handle("submit_order", _rpc_order_params())
+    conflicting = dict(_rpc_order_params(), stock_code="510300.SH")
+
+    # When/Then: an in-process identity conflict is not hidden by the journal.
+    with pytest.raises(ValueError, match="CLIENT_SUBMIT_ID_CONFLICT"):
+        handlers.handle("submit_order", conflicting)
+
+    assert len(gateway.submit_calls) == 1
+
+
+def test_rpc_unconfirmed_journal_reconciles_later_without_resubmitting(monkeypatch) -> None:
+    # Given: the order is initially invisible, then appears on a logical retry.
+    gateway = ReconciliationGateway(
+        [([], []), ([], []), ([], []), ([], []), ([_rpc_order()], [])]
+    )
+    handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+    monkeypatch.setattr("bigqmt_signal_trader.redis_rpc.time.sleep", lambda _seconds: None)
+
+    # When: the same handler receives the retry after its first unconfirmed result.
+    first = handlers.handle("submit_order", _rpc_order_params())
+    second = handlers.handle("submit_order", _rpc_order_params())
+
+    # Then: QMT is queried again and passorder remains a one-shot operation.
+    assert first.status == "SUBMITTED_UNCONFIRMED"
+    assert len(gateway.submit_calls) == 1
+    assert second.order_sys_id == "9001"
+    assert second.status == "IDEMPOTENT"
+
+
+def test_rpc_cancel_retry_returns_existing_canceled_state_without_provider_call() -> None:
+    # Given: a prior process already moved the broker order to canceled.
+    gateway = CancelReconciliationGateway([[_rpc_order(order_sys_id="168")]])
+    gateway.order_results = iter([[
+        OrderSnapshot(
+            order_sys_id="168",
+            user_order_id="meco00000000000000000001",
+            stock_code="300308.SZ",
+            action="BUY",
+            volume=100,
+            traded_volume=0,
+            status="54",
+        )
+    ]])
+    handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+
+    # When: the same cancel is retried after service recovery.
+    result = handlers.handle("cancel_order", {
+        "account_id": "acct-1",
+        "order_sysid": "168",
+    })
+
+    # Then: cancellation is acknowledged without calling the provider again.
+    assert result.success is True
+    assert gateway.cancel_calls == []
+    assert result.message == "order already cancel-acknowledged"
+
+
+def test_rpc_cancel_retry_does_not_touch_a_filled_order() -> None:
+    # Given: the broker order has already reached its filled terminal state.
+    gateway = CancelReconciliationGateway([[
+        OrderSnapshot(
+            order_sys_id="168",
+            user_order_id="meco00000000000000000001",
+            stock_code="300308.SZ",
+            action="BUY",
+            volume=100,
+            traded_volume=100,
+            status="56",
+        )
+    ]])
+    handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+
+    # When: the cancel request is retried after reconnecting.
+    result = handlers.handle("cancel_order", {
+        "account_id": "acct-1",
+        "order_sysid": "168",
+    })
+
+    # Then: the filled state is returned without another provider cancel.
+    assert result.success is False
+    assert gateway.cancel_calls == []
+    assert result.message == "order is terminal and not cancelable: 56"
+
+
+def test_rpc_cancel_still_sends_once_when_reconciliation_is_unavailable() -> None:
+    # Given: the embedded runtime cannot query current broker state.
+    gateway = CancelReconciliationGateway([TimeoutError("query offline")])
+    handlers = _handlers(order_gateway=gateway, allow_order_methods=True)
+
+    # When: cancellation is sent using the stable broker order identity.
+    result = handlers.handle("cancel_order", {
+        "account_id": "acct-1",
+        "order_sysid": "168",
+    })
+
+    # Then: the provider receives exactly one risk-reducing cancel operation.
+    assert result.success is True
+    assert len(gateway.cancel_calls) == 1
 
 
 def test_rpc_missing_global_and_trade_detail_capabilities_are_not_empty_results() -> None:
@@ -288,18 +488,6 @@ def test_unverified_trading_query_aliases_are_explicitly_unsupported(method: str
         ("order", ("000001.SZ", 23, 100)),
         ("cancel_order", (1,)),
         ("cancel_order_sysid", ("sys-1", 0)),
-        ("credit_order", ("000001.SZ", 23, 100)),
-        ("fund_transfer", (0, 100.0)),
-        ("ctp_fund_transfer", (0, 100.0)),
-        ("bank_transfer", (0, 100.0)),
-        ("smt_order", ("000001.SZ", 23, 100)),
-        ("smt_negotiate_order_async", ("000001.SZ", 23, 100)),
-        ("cancel_smt_order", (1,)),
-        ("order_async", ("000001.SZ", 23, 100)),
-        ("cancel_order_async", (1,)),
-        ("cancel_order_sysid_async", ("sys-1", 0)),
-        ("ctp_transfer_option_to_future", (100.0,)),
-        ("ctp_transfer_future_to_option", (100.0,)),
         (
             "sync_transaction_from_external",
             ("append", "DEAL", [], "STOCK"),
@@ -311,13 +499,12 @@ def test_bridge_write_gate_blocks_every_write_surface(
     args: tuple[object, ...],
 ) -> None:
     trader = RecordingTrader()
-    manager = XtTraderManager(
+    manager = BigQmtTradingManager(
         RecordingRuntime(trader),
         account_id="acct-1",
         order_writes_enabled=False,
     )
     manager._trader = trader
-    manager._account = SimpleNamespace(account_id="acct-1")
 
     with pytest.raises(TradingWriteDisabled, match="bridge_order_writes_disabled"):
         getattr(manager, method)(*args)
@@ -325,11 +512,7 @@ def test_bridge_write_gate_blocks_every_write_surface(
     assert not any(
         call[0]
         in {
-            "order_stock",
-            "fund_transfer",
-            "credit_order",
-            "smt_order",
-            "bank_transfer",
+            "submit_order",
         }
         for call in trader.calls
     )

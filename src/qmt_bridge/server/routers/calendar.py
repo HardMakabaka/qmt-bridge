@@ -1,7 +1,7 @@
 """Router — Trading calendar endpoints /api/calendar/*."""
 
 from fastapi import APIRouter, Query
-from ..bigqmt import xtdata
+from ..bigqmt import market_data
 
 from ..helpers import _call_xtdata_serialized, _numpy_to_python
 
@@ -16,7 +16,7 @@ def get_trading_dates(
     count: int = Query(-1, description="返回条数"),
 ):
     raw = _call_xtdata_serialized(
-        xtdata.get_trading_dates,
+        market_data.get_trading_dates,
         market, start_time=start_time, end_time=end_time, count=count
     )
     return {"market": market, "dates": _numpy_to_python(raw)}
@@ -24,7 +24,7 @@ def get_trading_dates(
 
 @router.get("/holidays")
 def get_holidays():
-    raw = _call_xtdata_serialized(xtdata.get_holidays)
+    raw = _call_xtdata_serialized(market_data.get_holidays)
     return {"holidays": _numpy_to_python(raw)}
 
 
@@ -35,7 +35,7 @@ def get_trading_calendar(
     end_time: str = Query("", description="结束时间"),
 ):
     raw = _call_xtdata_serialized(
-        xtdata.get_trading_calendar,
+        market_data.get_trading_calendar,
         market,
         start_time=start_time,
         end_time=end_time,
@@ -47,7 +47,7 @@ def get_trading_calendar(
 def get_trading_period(
     stock: str = Query(..., description="合约代码，如 000001.SZ"),
 ):
-    raw = _call_xtdata_serialized(xtdata.get_trading_period, stock)
+    raw = _call_xtdata_serialized(market_data.get_trading_period, stock)
     return {"stock": stock, "periods": _numpy_to_python(raw)}
 
 
@@ -63,7 +63,7 @@ def is_trading_date(
 ):
     """Check whether a given date is a trading date."""
     raw = _call_xtdata_serialized(
-        xtdata.get_trading_dates,
+        market_data.get_trading_dates,
         market,
         start_time=date,
         end_time=date,
@@ -79,7 +79,7 @@ def get_prev_trading_date(
 ):
     """Get the previous trading date relative to a given date."""
     raw = _call_xtdata_serialized(
-        xtdata.get_trading_dates,
+        market_data.get_trading_dates,
         market,
         end_time=date,
         count=2,
@@ -97,7 +97,7 @@ def get_next_trading_date(
 ):
     """Get the next trading date relative to a given date."""
     raw = _call_xtdata_serialized(
-        xtdata.get_trading_dates,
+        market_data.get_trading_dates,
         market,
         start_time=date,
         count=2,
@@ -116,7 +116,7 @@ def get_trading_dates_count(
 ):
     """Count number of trading dates in a range."""
     raw = _call_xtdata_serialized(
-        xtdata.get_trading_dates,
+        market_data.get_trading_dates,
         market,
         start_time=start_time,
         end_time=end_time,
@@ -130,5 +130,5 @@ def get_trading_time(
     stock: str = Query(..., description="合约代码"),
 ):
     """Get trading time info for a stock (alias for trading_period with richer info)."""
-    raw = _call_xtdata_serialized(xtdata.get_trading_period, stock)
+    raw = _call_xtdata_serialized(market_data.get_trading_period, stock)
     return {"stock": stock, "trading_time": _numpy_to_python(raw)}

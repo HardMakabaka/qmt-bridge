@@ -2,7 +2,7 @@
 
 > 通过 Big QMT 内嵌策略与本机 ZMQ RPC，将行情、账户和受控委托能力暴露为 HTTP/WebSocket；委托写能力默认开启。
 
-**QMT Bridge** 由两个进程组成：Big QMT 终端内的 Python 模型运行固定版本的 ZMQ RPC，外部 Python 3.10+ FastAPI 服务将其转换为稳定的 HTTP/WebSocket 合同。外部服务不安装或导入原生 `xtquant`；委托端点始终要求 API Key、已连接资金账户、双层写能力，以及当前模型确实运行在“实盘”模式的终端日志证明。
+**QMT Bridge** 由两个进程组成：Big QMT 终端内的 Python 模型运行固定版本的 ZMQ RPC，外部 Python 3.10+ FastAPI 服务将其转换为稳定的 HTTP/WebSocket 合同。外部服务不安装或导入原生 `xtquant`；委托端点始终要求 API Key、已连接资金账户、双层写能力，以及当前模型确实运行在“实盘”模式的终端日志证明。3.0 的移除项和升级方式见 [MIGRATION_3.md](docs/MIGRATION_3.md)。
 
 ```
 Mac / Linux (主力机)                    Windows (中转站)
@@ -22,7 +22,7 @@ QMT Bridge 把终端内能力收敛到只监听回环地址的 ZMQ 边界，再�
 ## Features
 
 - **186 个 HTTP 操作** — 启用账户路由时覆盖行情、板块、财务、账户与受控交易；Python 客户端逐项覆盖
-- **5 个 WebSocket 端点** — 实时行情、全市场行情、公式、L2 千档和交易回报；未验证能力显式返回 `unsupported`
+- **4 个 WebSocket 端点** — 实时行情、共享快照、公式和交易回报；公式推送尚未验证，显式返回 `unsupported`
 - **账户只读查询** — 资产、持仓、当日委托和成交；不需要开启委托写入
 - **受控委托边界** — 下单和撤单默认具备写能力，仍需 API Key、资金账户、两层写门禁和 QMT 实盘模式证明
 - **零依赖客户端** — Python 客户端基于 stdlib，无需安装 xtquant 即可在任意平台使用
@@ -112,19 +112,16 @@ qmt-server --qmt-root "C:\国金证券QMT交易端" \
   --api-key your-secret-key
 ```
 
-也可以使用脚本：
+Windows 推荐使用受管理脚本。它只管理本仓库虚拟环境启动的 bridge 进程，校验 PID、
+启动时间、可执行文件和命令行；不会启动 QMT、登录账户或重新加载策略模型：
 
-```bash
-# 前台运行（Ctrl+C 停止）
-bash scripts/start.sh
+```powershell
+.\scripts\manage-bridge.ps1 start
+.\scripts\manage-bridge.ps1 status
+.\scripts\manage-bridge.ps1 stop
 
-# 后台运行
-bash scripts/start-nohup.sh
-bash scripts/stop.sh
-
-# Windows
-scripts\start.bat
-scripts\stop.bat
+# 前台调试
+.\scripts\manage-bridge.ps1 start -Foreground -- --log-level debug
 ```
 
 ### 5. 验证
@@ -191,6 +188,12 @@ curl http://<Windows局域网IP>:13543/api/meta/capabilities
 | `QMT_BRIDGE_TRADING_ACCOUNT_ID` | `--account-id` | _(空)_ | 交易账户 ID |
 | `QMT_BRIDGE_ORDER_WRITES_ENABLED` | `--order-writes-enabled` | `true` | API 层委托写入门禁；可显式设为 `false` 冻结写入，终端层门禁仍需同时开启 |
 
+### 全链路诊断
+
+HTTP/SDK、RPC、QMT 原生调用、数据缓存、交易回报、下载与生命周期已接入本地结构化埋点。
+配置、按 trace/job/order ID 检索和状态解释见 [可观测性说明](docs/OBSERVABILITY.md)，
+实施范围与验收记录见 [实施计划](docs/OBSERVABILITY_PLAN.md)。埋点不替代柜台成交证据或业务对账。
+
 ## API Reference
 
 完整 API 文档请访问运行中的服务 `/docs`（Swagger UI）或 `/redoc`（ReDoc）。以下为端点概览。
@@ -224,7 +227,6 @@ curl http://<Windows局域网IP>:13543/api/meta/capabilities
 | GET | `/api/tick/l2_quote` | L2 行情快照 |
 | GET | `/api/tick/l2_order` | L2 逐笔委托 |
 | GET | `/api/tick/l2_transaction` | L2 逐笔成交 |
-| GET | `/api/tick/l2_thousand_quote` | L2 千档行情 |
 
 ### Sector — 板块数据 `/api/sector/*`
 
@@ -233,10 +235,8 @@ curl http://<Windows局域网IP>:13543/api/meta/capabilities
 | GET | `/api/sector/list` | 所有板块列表 |
 | GET | `/api/sector/stocks` | 板块成分股（支持历史日期） |
 | GET | `/api/sector/info` | 板块元数据 |
-| POST | `/api/sector/create_folder` | 创建板块文件夹 |
 | POST | `/api/sector/create` | 创建自定义板块 |
 | POST | `/api/sector/add_stocks` | 添加成分股 |
-| POST | `/api/sector/remove_stocks` | 移除成分股 |
 | DELETE | `/api/sector/remove` | 删除板块 |
 
 ### Calendar — 交易日历 `/api/calendar/*`
@@ -307,10 +307,11 @@ curl http://<Windows局域网IP>:13543/api/meta/capabilities
 |--------|------|-------------|
 | GET | `/api/meta/health` | HTTP 进程存活检查 |
 | GET | `/api/meta/readiness` | Big QMT ZMQ、账户和固定上游版本运行就绪检查 |
+| GET | `/api/meta/history-readiness` | 固定单标的短窗 1m 原生 ZMQ 数据探针，绕过 FormulaServer/bridge 缓存，不订阅、不下载 |
+| GET | `/api/meta/recovery-status` | 无 RPC 的在途委托/撤单 HTTP 请求计数，供宿主机恢复前检查 |
 | GET | `/api/meta/capabilities` | 全量 HTTP/WS 能力、适配模式、运行状态和原因码 |
 | GET | `/api/meta/version` | 服务版本 |
-| GET | `/api/meta/xtdata_version` | xtquant 版本 |
-| GET | `/api/meta/connection_status` | xtdata 连接状态 |
+| GET | `/api/meta/connection_status` | Big QMT RPC 连接与恢复状态 |
 | GET | `/api/meta/markets` | 可用市场列表 |
 | GET | `/api/meta/periods` | K 线周期列表 |
 | GET | `/api/meta/stock_list` | 按类别获取证券列表 |
@@ -329,8 +330,6 @@ curl http://<Windows局域网IP>:13543/api/meta/capabilities
 | POST | `/api/download/etf_info` | 下载 ETF 信息 |
 | POST | `/api/download/cb_data` | 下载可转债数据 |
 | POST | `/api/download/history_contracts` | 下载过期合约 |
-| POST | `/api/download/ipo_data` | 下载 IPO 数据 |
-| POST | `/api/download/option_data` | 下载期权数据 |
 
 ### Trading — 交易 `/api/trading/*` (需要 API Key)
 
@@ -355,15 +354,11 @@ curl http://<Windows局域网IP>:13543/api/meta/capabilities
 | GET | `/api/credit/asset` | 信用资产 |
 | GET | `/api/credit/debt` | 信用负债 |
 
-### Fund & Bank — 资金划转 (需要 API Key)
+### Fund — 资金查询 (需要 API Key)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/fund/transfer` | 资金划转（当前未适配） |
-| GET | `/api/fund/transfer_records` | 划转记录（当前未适配） |
 | GET | `/api/fund/available` | 可用资金（由资产查询派生） |
-| POST | `/api/bank/transfer_in` | 银行转证券（当前未适配） |
-| POST | `/api/bank/transfer_out` | 证券转银行（当前未适配） |
 
 ### WebSocket
 
@@ -372,7 +367,6 @@ curl http://<Windows局域网IP>:13543/api/meta/capabilities
 | `/ws/realtime` | 实时行情推送 |
 | `/ws/whole_quote` | 全市场行情订阅 |
 | `/ws/formula` | 公式推送；当前 Big QMT 合同未验证，返回 `unsupported` |
-| `/ws/l2_thousand` | L2 千档推送；当前 Big QMT 合同未验证，返回 `unsupported` |
 | `/ws/trade` | 交易回报推送 (需要 API Key) |
 
 WebSocket 连接后发送 JSON 订阅请求：
@@ -384,8 +378,6 @@ WebSocket 连接后发送 JSON 订阅请求：
 // /ws/whole_quote
 { "codes": ["SH", "SZ"] }
 
-// /ws/l2_thousand
-{ "stocks": ["000001.SZ"] }
 ```
 
 ## Python Client
@@ -531,9 +523,7 @@ qmt-bridge/
 ├── pyproject.toml                  # 项目元数据与依赖
 ├── .env.example                    # 配置模板
 ├── scripts/                        # 启动 / 停止脚本
-│   ├── start.sh / start.bat        # 前台启动
-│   ├── start-nohup.sh              # 后台启动
-│   └── stop.sh / stop.bat          # 停止服务
+│   └── manage-bridge.ps1           # Windows 受管理的启动、状态和停止
 ├── src/qmt_bridge/
 │   ├── _version.py                 # 版本号
 │   ├── server/                     # FastAPI 服务端
@@ -545,7 +535,7 @@ qmt-bridge/
 │   │   ├── models.py               # Pydantic 请求 / 响应模型
 │   │   ├── deps.py                 # 依赖注入
 │   │   ├── routers/                # REST API 路由 (21 个模块)
-│   │   ├── ws/                     # WebSocket 端点 (5 个)
+│   │   ├── ws/                     # WebSocket 端点
 │   │   └── trading/                # 交易模块
 │   │       ├── manager.py          # XtTraderManager 生命周期
 │   │       └── callbacks.py        # 交易回调
@@ -561,7 +551,7 @@ qmt-bridge/
 
 QMT Bridge 支持可选的 API Key 认证机制：
 
-- **交易端点** (`/api/trading/*`, `/api/credit/*`, `/api/fund/*`, `/api/bank/*`) — 设置了 `API_KEY` 时强制认证
+- **交易端点** (`/api/trading/*`, `/api/credit/*`, `/api/fund/*`, `/api/smt/*`) — 设置了 `API_KEY` 时强制认证
 - **数据端点** — 默认无需认证，可通过 `QMT_BRIDGE_REQUIRE_AUTH_FOR_DATA=true` 开启
 - **认证方式** — HTTP Header `X-API-Key: your-secret-key`
 
@@ -587,7 +577,8 @@ QMT Bridge 支持可选的 API Key 认证机制：
 
 **Q: 数据延迟大吗？**
 
-局域网内 HTTP 请求延迟通常在 1–5ms。实时 tick 通过 WebSocket 推送，延迟取决于 QMT 客户端本身的行情速度。
+未对当前部署做性能承诺。实时行情由 Big QMT 回调转发；延迟和可用性应以运行中的
+`/api/meta/readiness`、业务端超时与调用方自己的测量为准。
 
 **Q: 客户端需要安装什么依赖吗？**
 

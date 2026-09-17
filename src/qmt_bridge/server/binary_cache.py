@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -13,6 +13,8 @@ import tempfile
 import threading
 import time
 from typing import Any, Callable
+
+from bigqmt_signal_trader.telemetry import emit, span
 
 
 BINARY_CACHE_SCHEMA_VERSION = "qmt_bridge_binary_cache_v1"
@@ -31,6 +33,17 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         return default
     try:
         value = int(str(raw).strip())
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(str(raw).strip())
     except ValueError:
         return default
     return max(minimum, value)
@@ -84,6 +97,7 @@ class BinaryCache:
         cache_dir: Path | None = None,
         ttl_seconds: int | None = None,
         max_bytes: int | None = None,
+        singleflight_wait_seconds: float | None = None,
     ) -> None:
         self.enabled = _env_bool("QMT_BRIDGE_BINARY_CACHE_ENABLED", True) if enabled is None else enabled
         self.cache_dir = cache_dir or _default_cache_dir()
@@ -97,6 +111,13 @@ class BinaryCache:
             if max_bytes is not None
             else _env_int("QMT_BRIDGE_BINARY_CACHE_MAX_BYTES", 2 * 1024 * 1024 * 1024, minimum=0)
         )
+        self.singleflight_wait_seconds = (
+            singleflight_wait_seconds
+            if singleflight_wait_seconds is not None
+            else _env_float("QMT_BRIDGE_BINARY_CACHE_SINGLEFLIGHT_WAIT_SECONDS", 30.0)
+        )
+        if self.singleflight_wait_seconds <= 0:
+            self.singleflight_wait_seconds = 30.0
         self._inflight_lock = threading.Lock()
         self._inflight: dict[str, Future[tuple[Any, dict[str, Any]]]] = {}
 
@@ -139,6 +160,7 @@ class BinaryCache:
         extra_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
+            emit("market.binary_cache.store_skipped", namespace=namespace, reason="disabled")
             return {"enabled": False, "stored": False}
         path = self.path_for(namespace, params)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +185,7 @@ class BinaryCache:
             size = path.stat().st_size
             metadata["size_bytes"] = size
             self._enforce_size_budget()
+            emit("market.binary_cache.stored", namespace=namespace, size_bytes=size)
             return {"enabled": True, "stored": True, "path": str(path), **metadata}
         except Exception:
             self._delete_best_effort(tmp_path)
@@ -179,6 +202,7 @@ class BinaryCache:
     ) -> tuple[Any, dict[str, Any]]:
         read = self.get(namespace, params)
         if read.hit:
+            emit("market.binary_cache.hit", namespace=namespace)
             return read.data, {"enabled": self.enabled, "hit": True, **(read.metadata or {})}
 
         key = _cache_key(namespace, params)
@@ -189,15 +213,29 @@ class BinaryCache:
                 flight = Future()
                 self._inflight[key] = flight
         if not owns_flight:
-            return flight.result()
+            try:
+                with span("market.binary_cache.singleflight_wait", namespace=namespace) as result:
+                    value = flight.result(timeout=self.singleflight_wait_seconds)
+                    result["outcome"] = "success"
+                    return value
+            except FutureTimeout as exc:
+                # A caller waiting behind a slow QMT request must retain a
+                # bounded request budget; it did not execute the loader.
+                emit("market.binary_cache.singleflight_wait", namespace=namespace,
+                     outcome="timeout", critical=True)
+                raise TimeoutError("binary_cache_singleflight_wait_timeout") from exc
 
         try:
-            data = loader()
+            with span("market.binary_cache.load", namespace=namespace) as result:
+                data = loader()
+                result["outcome"] = "success"
             cacheable = should_store(data) if should_store is not None else True
             if cacheable:
                 metadata = self.set(namespace, params, data, extra_metadata=extra_metadata)
                 result = (data, {"hit": False, **metadata})
             else:
+                emit("market.binary_cache.store_skipped", namespace=namespace,
+                     reason="not_cacheable")
                 result = (
                     data,
                     {"enabled": self.enabled, "hit": False, "stored": False, "reason": "not_cacheable"},
@@ -233,6 +271,7 @@ class BinaryCache:
             "cache_dir": str(self.cache_dir),
             "ttl_seconds": self.ttl_seconds,
             "max_bytes": self.max_bytes,
+            "singleflight_wait_seconds": self.singleflight_wait_seconds,
             "files": total_files,
             "bytes": total_bytes,
             "namespaces": namespaces,

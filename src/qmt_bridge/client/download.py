@@ -63,13 +63,7 @@ class DownloadMixin:
         """Trigger expired contracts download."""
         return self._post("/api/download/history_contracts", {})
 
-    def download_ipo_data(self) -> dict:
-        """Trigger IPO data download."""
-        return self._post("/api/download/ipo_data", {})
 
-    def download_option_data(self) -> dict:
-        """Trigger option data download."""
-        return self._post("/api/download/option_data", {})
 
 
     def download_financial_data2(

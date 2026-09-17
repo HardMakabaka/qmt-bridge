@@ -6,6 +6,11 @@ import pickle
 import time
 
 from .code_utils import normalize_stock_code
+from .telemetry import emit
+
+
+def _emit(name, critical=False, **fields):
+    emit(name, critical=critical, **fields)
 
 
 MARKET_CODES = {"SH", "SZ", "BJ", "HK"}
@@ -90,6 +95,8 @@ def request_full_tick_cache(redis_client, account_id, codes, demand_ttl_seconds=
         redis_client.expire(key, max(30, int(float(demand_ttl_seconds) * 3)))
     except Exception:
         pass
+    _emit("full_tick_demand_registered", account_id=str(account_id or ""),
+          subscription_id=request_id, code_count=len(normalized))
     return payload
 
 
@@ -107,6 +114,8 @@ def write_full_tick_cache(redis_client, account_id, codes, data, cache_ttl_secon
     key = full_tick_cache_key(account_id, request_id=request_id)
     ttl = int(max(1, float(cache_ttl_seconds)))
     redis_client.setex(key, ttl, _dump_snapshot(payload))
+    _emit("full_tick_cache_written", account_id=str(account_id or ""),
+          subscription_id=request_id, code_count=len(normalized))
     return payload
 
 
@@ -115,6 +124,7 @@ def read_full_tick_cache(redis_client, account_id, codes, max_age_seconds=10):
     key = full_tick_cache_key(account_id, codes=normalized)
     snapshot = _load_snapshot(redis_client.get(key))
     if not isinstance(snapshot, dict):
+        _emit("full_tick_cache_miss", account_id=str(account_id or ""), reason="missing")
         return None
     if normalize_full_tick_codes(snapshot.get("codes") or []) != normalized:
         return None
@@ -122,6 +132,7 @@ def read_full_tick_cache(redis_client, account_id, codes, max_age_seconds=10):
     if updated_at <= 0:
         return None
     if time.time() - updated_at > float(max_age_seconds):
+        _emit("full_tick_cache_miss", account_id=str(account_id or ""), reason="stale")
         return None
     data = snapshot.get("data")
     return data if isinstance(data, dict) else None
@@ -198,12 +209,15 @@ def refresh_full_tick_cache(
     """
     started_at = time.time()
     refreshed = 0
-    for demand in iter_active_full_tick_demands(
+    demands = iter_active_full_tick_demands(
         redis_client,
         account_id,
         demand_ttl_seconds=demand_ttl_seconds,
         max_requests=max_requests,
-    ):
+    )
+    if not demands:
+        _emit("full_tick_refresh_skipped", account_id=str(account_id or ""), reason="no_demand")
+    for demand in demands:
         codes = demand.get("codes") or []
         is_market = _demand_is_market(codes)
         if kind == "symbol" and is_market:
@@ -216,4 +230,7 @@ def refresh_full_tick_cache(
         ttl = demand.get("cache_ttl_seconds") or cache_ttl_seconds
         write_full_tick_cache(redis_client, account_id, codes, tick_data, cache_ttl_seconds=ttl)
         refreshed += 1
+    _emit("full_tick_refresh_summary", account_id=str(account_id or ""),
+          refreshed=refreshed, kind=kind or "all",
+          elapsed_ms=int((time.time() - started_at) * 1000))
     return refreshed

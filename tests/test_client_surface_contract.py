@@ -42,3 +42,27 @@ def test_python_client_covers_every_public_http_operation() -> None:
     }
 
     assert client_operations == server_operations
+
+
+def test_minute_recovery_clients_preserve_status_and_request_contract(monkeypatch) -> None:
+    from qmt_bridge import QMTClient
+
+    client = QMTClient("127.0.0.1", port=1)
+    calls = []
+    payload = {"status": "partial", "missing_stocks": ["000300.SH"], "data": {}}
+
+    def fake_get(path, params=None):
+        calls.append((path, params))
+        return payload
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    assert client.get_minute_tail(["000300.SH"], "20260820145700", "20260820145900") is payload
+    assert calls[-1] == ("/api/market/minute_tail", {
+        "stocks": "000300.SH", "start_time": "20260820145700", "end_time": "20260820145900",
+        "count": 3, "refresh_missing": True,
+    })
+    assert client.get_history_readiness("000300.SH", "20260820145700", "20260820145900") is payload
+    assert calls[-1][0] == "/api/meta/history-readiness"
+    assert calls[-1][1]["timeout_seconds"] == 8
+    assert client.get_recovery_status() is payload
+    assert calls[-1] == ("/api/meta/recovery-status", None)

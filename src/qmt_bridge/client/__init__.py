@@ -20,7 +20,6 @@ from qmt_bridge.client.trading import TradingMixin
 from qmt_bridge.client.credit import CreditMixin
 from qmt_bridge.client.fund import FundMixin
 from qmt_bridge.client.smt import SMTMixin
-from qmt_bridge.client.bank import BankMixin
 from qmt_bridge.client.websocket import WebSocketMixin
 
 
@@ -44,7 +43,6 @@ class QMTClient(
     CreditMixin,
     FundMixin,
     SMTMixin,
-    BankMixin,
     WebSocketMixin,
     BaseClient,
 ):

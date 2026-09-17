@@ -6,6 +6,16 @@ from typing import Optional
 class MarketMixin:
     """Client methods for /api/market/* and legacy market endpoints."""
 
+    def get_minute_tail(
+        self, stocks: list[str], start_time: str, end_time: str, *,
+        count: int = 3, refresh_missing: bool = True,
+    ) -> dict:
+        """Read closed raw minutes while preserving gaps, status and per-stock source."""
+        return self._get("/api/market/minute_tail", {
+            "stocks": ",".join(stocks), "start_time": start_time, "end_time": end_time,
+            "count": count, "refresh_missing": refresh_missing,
+        })
+
     # ------------------------------------------------------------------
     # Legacy API
     # ------------------------------------------------------------------
@@ -279,27 +289,7 @@ class MarketMixin:
         })
         return self._response_value(resp, default={})
 
-    def get_fullspeed_orderbook(
-        self, stock: str, start_time: str = "", end_time: str = ""
-    ) -> dict:
-        """Get full-speed order book data."""
-        resp = self._get("/api/market/fullspeed_orderbook", {
-            "stock": stock,
-            "start_time": start_time,
-            "end_time": end_time,
-        })
-        return self._response_value(resp, default={})
 
-    def get_transactioncount(
-        self, stock: str, start_time: str = "", end_time: str = ""
-    ) -> dict:
-        """Get transaction count data."""
-        resp = self._get("/api/market/transactioncount", {
-            "stock": stock,
-            "start_time": start_time,
-            "end_time": end_time,
-        })
-        return self._response_value(resp, default={})
 
     def subscribe_warmup(
         self,

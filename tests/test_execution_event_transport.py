@@ -11,7 +11,7 @@ from bigqmt_signal_trader.exec_events import (
     EventReplayBuffer,
     ZmqExecutionEventPublisher,
 )
-from bigqmt_signal_trader.xtquant_compat import BigQmtXtTrader
+from bigqmt_signal_trader.trading_client import BigQmtTradingClient
 
 
 def test_event_replay_buffer_assigns_monotonic_cursor_and_replays_after_cursor() -> None:
@@ -97,10 +97,10 @@ def test_trader_replays_after_cursor_and_deduplicates_live_event() -> None:
         def __init__(self) -> None:
             self.trades = []
 
-        def on_stock_trade(self, trade) -> None:
+        def on_trade(self, trade) -> None:
             self.trades.append(trade)
 
-    trader = BigQmtXtTrader(account_id="acct-1", redis_config={})
+    trader = BigQmtTradingClient(account_id="acct-1", redis_config={})
     trader.client = ReplayClient()
     trader.callback = Callback()
     trader._event_cursor = {"epoch": "epoch-1", "sequence": 1}
@@ -109,7 +109,7 @@ def test_trader_replays_after_cursor_and_deduplicates_live_event() -> None:
     trader._dispatch_event(event)
 
     assert len(trader.callback.trades) == 1
-    assert trader.callback.trades[0].trade_id == "T2"
+    assert trader.callback.trades[0]["trade_id"] == "T2"
     assert trader._event_cursor == {"epoch": "epoch-1", "sequence": 2}
 
 
@@ -138,16 +138,16 @@ def test_trader_initial_subscription_replays_retained_events() -> None:
         def __init__(self) -> None:
             self.orders = []
 
-        def on_stock_order(self, order) -> None:
+        def on_order(self, order) -> None:
             self.orders.append(order)
 
-    trader = BigQmtXtTrader(account_id="acct-1", redis_config={})
+    trader = BigQmtTradingClient(account_id="acct-1", redis_config={})
     trader.client = ReplayClient()
     trader.callback = Callback()
 
     trader._replay_execution_events()
 
-    assert [order.order_id for order in trader.callback.orders] == ["O1"]
+    assert [order["order_id"] for order in trader.callback.orders] == ["O1"]
     assert trader._event_cursor == {"epoch": "epoch-1", "sequence": 1}
 
 
@@ -159,10 +159,10 @@ def test_trader_ignores_other_account_events_but_advances_cursor() -> None:
         def __init__(self) -> None:
             self.trades = []
 
-        def on_stock_trade(self, trade) -> None:
+        def on_trade(self, trade) -> None:
             self.trades.append(trade)
 
-    trader = BigQmtXtTrader(account_id="acct-1", redis_config={})
+    trader = BigQmtTradingClient(account_id="acct-1", redis_config={})
     trader.client = Client()
     trader.callback = Callback()
     trader._dispatch_event(
@@ -192,7 +192,7 @@ def test_zmq_listener_periodically_repairs_dropped_pub_events(monkeypatch) -> No
                 "gap": False,
             }
 
-    trader = BigQmtXtTrader(account_id="acct-1", redis_config={})
+    trader = BigQmtTradingClient(account_id="acct-1", redis_config={})
     trader.client = ReplayClient()
     trader._event_cursor = {"epoch": "epoch-1", "sequence": 1}
     trader._event_running = True
@@ -262,15 +262,15 @@ def test_trader_repairs_detected_live_sequence_gap_before_dispatch() -> None:
         def __init__(self) -> None:
             self.trades = []
 
-        def on_stock_trade(self, trade) -> None:
+        def on_trade(self, trade) -> None:
             self.trades.append(trade)
 
-    trader = BigQmtXtTrader(account_id="acct-1", redis_config={})
+    trader = BigQmtTradingClient(account_id="acct-1", redis_config={})
     trader.client = ReplayClient()
     trader.callback = Callback()
     trader._event_cursor = {"epoch": "epoch-1", "sequence": 1}
 
     trader._dispatch_event(replay_events[-1])
 
-    assert [trade.trade_id for trade in trader.callback.trades] == ["T2", "T3"]
+    assert [trade["trade_id"] for trade in trader.callback.trades] == ["T2", "T3"]
     assert trader._event_cursor == {"epoch": "epoch-1", "sequence": 3}

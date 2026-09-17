@@ -34,30 +34,12 @@ class FinancialDownloadRequest(BaseModel):
     end_time: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Sector write models
-# ---------------------------------------------------------------------------
-
-class CreateSectorFolderRequest(BaseModel):
-    folder_name: str
-
-
 class CreateSectorRequest(BaseModel):
     sector_name: str
     parent_node: str = ""
 
 
 class AddSectorStocksRequest(BaseModel):
-    sector_name: str
-    stocks: list[str]
-
-
-class RemoveSectorStocksRequest(BaseModel):
-    sector_name: str
-    stocks: list[str]
-
-
-class ResetSectorRequest(BaseModel):
     sector_name: str
     stocks: list[str]
 
@@ -99,57 +81,8 @@ class QueryAssetRequest(BaseModel):
     account_id: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Credit trading models
-# ---------------------------------------------------------------------------
-
-class CreditOrderRequest(BaseModel):
-    account_id: str = ""
-    stock_code: str
-    order_type: int
-    order_volume: int
-    price_type: int = 5
-    price: float = 0.0
-    credit_type: str = "fin_buy"  # fin_buy / slo_sell / buy_back / sell_back
-    strategy_name: str = ""
-    order_remark: str = ""
-
-
 class CreditQueryRequest(BaseModel):
     account_id: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Fund transfer models
-# ---------------------------------------------------------------------------
-
-class FundTransferRequest(BaseModel):
-    account_id: str = ""
-    transfer_direction: int  # 0: in, 1: out
-    amount: float
-
-
-class BankTransferRequest(BaseModel):
-    account_id: str = ""
-    transfer_direction: int
-    amount: float
-    bank_code: str = ""
-
-
-# ---------------------------------------------------------------------------
-# SMT models
-# ---------------------------------------------------------------------------
-
-class SMTOrderRequest(BaseModel):
-    account_id: str = ""
-    stock_code: str
-    order_type: int
-    order_volume: int
-    price_type: int = 5
-    price: float = 0.0
-    smt_type: str = ""
-    strategy_name: str = ""
-    order_remark: str = ""
 
 
 class SMTQueryRequest(BaseModel):
@@ -182,15 +115,6 @@ class CallFormulaBatchRequest(BaseModel):
     params: dict = {}
 
 
-class GenerateIndexDataRequest(BaseModel):
-    index_code: str
-    stocks: list[str]
-    weights: list[float]
-    period: str = "1d"
-    start_time: str = ""
-    end_time: str = ""
-
-
 # ---------------------------------------------------------------------------
 # Additional download models
 # ---------------------------------------------------------------------------
@@ -200,65 +124,9 @@ class FinancialDownload2Request(BaseModel):
     tables: list[str] = []
 
 
-# ---------------------------------------------------------------------------
-# Async order models
-# ---------------------------------------------------------------------------
-
-class AsyncOrderRequest(BaseModel):
-    account_id: str = ""
-    stock_code: str
-    order_type: int
-    order_volume: int
-    price_type: int = 5
-    price: float = 0.0
-    strategy_name: str = ""
-    order_remark: str = ""
-
-
-class AsyncCancelRequest(BaseModel):
-    account_id: str = ""
-    order_id: int = 0
-    order_sysid: str = ""
-    market: int | str = ""
-
-
-# ---------------------------------------------------------------------------
-# Export / Sync models
-# ---------------------------------------------------------------------------
-
-class ExportDataRequest(BaseModel):
-    account_id: str = ""
-    data_type: str = "orders"
-    file_path: str = ""
-
-
 class SyncTransactionRequest(BaseModel):
     account_id: str = ""
     account_type: str = "STOCK"
     operation: str
     data_type: str
     data: list[dict] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# CTP cross-market transfer models
-# ---------------------------------------------------------------------------
-
-class CTPCrossMarketTransferRequest(BaseModel):
-    account_id: str = ""
-    amount: float
-
-
-# ---------------------------------------------------------------------------
-# SMT appointment / negotiate models
-# ---------------------------------------------------------------------------
-
-class SMTNegotiateOrderRequest(BaseModel):
-    account_id: str = ""
-    stock_code: str
-    order_type: int
-    order_volume: int
-    price: float = 0.0
-    compact_id: str = ""
-    strategy_name: str = ""
-    order_remark: str = ""

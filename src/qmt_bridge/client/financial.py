@@ -22,23 +22,6 @@ class FinancialMixin:
         })
         return self._response_value(resp, default={})
 
-    def get_financial_data_field(
-        self,
-        table: str,
-        field: str,
-        market: str = "",
-        code: str = "",
-        report_type: str = "report_time",
-        barpos: int = -1,
-    ) -> dict:
-        return self._get("/api/financial/field", {
-            "table": table,
-            "field": field,
-            "market": market,
-            "code": code,
-            "report_type": report_type,
-            "barpos": barpos,
-        })
 
     def get_raw_financial_data(
         self,

@@ -50,6 +50,10 @@ class Settings:
     formula_enabled: bool = True
     formula_host: str = "127.0.0.1"
     formula_port: int = 58600
+    formula_history_read_workers: int = 2
+    local_cache_enabled: bool = False
+    local_cache_dir: str = ""
+    local_cache_format: str = "auto"
 
     account_enabled: bool = False
     trading_account_id: str = ""
@@ -109,6 +113,17 @@ class Settings:
             ),
             formula_port=int(
                 os.environ.get("QMT_BRIDGE_FORMULA_PORT", "58600")
+            ),
+            formula_history_read_workers=int(
+                os.environ.get("QMT_BRIDGE_FORMULA_HISTORY_READ_WORKERS", "2")
+            ),
+            local_cache_enabled=os.environ.get(
+                "QMT_BRIDGE_LOCAL_CACHE_ENABLED", "false"
+            ).lower()
+            in ("1", "true", "yes", "on"),
+            local_cache_dir=os.environ.get("QMT_BRIDGE_LOCAL_CACHE_DIR", ""),
+            local_cache_format=os.environ.get(
+                "QMT_BRIDGE_LOCAL_CACHE_FORMAT", "auto"
             ),
             account_enabled=os.environ.get(
                 "QMT_BRIDGE_ACCOUNT_ENABLED", ""

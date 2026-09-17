@@ -8,6 +8,7 @@ clear error so misconfiguration fails fast.
 """
 
 from .base import RpcTransport, TransportError
+from ..telemetry import emit
 
 
 class SharedMemoryTransport(RpcTransport):
@@ -19,6 +20,8 @@ class SharedMemoryTransport(RpcTransport):
         )
 
     def _unsupported(self):
+        emit("rpc.transport.shm.unsupported", critical=True, transport="shm",
+             outcome="unsupported")
         raise TransportError(
             "shared-memory transport is not implemented yet "
             "(requires Python 3.8+ shared_memory or a custom mmap ring buffer)"

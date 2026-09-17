@@ -20,6 +20,24 @@ routing hints (``reply_key``/``reply_channel``/``reply_list``/``ttl_seconds``);
 Redis uses them, other transports may ignore them and use native routing.
 """
 
+from ..telemetry import bind_context, emit, extract_trace, span
+
+
+def _response_outcome(response):
+    if response is None or response.get("ok"):
+        return "success"
+    error_type = str(response.get("error_type") or "")
+    status = str(response.get("status") or "")
+    if error_type in ("NotImplementedError", "AttributeError"):
+        return "unsupported"
+    if error_type in ("TimeoutError", "TransportTimeout") or status == "DEADLINE_EXCEEDED":
+        return "timeout"
+    if error_type in ("PermissionError", "ValueError", "TypeError"):
+        return "rejected"
+    if status == "OVERLOADED":
+        return "overloaded"
+    return "unknown"
+
 
 class TransportError(RuntimeError):
     """A transport failed (connection lost, encode error, etc.)."""
@@ -95,26 +113,44 @@ class RpcTransport(object):
         callback = self._on_request
         if callback is None:
             return None
-        try:
-            response = callback(request)
-        except Exception as exc:  # noqa: BLE001 - transport must survive
-            import datetime as _dt
+        request = request or {}
+        context = extract_trace(request)
+        context.setdefault("rpc_request_id", str(request.get("request_id") or ""))
+        method = str(request.get("method") or "")
+        with bind_context(**context):
+            emit("rpc.server.handler.received", rpc_request_id=context["rpc_request_id"],
+                 method=method, transport=self.name)
+            try:
+                with span("rpc.server.handler", rpc_request_id=context["rpc_request_id"],
+                          method=method, transport=self.name) as observed:
+                    response = callback(request)
+                    observed["outcome"] = _response_outcome(response)
+            except Exception as exc:  # noqa: BLE001 - transport must survive
+                import datetime as _dt
 
-            response = {
-                "schema_version": 1,
-                "request_id": str((request or {}).get("request_id") or ""),
-                "account_id": str((request or {}).get("account_id") or self.account_id or ""),
-                "method": str((request or {}).get("method") or ""),
-                "ok": False,
-                "data": None,
-                "error": "%s: %s" % (exc.__class__.__name__, exc),
-                "error_type": exc.__class__.__name__,
-                "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
+                response = {
+                    "schema_version": 1,
+                    "request_id": str(request.get("request_id") or ""),
+                    "account_id": str(request.get("account_id") or self.account_id or ""),
+                    "method": method,
+                    "ok": False,
+                    "data": None,
+                    "error": "%s: %s" % (exc.__class__.__name__, exc),
+                    "error_type": exc.__class__.__name__,
+                    "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                emit("rpc.server.handler.error", rpc_request_id=context["rpc_request_id"],
+                     method=method, transport=self.name, outcome="unknown",
+                     error_type=type(exc).__name__, critical=True)
         if response is not None:
             try:
                 self.send_response(request, response)
+                emit("rpc.server.response.sent", rpc_request_id=context["rpc_request_id"],
+                     method=method, transport=self.name,
+                     outcome=_response_outcome(response))
             except Exception:
+                emit("rpc.server.response.send_failed", rpc_request_id=context["rpc_request_id"],
+                     method=method, transport=self.name, outcome="unknown", critical=True)
                 pass
         return response
 

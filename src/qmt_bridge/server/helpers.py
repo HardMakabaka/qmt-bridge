@@ -1,10 +1,15 @@
 """QMT Bridge — data conversion helpers."""
 
 import math
+import os
 import threading
+import time
 
 import numpy as np
 import pandas as pd
+
+from bigqmt_signal_trader.request_budget import current_deadline, request_budget
+from bigqmt_signal_trader import telemetry
 
 
 _OBJECT_FIELDS = (
@@ -58,20 +63,90 @@ class XtdataTransportStuckError(RuntimeError):
     pass
 
 
+class NativePayloadError(ValueError):
+    """Native data could not be represented without discarding its content."""
+
+
 class _XtdataTransportCoordinator:
-    def __init__(self) -> None:
+    def __init__(self, lane="market") -> None:
+        self.lane = lane
         self._call_lock = threading.RLock()
         self._state_lock = threading.Lock()
         self._stuck_reason: str | None = None
 
     def call(self, cancel_event, function, *args, **kwargs):
+        with telemetry.span("native.lane", lane=self.lane, method=getattr(function, "__name__", "callable")) as result:
+            result["call_started"] = False
+            return self._call_observed(result, cancel_event, function, *args, **kwargs)
+
+    def _call_observed(self, result, cancel_event, function, *args, **kwargs):
+        waiting = time.monotonic()
+        budget = float(os.environ.get("QMT_BRIDGE_RPC_TIMEOUT_SECONDS", "6"))
+        deadline = time.monotonic() + budget
+        inherited = current_deadline()
+        if inherited is not None:
+            deadline = min(deadline, inherited)
         while True:
-            self._raise_if_unavailable(cancel_event)
-            if self._call_lock.acquire(timeout=_XTDATA_LOCK_POLL_SECONDS):
-                break
+            try:
+                self._raise_if_unavailable(cancel_event)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result["outcome"] = "timeout"
+                    result["phase"] = "lock_wait"
+                    raise TimeoutError("native request deadline expired waiting for transport")
+                if self._call_lock.acquire(timeout=min(_XTDATA_LOCK_POLL_SECONDS, remaining)):
+                    break
+            finally:
+                result["queue_wait_ms"] = round((time.monotonic() - waiting) * 1000, 3)
         try:
             self._raise_if_unavailable(cancel_event)
-            return function(*args, **kwargs)
+            if time.monotonic() >= deadline:
+                result.update(outcome="timeout", phase="before_call")
+                raise TimeoutError("native request deadline expired before invocation")
+            with request_budget(deadline):
+                result.update(call_started=True, remaining_budget_ms=max(0, (deadline - time.monotonic()) * 1000))
+                with telemetry.span("native.lane.invoke", lane=self.lane):
+                    return function(*args, **kwargs)
+        finally:
+            self._call_lock.release()
+
+    def call_with_budget(self, budget_seconds, callback):
+        """Enter the serialized transport only while a total deadline remains.
+
+        The callback receives the remaining budget and is responsible for
+        passing it to the native RPC client.  It is never invoked after the
+        lock wait has consumed the deadline.
+        """
+        with telemetry.span("native.lane", lane=self.lane, method=getattr(callback, "__name__", "callable")) as result:
+            result["call_started"] = False
+            return self._call_with_budget_observed(result, budget_seconds, callback)
+
+    def _call_with_budget_observed(self, result, budget_seconds, callback):
+        waiting = time.monotonic()
+        deadline = waiting + max(float(budget_seconds), 0.0)
+        while True:
+            try:
+                self._raise_if_unavailable(None)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result.update(outcome="timeout", phase="lock_wait")
+                    raise TimeoutError("xtdata call budget expired before transport entry")
+                if self._call_lock.acquire(
+                    timeout=min(_XTDATA_LOCK_POLL_SECONDS, remaining)
+                ):
+                    break
+            finally:
+                result["queue_wait_ms"] = round((time.monotonic() - waiting) * 1000, 3)
+        try:
+            self._raise_if_unavailable(None)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                result.update(outcome="timeout", phase="before_call")
+                raise TimeoutError("xtdata call budget expired before native invocation")
+            with request_budget(deadline):
+                result.update(call_started=True, remaining_budget_ms=remaining * 1000)
+                with telemetry.span("native.lane.invoke", lane=self.lane):
+                    return callback(remaining)
         finally:
             self._call_lock.release()
 
@@ -79,6 +154,12 @@ class _XtdataTransportCoordinator:
         with self._state_lock:
             if self._stuck_reason is None:
                 self._stuck_reason = reason
+                telemetry.emit("native.lane.blocked", critical=True, lane=self.lane, reason_code="transport_stuck")
+
+    def status(self) -> dict:
+        with self._state_lock:
+            return {"status": "blocked" if self._stuck_reason is not None else "available",
+                    "reason": self._stuck_reason}
 
     def reset_for_tests(self) -> None:
         with self._state_lock:
@@ -86,18 +167,22 @@ class _XtdataTransportCoordinator:
 
     def _raise_if_unavailable(self, cancel_event) -> None:
         if cancel_event is not None and cancel_event.is_set():
+            telemetry.emit("native.lane.rejected", lane=self.lane, outcome="canceled", call_started=False)
             raise XtdataCallCancelledError(
                 "xtdata call canceled before transport entry"
             )
         with self._state_lock:
             stuck_reason = self._stuck_reason
         if stuck_reason is not None:
+            telemetry.emit("native.lane.rejected", lane=self.lane, outcome="rejected",
+                           reason_code="transport_stuck", call_started=False)
             raise XtdataTransportStuckError(
                 f"xtdata transport unavailable until bridge restart: {stuck_reason}"
             )
 
 
 _XTDATA_TRANSPORT = _XtdataTransportCoordinator()
+_MINUTE_XTDATA_TRANSPORT = _XtdataTransportCoordinator(lane="minute")
 
 
 def _call_xtdata_serialized(function, *args, **kwargs):
@@ -108,8 +193,22 @@ def _call_xtdata_serialized_cancellable(cancel_event, function, *args, **kwargs)
     return _XTDATA_TRANSPORT.call(cancel_event, function, *args, **kwargs)
 
 
+def _call_xtdata_serialized_with_budget(budget_seconds, callback):
+    return _XTDATA_TRANSPORT.call_with_budget(budget_seconds, callback)
+
+
+def _call_minute_xtdata_serialized_with_budget(budget_seconds, callback):
+    # Keep the shared native-unavailable guard, not the unrelated bulk-read lock.
+    _XTDATA_TRANSPORT._raise_if_unavailable(None)
+    return _MINUTE_XTDATA_TRANSPORT.call_with_budget(budget_seconds, callback)
+
+
 def _mark_xtdata_transport_stuck(reason: str) -> None:
     _XTDATA_TRANSPORT.mark_stuck(reason)
+
+
+def get_xtdata_transport_status() -> dict:
+    return _XTDATA_TRANSPORT.status()
 
 
 def _reset_xtdata_transport_for_tests() -> None:
@@ -125,7 +224,7 @@ def _numpy_to_python(obj):
     if isinstance(obj, (list, tuple)):
         return [_numpy_to_python(i) for i in obj]
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        return _numpy_to_python(obj.tolist())
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
@@ -144,6 +243,10 @@ def _numpy_to_python(obj):
 
 
 def _exception_status(exc: Exception) -> str:
+    if getattr(exc, "code", None) == "OVERLOADED":
+        return "overloaded"
+    if getattr(exc, "code", None) == "DEADLINE_EXCEEDED":
+        return "timeout"
     message = str(exc).lower()
     if isinstance(exc, (ConnectionError, OSError, TimeoutError)) or any(
         marker in message
@@ -182,7 +285,7 @@ def _status_payload(
         "message": reason_code,
         "capability": function or None,
         "provider": "bigqmt",
-        "retryable": status == "unavailable",
+        "retryable": status in {"unavailable", "overloaded", "timeout"},
         "details": {},
     }
     if reason:
@@ -190,6 +293,12 @@ def _status_payload(
     if function:
         payload["function"] = function
     payload.update(extra)
+    # ``reason`` can be a provider exception containing arbitrary request data.
+    # Keep the public response unchanged, but log only a stable capability code.
+    telemetry.emit("data.result", outcome=status,
+                   reason_code=f"xtdata_{function}_{status}" if function else status,
+                   capability=function or None, error_type=extra.get("error_type"),
+                   retryable=payload["retryable"])
     return payload
 
 
@@ -198,6 +307,8 @@ def _is_failure_payload(value) -> bool:
         "unsupported",
         "unavailable",
         "error",
+        "overloaded",
+        "timeout",
     }
 
 
@@ -243,6 +354,7 @@ def _call_xtdata_optional(
     return _status_payload("ok", data=raw, function=function_name)
 
 
+@telemetry.traced("data.convert.market")
 def _market_data_to_records(
     raw: dict, stock_list: list[str], field_list: list[str]
 ) -> dict[str, list[dict]]:
@@ -258,6 +370,8 @@ def _market_data_to_records(
             df = raw.get(field)
             if df is None:
                 continue
+            if not isinstance(df, pd.DataFrame):
+                raise NativePayloadError(f"invalid native field {field}: {type(df).__name__}")
             if stock in df.index:
                 for date, value in df.loc[stock].items():
                     entry = rows.setdefault(str(date), {"date": str(date)})
@@ -267,6 +381,7 @@ def _market_data_to_records(
     return result
 
 
+@telemetry.traced("data.convert.bars")
 def _dataframe_dict_to_records(data: dict) -> dict[str, list[dict]]:
     """Convert {stock: DataFrame} format (get_market_data_ex / get_local_data return value).
 
@@ -282,11 +397,16 @@ def _dataframe_dict_to_records(data: dict) -> dict[str, list[dict]]:
             )
             records = records_frame.to_dict(orient="records")
             result[stock] = [_numpy_to_python(r) for r in records]
-        else:
+        elif df is None or (isinstance(df, pd.DataFrame) and df.empty):
             result[stock] = []
+        elif isinstance(df, list) and all(isinstance(row, dict) for row in df):
+            result[stock] = [_numpy_to_python(row) for row in df]
+        else:
+            raise NativePayloadError(f"invalid native bars for {stock}: {type(df).__name__}")
     return result
 
 
+@telemetry.traced("data.convert.financial")
 def _financial_data_to_records(data: dict) -> dict:
     """Convert {stock: {table: DataFrame}} format (get_financial_data return value).
 
@@ -300,7 +420,13 @@ def _financial_data_to_records(data: dict) -> dict:
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     records = df.reset_index().to_dict(orient="records")
                     stock_data[table_name] = [_numpy_to_python(r) for r in records]
-                else:
+                elif df is None or (isinstance(df, pd.DataFrame) and df.empty):
                     stock_data[table_name] = []
+                elif isinstance(df, list) and all(isinstance(row, dict) for row in df):
+                    stock_data[table_name] = [_numpy_to_python(row) for row in df]
+                else:
+                    raise NativePayloadError(f"invalid native financial table {stock}/{table_name}")
+        elif tables is not None:
+            raise NativePayloadError(f"invalid native financial data for {stock}")
         result[stock] = stock_data
     return result

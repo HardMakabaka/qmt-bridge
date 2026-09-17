@@ -2,6 +2,8 @@
 
 import datetime as _dt
 
+from ..telemetry import emit
+
 
 class RedisStateStore:
     def __init__(
@@ -63,6 +65,8 @@ class RedisStateStore:
                     "message": "",
                 },
             )
+        emit("signal.state.claim", critical=True, signal_id=signal.signal_id,
+             account_id=account_id, outcome="success" if ok else "rejected")
         return bool(ok)
 
     def mark_submitted(self, signal_id, result):
@@ -77,6 +81,9 @@ class RedisStateStore:
                 "message": result.message,
             },
         )
+        emit("signal.state.submitted", critical=True, signal_id=signal_id,
+             account_id=account_id, client_submit_id=result.user_order_id,
+             order_sys_id=result.order_sys_id, outcome="success", status=result.status)
 
     def mark_finished(self, signal_id, status, message=""):
         account_id = self._account_for(signal_id)
@@ -88,3 +95,47 @@ class RedisStateStore:
                 "message": message,
             },
         )
+        emit("signal.state.finished", critical=True, signal_id=signal_id,
+             account_id=account_id, outcome="success", status=status)
+
+    def mark_submitting(self, signal_id, request):
+        """Durably record the exact broker identity before ``passorder``.
+
+        A Redis Stream acknowledgement is intentionally later than this write:
+        after a process crash, recovery can reconcile this immutable intent
+        against QMT instead of submitting the signal a second time.
+        """
+        account_id = str(request.account_id or self._account_for(signal_id))
+        self._accounts_by_signal_id[signal_id] = account_id
+        self._write_status(
+            account_id,
+            signal_id,
+            {
+                "status": "SUBMITTING",
+                "user_order_id": request.remark,
+                "stock_code": request.stock_code,
+                "action": request.action,
+                "volume": request.volume,
+                "price": request.price,
+                "price_type": request.price_type,
+                "strategy_name": request.strategy_name,
+                "message": "durable intent recorded before broker submission",
+            },
+        )
+        emit("signal.state.intent", critical=True, signal_id=signal_id, account_id=account_id,
+             client_submit_id=request.remark, stock_code=request.stock_code,
+             action=request.action, volume=request.volume, price=request.price,
+             strategy_name=request.strategy_name, outcome="success")
+
+    def get_status(self, signal_id, account_id=None):
+        """Read durable signal state for safe stream-pending reconciliation."""
+        account_id = str(account_id or self._account_for(signal_id))
+        raw = self.redis.hgetall(self._status_key(account_id, signal_id)) or {}
+        decoded = {}
+        for key, value in raw.items():
+            if isinstance(key, bytes):
+                key = key.decode("utf-8", "replace")
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", "replace")
+            decoded[str(key)] = str(value)
+        return decoded

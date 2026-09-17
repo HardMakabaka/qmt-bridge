@@ -1,6 +1,7 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..helpers import _status_payload
+from bigqmt_signal_trader.telemetry import emit
 
 router = APIRouter()
 
@@ -10,6 +11,7 @@ async def ws_formula(ws: WebSocket):
     await ws.accept()
     try:
         await ws.receive_text()
+        emit("ws.formula.subscription", critical=True, outcome="unsupported")
         await ws.send_json(
             _status_payload(
                 "unsupported",
@@ -19,4 +21,4 @@ async def ws_formula(ws: WebSocket):
         )
         await ws.close(code=1003)
     except WebSocketDisconnect:
-        pass
+        emit("ws.formula.disconnected")

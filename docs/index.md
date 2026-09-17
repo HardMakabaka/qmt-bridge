@@ -15,8 +15,8 @@ Mac / Linux (主力机)                    Windows (中转站)
 
 ## 核心特性
 
-- **186 个 HTTP 操作** — 启用账户路由后的完整服务面，Python 客户端逐项覆盖
-- **5 个 WebSocket 端点** — 实时行情、全市场行情、公式、L2 千档和交易回报
+- **运行时能力清单** — `/api/meta/capabilities` 报告当前路由和 Big QMT 运行时的实际支持状态
+- **4 个 WebSocket 端点** — 实时行情、全市场行情、公式状态和交易回报；公式推送尚未验证
 - **显式能力状态** — `/api/meta/capabilities` 区分原生、派生、暂不可用与未适配，禁止危险别名回退
 - **零依赖客户端** — Python 客户端基于 stdlib，无需安装 xtquant 即可在任意平台使用
 - **API Key 认证** — 可选的 API Key 保护，交易端点强制认证

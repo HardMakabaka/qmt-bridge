@@ -1,7 +1,7 @@
 """Router — Legacy endpoints from server.py (backward compatibility)."""
 
 from fastapi import APIRouter, Query
-from ..bigqmt import xtdata
+from ..bigqmt import market_data
 
 from ..helpers import (
     _call_xtdata_serialized,
@@ -25,7 +25,7 @@ def get_history(
 ):
     field_list = [f.strip() for f in fields.split(",")]
     raw = _call_xtdata_serialized(
-        xtdata.get_market_data,
+        market_data.get_market_data,
         field_list=field_list,
         stock_list=[stock],
         period=period,
@@ -48,7 +48,7 @@ def get_batch_history(
     stock_list = [s.strip() for s in stocks.split(",")]
     field_list = [f.strip() for f in fields.split(",")]
     raw = _call_xtdata_serialized(
-        xtdata.get_market_data,
+        market_data.get_market_data,
         field_list=field_list,
         stock_list=stock_list,
         period=period,
@@ -63,7 +63,7 @@ def get_full_tick(
     stocks: str = Query(..., description="股票代码列表，逗号分隔"),
 ):
     stock_list = [s.strip() for s in stocks.split(",")]
-    raw = _call_xtdata_serialized(xtdata.get_full_tick, code_list=stock_list)
+    raw = _call_xtdata_serialized(market_data.get_full_tick, code_list=stock_list)
     return {"data": _numpy_to_python(raw)}
 
 
@@ -71,7 +71,7 @@ def get_full_tick(
 def get_sector_stocks(
     sector: str = Query(..., description="板块名称，如 沪深A股"),
 ):
-    stock_list = _call_xtdata_serialized(xtdata.get_stock_list_in_sector, sector)
+    stock_list = _call_xtdata_serialized(market_data.get_stock_list_in_sector, sector)
     return {"sector": sector, "stocks": stock_list}
 
 
@@ -79,14 +79,21 @@ def get_sector_stocks(
 def get_instrument_detail(
     stock: str = Query(..., description="股票代码，如 000001.SZ"),
 ):
-    detail = _call_xtdata_serialized(xtdata.get_instrument_detail, stock)
+    detail = _call_xtdata_serialized(market_data.get_instrument_detail, stock)
     return {"stock": stock, "detail": _numpy_to_python(detail)}
 
 
 @router.post("/api/download")
 def download_data(req: DownloadRequest):
     _call_xtdata_serialized(
-        xtdata.download_history_data,
+        market_data.download_history_data,
         req.stock, period=req.period, start_time=req.start, end_time=req.end
     )
-    return {"status": "ok", "stock": req.stock, "period": req.period}
+    return {
+        "status": "download_invoked",
+        "stock": req.stock,
+        "period": req.period,
+        "download_invocation_completed": True,
+        "history_visibility_verified": False,
+        "coverage_verified": False,
+    }

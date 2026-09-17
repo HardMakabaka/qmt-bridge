@@ -36,9 +36,6 @@
 | GET | `/api/tick/l2_quote` | L2 行情快照 |
 | GET | `/api/tick/l2_order` | L2 逐笔委托 |
 | GET | `/api/tick/l2_transaction` | L2 逐笔成交 |
-| GET | `/api/tick/l2_thousand_quote` | L2 千档行情 |
-| GET | `/api/tick/l2_thousand_orderbook` | L2 千档 Order Book |
-| GET | `/api/tick/l2_thousand_trade` | L2 千档成交 |
 
 ## Sector — 板块管理 `/api/sector/*`
 
@@ -47,12 +44,9 @@
 | GET | `/api/sector/list` | 所有板块列表 |
 | GET | `/api/sector/stocks` | 板块成分股（支持历史日期） |
 | GET | `/api/sector/info` | 板块元数据 |
-| POST | `/api/sector/create_folder` | 创建板块文件夹 |
 | POST | `/api/sector/create` | 创建自定义板块 |
 | POST | `/api/sector/add_stocks` | 添加成分股 |
-| POST | `/api/sector/remove_stocks` | 移除成分股 |
 | DELETE | `/api/sector/remove` | 删除板块 |
-| POST | `/api/sector/reset` | 重置板块成分股 |
 
 ## Calendar — 交易日历 `/api/calendar/*`
 
@@ -118,7 +112,6 @@
 |------|------|------|
 | POST | `/api/formula/call` | 调用公式（单只股票） |
 | POST | `/api/formula/call_batch` | 调用公式（多只股票） |
-| POST | `/api/formula/generate_index` | 生成自定义指数 |
 
 ## HK — 港股通 `/api/hk/*`
 
@@ -149,10 +142,9 @@
 |------|------|------|
 | GET | `/api/meta/health` | HTTP 进程存活检查 |
 | GET | `/api/meta/readiness` | Big QMT ZMQ、账户与固定上游版本运行就绪检查 |
-| GET | `/api/meta/capabilities` | 186 个 HTTP 操作与 5 个 WebSocket 的适配/运行状态 |
+| GET | `/api/meta/capabilities` | 当前 HTTP/WebSocket 的适配与运行状态 |
 | GET | `/api/meta/version` | 服务版本 |
-| GET | `/api/meta/xtdata_version` | xtquant 版本 |
-| GET | `/api/meta/connection_status` | xtdata 连接状态 |
+| GET | `/api/meta/connection_status` | Big QMT RPC 连接与恢复状态 |
 | GET | `/api/meta/markets` | 可用市场列表 |
 | GET | `/api/meta/periods` | K 线周期列表 |
 | GET | `/api/meta/stock_list` | 按类别获取证券列表 |
@@ -173,8 +165,6 @@
 | POST | `/api/download/etf_info` | 下载 ETF 信息 |
 | POST | `/api/download/cb_data` | 下载可转债数据 |
 | POST | `/api/download/history_contracts` | 下载过期合约 |
-| POST | `/api/download/ipo_data` | 下载 IPO 数据 |
-| POST | `/api/download/option_data` | 下载期权数据 |
 | POST | `/api/download/holiday` | 下载节假日数据 |
 
 ## Trading — 交易 `/api/trading/*` :material-lock:
@@ -188,8 +178,6 @@
 | POST | `/api/trading/cancel` | 撤单 |
 | POST | `/api/trading/batch_order` | 批量下单 |
 | POST | `/api/trading/batch_cancel` | 批量撤单 |
-| POST | `/api/trading/order_async` | 异步下单 |
-| POST | `/api/trading/cancel_async` | 异步撤单 |
 | GET | `/api/trading/orders` | 查询委托 |
 | GET | `/api/trading/trades` | 查询成交 |
 | GET | `/api/trading/positions` | 查询持仓 |
@@ -216,19 +204,9 @@
 
 ## Big QMT 能力边界
 
-`GET /api/meta/capabilities` 是权威清单。当前代码基线明确标记 44 个 HTTP 操作
-和 2 个 WebSocket 为 `unsupported`，主要分组如下：
-
-- 银证接口 8 个、SMT 接口 8 个：安装的 Big QMT 精确方法未验证或不存在。
-- 资金/CTP 接口 7 个、信用接口 2 个：禁止回退到普通资金划转或普通委托。
-- 异步委托/撤单、COM、导出/查询 6 个：RPC 合同未提供对应原生能力。
-- 千档 HTTP 3 个、千档/公式 WebSocket 2 个：不以普通 L2 或轮询伪装推送。
-- 其余 10 个包括次主力、全速盘口、成交笔数、板块变更、下载、财务字段和
-  自定义指数等缺失或签名未验证接口。
-
-所有这类调用返回统一信封：`status`、`data`、`reason_code`、`message`、
-`capability`、`provider`、`retryable`、`details`。`unavailable` 可重试；
-`unsupported` 不可重试。业务空集合仅在真实成功时返回，不能再代表接口缺失。
+`GET /api/meta/capabilities` 是权威清单。未验证的原生能力会显式标为
+`unsupported`；`unavailable` 表示当前运行时不可用。不要用空结果推断支持状态，
+也不要把已移除的 MiniQMT、fake async 或 L2 千档入口当作可探测能力。
 
 ## Credit — 融资融券 `/api/credit/*` :material-lock:
 
@@ -244,41 +222,16 @@
 | GET | `/api/credit/subjects` | 标的证券 |
 | GET | `/api/credit/assure` | 担保品信息 |
 
-## Fund — 资金划转 `/api/fund/*` :material-lock:
+## Fund — 资金查询 `/api/fund/*` :material-lock:
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/fund/transfer` | 资金划转 |
-| GET | `/api/fund/transfer_records` | 划转记录 |
 | GET | `/api/fund/available` | 可用资金 |
-| POST | `/api/fund/ctp_transfer_in` | CTP 转入 |
-| POST | `/api/fund/ctp_transfer_out` | CTP 转出 |
-| GET | `/api/fund/ctp_balance` | CTP 余额 |
-| POST | `/api/fund/ctp_option_to_future` | 期权→期货划转 |
-| POST | `/api/fund/ctp_future_to_option` | 期货→期权划转 |
 
 ## SMT — 约定式交易 `/api/smt/*` :material-lock:
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/smt/order` | 约定式下单 |
-| POST | `/api/smt/negotiate_order_async` | 异步协商下单 |
-| POST | `/api/smt/cancel` | 撤单 |
-| GET | `/api/smt/quoter` | 报价方信息 |
-| GET | `/api/smt/compact` | 约定合约 |
 | GET | `/api/smt/appointment` | 预约信息 |
 | GET | `/api/smt/secu_info` | 证券信息 |
 | GET | `/api/smt/secu_rate` | 证券费率 |
-
-## Bank — 银证转账 `/api/bank/*` :material-lock:
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/bank/transfer_in` | 银行→证券 |
-| POST | `/api/bank/transfer_out` | 证券→银行 |
-| GET | `/api/bank/balance` | 银行余额 |
-| GET | `/api/bank/transfer_records` | 转账记录 |
-| GET | `/api/bank/banks` | 已绑定银行 |
-| GET | `/api/bank/transfer_limit` | 转账限额 |
-| GET | `/api/bank/available_amount` | 可转金额 |
-| GET | `/api/bank/status` | 转账状态 |

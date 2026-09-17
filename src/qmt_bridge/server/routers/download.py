@@ -9,17 +9,20 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from collections import deque
 from queue import Queue
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException
-from ..bigqmt import xtdata
+from bigqmt_signal_trader.telemetry import bind_context, current_context, emit
+from ..bigqmt import market_data
+from ..download_state import DownloadStateStore
 
 from ..helpers import (
     XtdataCallCancelledError,
     XtdataTransportStuckError,
-    _call_xtdata_optional,
     _call_xtdata_serialized,
     _call_xtdata_serialized_cancellable,
     _mark_xtdata_transport_stuck,
@@ -32,6 +35,10 @@ from ..models import (
     HistoryDownloadJobRequest,
     SectorDownloadRequest,
 )
+
+
+def _emit_download(name: str, critical: bool = False, **fields) -> None:
+    emit(name, critical=critical, **fields)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +57,27 @@ SECTOR_DOWNLOAD_STOP_GRACE_SECONDS = 5.0
 SECTOR_DOWNLOAD_PERIOD = (2009, 86400000)
 SECTOR_DOWNLOAD_USE_SUBPROCESS = True
 SECTOR_DOWNLOAD_METHOD = "xtdata.download_sector_data"
+
+
+def _default_download_state_dir() -> str:
+    configured = os.getenv("QMT_BRIDGE_DOWNLOAD_STATE_DIR")
+    if configured:
+        return configured
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        return os.path.join(local_app_data, "qmt-bridge", "download-jobs")
+    return os.path.join(os.path.expanduser("~"), ".qmt-bridge", "download-jobs")
+
+
+def _in_shanghai_a_share_session(now: float | None = None) -> bool:
+    """Return whether a new heavy native download should yield to the market."""
+    current = datetime.fromtimestamp(
+        time.time() if now is None else now, tz=ZoneInfo("Asia/Shanghai")
+    )
+    if current.weekday() >= 5:
+        return False
+    minute = current.hour * 60 + current.minute
+    return 9 * 60 + 30 <= minute < 11 * 60 + 30 or 13 * 60 <= minute < 15 * 60
 
 
 class _DownloadCallTimeout(RuntimeError):
@@ -72,15 +100,35 @@ def _frame_has_usable_rows(frame) -> bool:
 
 
 class _DownloadJobManager:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        state_dir: str | None = None,
+        market_session=_in_shanghai_a_share_session,
+        defer_market_hours: bool | None = None,
+    ) -> None:
         self._jobs: dict[str, dict] = {}
         self._queue: deque[str] = deque()
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._worker: threading.Thread | None = None
+        self._closed = False
+        self._native_active_thread: threading.Thread | None = None
+        self._state = DownloadStateStore(_default_download_state_dir() if state_dir is None else state_dir)
+        self._market_session = market_session
+        self._defer_market_hours = (
+            os.getenv("QMT_BRIDGE_ALLOW_MARKET_HOURS_DOWNLOAD", "").lower()
+            not in {"1", "true", "yes"}
+            if defer_market_hours is None
+            else defer_market_hours
+        )
+        with self._condition:
+            self._restore_locked()
+            if self._queue:
+                self._ensure_worker_locked()
 
     def submit(self, req: HistoryDownloadJobRequest) -> dict:
-        stocks = [stock.strip() for stock in req.stocks if str(stock).strip()]
+        stocks = list(dict.fromkeys(stock.strip() for stock in req.stocks if str(stock).strip()))
         if not stocks:
             raise HTTPException(status_code=400, detail="stocks must not be empty")
         batch_size = min(DOWNLOAD_MAX_BATCH_SIZE, max(1, int(req.batch_size or 10)))
@@ -109,11 +157,18 @@ class _DownloadJobManager:
             "last_progress": None,
             "stop_requested": False,
             "error": None,
+            "download_invoked_symbols": [],
+            "download_invocation_completed": False,
+            "history_visibility_verified": False,
+            "coverage_verified": False,
+            "native_inflight_symbols": [],
+            "trace_context": current_context(),
         }
         with self._condition:
             self._gc_locked()
             self._jobs[job_id] = job
             self._queue.append(job_id)
+            self._persist_locked(job)
             self._ensure_worker_locked()
             self._condition.notify()
         logger.info(
@@ -125,6 +180,8 @@ class _DownloadJobManager:
             req.end_time,
             batch_size,
         )
+        _emit_download("download_job_submitted", critical=True, job_id=job_id,
+                       total=len(stocks), period=req.period)
         return self.get(job_id)
 
     def get(self, job_id: str) -> dict:
@@ -140,13 +197,15 @@ class _DownloadJobManager:
             if job is None:
                 raise HTTPException(status_code=404, detail="Download job not found")
             job["stop_requested"] = True
+            _emit_download("download_job_cancel_requested", critical=True, job_id=job_id,
+                           status=job.get("status"))
             if job["status"] == "queued":
                 try:
                     self._queue.remove(job_id)
                 except ValueError:
                     pass
                 self._finish_locked(job, "canceled")
-            self._stop_xtdata_download()
+            self._persist_locked(job)
             self._condition.notify_all()
             return self._snapshot_locked(job)
 
@@ -154,9 +213,29 @@ class _DownloadJobManager:
         with self._condition:
             self._jobs = {}
             self._queue = deque()
+            # The in-process singleton is reset by unit tests; do not make their
+            # outcome depend on the host clock or write persistent test state.
+            self._defer_market_hours = False
+            self._state.close()
+            self._state = DownloadStateStore(None)
             if self._worker is not None and not self._worker.is_alive():
                 self._worker = None
             self._condition.notify_all()
+
+    def close(self) -> None:
+        """Release the local state-dir ownership after the native lane is idle."""
+        with self._condition:
+            active = self._native_active_thread
+            if active is not None and active.is_alive():
+                raise RuntimeError("cannot close while a native download is active")
+            self._closed = True
+            self._condition.notify_all()
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout=2.0)
+        if worker is not None and worker.is_alive():
+            raise RuntimeError("cannot close while a download worker is active")
+        self._state.close()
 
     def _ensure_worker_locked(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -168,17 +247,60 @@ class _DownloadJobManager:
         )
         self._worker.start()
 
+    def _persist_locked(self, job: dict) -> None:
+        self._state.save(_numpy_to_python(job))
+        _emit_download("download_job_persisted", job_id=job.get("job_id"),
+                       status=job.get("status"), processed=job.get("processed"),
+                       total=job.get("total"))
+
+    def _restore_locked(self) -> None:
+        """Restore only work whose last native invocation is known not to be in flight."""
+        now = time.time()
+        for job in self._state.load():
+            if now - float(job.get("created_at") or now) > DOWNLOAD_JOB_TTL_SECONDS:
+                self._state.remove(str(job["job_id"]))
+                continue
+            status = str(job.get("status") or "queued")
+            if job.get("native_inflight_symbols"):
+                # A native call could have succeeded after the bridge died.  It
+                # must be reconciled against QMT data by an operator, never retried.
+                job["status"] = "requires_reconciliation"
+                job["error"] = "native download outcome unknown after bridge restart"
+                job["finished_at"] = now
+                self._jobs[str(job["job_id"])] = job
+                self._persist_locked(job)
+                _emit_download("download_job_restore_unknown", critical=True,
+                               job_id=job.get("job_id"))
+                continue
+            if status not in {"queued", "running", "paused_market_hours"}:
+                self._jobs[str(job["job_id"])] = job
+                continue
+            job["status"] = "queued"
+            job["started_at"] = None
+            self._jobs[str(job["job_id"])] = job
+            self._queue.append(str(job["job_id"]))
+            _emit_download("download_job_restored", critical=True, job_id=job.get("job_id"))
+
     def _worker_loop(self) -> None:
         while True:
+            active = self._native_active_thread
+            if active is not None:
+                # Never free the sole native lane while a timed-out/canceled QMT
+                # function is still running.
+                active.join()
+                self._native_active_thread = None
             with self._condition:
-                while not self._queue:
+                while not self._queue and not self._closed:
                     self._condition.wait()
+                if self._closed:
+                    return
                 job_id = self._queue.popleft()
                 job = self._jobs.get(job_id)
             if job is None:
                 continue
             try:
-                self._run_job(job_id)
+                with bind_context(**dict(job.get("trace_context") or {})):
+                    self._run_job(job_id)
             except Exception as exc:
                 logger.exception("History download job crashed: job_id=%s", job_id)
                 with self._condition:
@@ -193,9 +315,23 @@ class _DownloadJobManager:
             job = self._jobs[job_id]
             job["status"] = "running"
             job["started_at"] = time.time()
+            self._persist_locked(job)
+            _emit_download("download_job_started", critical=True, job_id=job_id)
             self._condition.notify_all()
 
-        stocks = list(job["stocks"])
+        previously_ok = [
+            stock
+            for stock, result in job.get("symbol_results", {}).items()
+            if result.get("status") == "ok"
+        ]
+        # Persisted success is only a hint.  Recheck QMT data before skipping it
+        # after a bridge restart.
+        missing_previously_ok = set(self._missing_downloaded_symbols(job_id, previously_ok))
+        stocks = [
+            stock
+            for stock in job["stocks"]
+            if stock not in previously_ok or stock in missing_previously_ok
+        ]
         batch_size = int(job["batch_size"])
         logger.info("Started history download job: job_id=%s total=%s", job_id, len(stocks))
 
@@ -206,10 +342,28 @@ class _DownloadJobManager:
                 return
             with self._condition:
                 job = self._jobs[job_id]
+                if self._defer_market_hours and self._market_session():
+                    job["status"] = "paused_market_hours"
+                    job["current_batch"] = []
+                    self._persist_locked(job)
+                    _emit_download("download_job_market_paused", critical=True,
+                                   job_id=job_id)
+                    self._condition.notify_all()
+                    # No new native invocation is started during market hours.
+                    # The worker remains the sole owner of the lane.
+                    while self._market_session() and not job.get("stop_requested"):
+                        self._condition.wait(timeout=1.0)
+                    if job.get("stop_requested"):
+                        self._mark_canceled(job_id)
+                        return
+                    job["status"] = "running"
                 job["current_batch"] = batch
+                self._persist_locked(job)
                 self._condition.notify_all()
 
             batch_status, batch_error = self._run_batch(job_id, batch, attempt=1)
+            _emit_download("download_job_batch_finished", job_id=job_id,
+                           attempt=1, outcome=batch_status, symbols=len(batch))
             if batch_status == "ok":
                 self._mark_symbols(job_id, batch, status="ok", error="")
                 continue
@@ -301,6 +455,10 @@ class _DownloadJobManager:
             len(self.get(job_id)["slow_symbols"]),
             self.get(job_id)["elapsed_seconds"],
         )
+        _emit_download("download_job_finished", critical=True, job_id=job_id,
+                       outcome={"completed": "success", "canceled": "canceled"}.get(
+                           self.get(job_id).get("status"), "error"
+                       ), status=self.get(job_id).get("status"))
 
     def _retry_symbol(
         self,
@@ -315,6 +473,8 @@ class _DownloadJobManager:
         last_status = first_status
         last_error = first_error
         for attempt in range(max(1, next_attempt), max_attempts + 1):
+            _emit_download("download_job_retry", job_id=job_id, attempt=attempt,
+                           symbol_count=1, previous_outcome=last_status)
             status, error = self._run_batch(job_id, [stock], attempt=attempt)
             last_status, last_error = status, error
             if status == "ok":
@@ -330,9 +490,12 @@ class _DownloadJobManager:
 
     def _run_batch(self, job_id: str, batch: list[str], *, attempt: int) -> tuple[str, str]:
         started = time.time()
+        deadline = started + DOWNLOAD_BATCH_TIMEOUT_SECONDS
         last_progress_at = started
         result_queue: Queue = Queue(maxsize=1)
         cancel_call = threading.Event()
+        native_single = True
+        trace_context = current_context()
 
         def on_progress(data):
             nonlocal last_progress_at
@@ -345,23 +508,70 @@ class _DownloadJobManager:
                     self._condition.notify_all()
 
         def target() -> None:
-            try:
-                result = _call_xtdata_serialized_cancellable(
-                    cancel_call,
-                    xtdata.download_history_data2,
-                    batch,
-                    period=self.get(job_id)["period"],
-                    start_time=self.get(job_id)["start_time"],
-                    end_time=self.get(job_id)["end_time"],
-                    callback=on_progress,
-                )
-                result_queue.put(("ok", result))
-            except XtdataTransportStuckError as exc:
-                result_queue.put(("transport_stuck", exc))
-            except XtdataCallCancelledError as exc:
-                result_queue.put(("call_canceled", exc))
-            except Exception as exc:
-                result_queue.put(("error", exc))
+            with bind_context(**trace_context):
+                try:
+                    job = self.get(job_id)
+                    if native_single:
+                        results = []
+                        for stock in batch:
+                            if cancel_call.is_set() or self._is_stop_requested(job_id):
+                                raise XtdataCallCancelledError(
+                                    "download canceled before next symbol"
+                                )
+
+                            def invoke_single():
+                                if cancel_call.is_set() or self._is_stop_requested(job_id):
+                                    raise XtdataCallCancelledError(
+                                        "download canceled before native invocation"
+                                    )
+                                remaining = deadline - time.time()
+                                if remaining <= 0:
+                                    raise _DownloadCallTimeout(
+                                        "batch budget expired before next symbol"
+                                    )
+                                return market_data.download_history_data(
+                                    stock,
+                                    period=job["period"],
+                                    start_time=job["start_time"],
+                                    end_time=job["end_time"],
+                                    timeout_seconds=remaining,
+                                )
+
+                            with self._condition:
+                                current = self._jobs[job_id]
+                                current["native_inflight_symbols"] = [stock]
+                                self._persist_locked(current)
+                            _emit_download("download_job_native_started", critical=True,
+                                           job_id=job_id, attempt=attempt, symbol_count=1)
+                            results.append(
+                                _call_xtdata_serialized_cancellable(
+                                    cancel_call, invoke_single
+                                )
+                            )
+                            with self._condition:
+                                current = self._jobs[job_id]
+                                current["native_inflight_symbols"] = []
+                                self._persist_locked(current)
+                            self._record_download_invocation(job_id, [stock])
+                            on_progress({
+                                "stock": stock,
+                                "completed": len(results),
+                                "total": len(batch),
+                            })
+                        result = results
+                    result_queue.put(("ok", result))
+                except XtdataTransportStuckError as exc:
+                    self._clear_native_inflight(job_id)
+                    result_queue.put(("transport_stuck", exc))
+                except XtdataCallCancelledError as exc:
+                    self._clear_native_inflight(job_id)
+                    result_queue.put(("call_canceled", exc))
+                except _DownloadCallTimeout as exc:
+                    self._clear_native_inflight(job_id)
+                    result_queue.put(("download_timeout", exc))
+                except Exception as exc:
+                    self._clear_native_inflight(job_id)
+                    result_queue.put(("error", exc))
 
         thread = threading.Thread(
             target=target,
@@ -373,21 +583,17 @@ class _DownloadJobManager:
         try:
             while thread.is_alive():
                 if self._is_stop_requested(job_id):
-                    cancel_call.set()
-                    self._stop_xtdata_download()
-                    thread.join(DOWNLOAD_STOP_GRACE_SECONDS)
-                    raise _DownloadCallTimeout("download canceled")
+                    # Big QMT has no supported cancellation API for this native
+                    # call.  Let it finish; the target checks cancellation before
+                    # it starts the following symbol.
+                    thread.join(0.1)
                 now = time.time()
                 if now - started > DOWNLOAD_BATCH_TIMEOUT_SECONDS:
-                    cancel_call.set()
-                    self._stop_xtdata_download()
                     thread.join(DOWNLOAD_STOP_GRACE_SECONDS)
                     raise _DownloadCallTimeout(
                         f"batch timeout after {DOWNLOAD_BATCH_TIMEOUT_SECONDS:.0f}s"
                     )
                 if now - last_progress_at > DOWNLOAD_NO_PROGRESS_TIMEOUT_SECONDS:
-                    cancel_call.set()
-                    self._stop_xtdata_download()
                     thread.join(DOWNLOAD_STOP_GRACE_SECONDS)
                     raise _DownloadCallTimeout(
                         f"no progress for {DOWNLOAD_NO_PROGRESS_TIMEOUT_SECONDS:.0f}s"
@@ -405,6 +611,15 @@ class _DownloadJobManager:
             if thread_alive:
                 reason = f"{exc}; xtdata transport thread is still active"
                 _mark_xtdata_transport_stuck(reason)
+                _emit_download("download_job_native_stuck", critical=True,
+                               job_id=job_id, attempt=attempt)
+                self._native_active_thread = thread
+                with self._condition:
+                    job = self._jobs.get(job_id)
+                    if job is not None:
+                        # Persist an explicit unknown outcome.  A restarted bridge
+                        # will not automatically replay this native invocation.
+                        self._persist_locked(job)
                 return "transport_stuck", reason
             return "download_timeout", str(exc)
 
@@ -414,6 +629,8 @@ class _DownloadJobManager:
             return status, str(payload)
         if status == "call_canceled":
             return "download_timeout", str(payload)
+        if status == "download_timeout":
+            return status, str(payload)
         if status == "ok":
             for validation_attempt in range(DOWNLOAD_HISTORY_VISIBILITY_ATTEMPTS):
                 missing_symbols = self._missing_downloaded_symbols(job_id, batch)
@@ -452,7 +669,7 @@ class _DownloadJobManager:
         return "error", str(payload)
 
     def _missing_downloaded_symbols(self, job_id: str, stocks: list[str]) -> list[str]:
-        getter = getattr(xtdata, "get_market_data_ex", None)
+        getter = getattr(market_data, "get_market_data_ex", None)
         if not callable(getter):
             return []
         job = self.get(job_id)
@@ -497,6 +714,28 @@ class _DownloadJobManager:
                 if status != "ok" and stock not in job["failed_symbols"]:
                     job["failed_symbols"].append(stock)
             job["processed"] = len(job["symbol_results"])
+            self._persist_locked(job)
+            self._condition.notify_all()
+
+    def _clear_native_inflight(self, job_id: str) -> None:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job["native_inflight_symbols"] = []
+                self._persist_locked(job)
+
+    def _record_download_invocation(self, job_id: str, stocks: list[str]) -> None:
+        with self._condition:
+            job = self._jobs[job_id]
+            invoked = job["download_invoked_symbols"]
+            for stock in stocks:
+                if stock not in invoked:
+                    invoked.append(stock)
+            requested = set(job.get("stocks") or [])
+            job["download_invocation_completed"] = bool(requested) and requested.issubset(
+                set(invoked)
+            )
+            self._persist_locked(job)
             self._condition.notify_all()
 
     def _mark_slow(self, job_id: str, stocks: list[str], error: str) -> None:
@@ -506,12 +745,15 @@ class _DownloadJobManager:
                 if stock not in job["slow_symbols"]:
                     job["slow_symbols"].append(stock)
             job["last_slow_error"] = error
+            self._persist_locked(job)
             self._condition.notify_all()
 
     def _mark_canceled(self, job_id: str) -> None:
         with self._condition:
             job = self._jobs[job_id]
             self._finish_locked(job, "canceled")
+            self._persist_locked(job)
+            _emit_download("download_job_canceled", critical=True, job_id=job_id)
             self._condition.notify_all()
 
     def _is_stop_requested(self, job_id: str) -> bool:
@@ -525,6 +767,24 @@ class _DownloadJobManager:
         job["finished_at"] = now
         started = job.get("started_at") or job.get("created_at") or now
         job["elapsed_seconds"] = max(0.0, now - float(started))
+        requested = set(job.get("stocks") or [])
+        invoked = set(job.get("download_invoked_symbols") or [])
+        job["download_invocation_completed"] = bool(requested) and requested.issubset(
+            invoked
+        )
+        verified = {
+            stock
+            for stock, result in (job.get("symbol_results") or {}).items()
+            if result.get("status") == "ok"
+        }
+        # This verifies only that each symbol has at least one usable row after
+        # the download call. It does not prove complete requested-window or
+        # trading-calendar coverage, so the stronger coverage claim stays false.
+        job["history_visibility_verified"] = bool(requested) and requested.issubset(
+            verified
+        )
+        job["coverage_verified"] = False
+        self._persist_locked(job)
 
     def _snapshot_locked(self, job: dict) -> dict:
         now = time.time()
@@ -549,32 +809,40 @@ class _DownloadJobManager:
         ]
         for job_id in expired:
             self._jobs.pop(job_id, None)
+            self._state.remove(job_id)
             try:
                 self._queue.remove(job_id)
             except ValueError:
                 pass
 
-    @staticmethod
-    def _stop_xtdata_download() -> None:
-        # Cancellation must be able to interrupt the call that currently owns
-        # the serialization lock, so these control calls deliberately bypass it.
-        try:
-            client = xtdata.get_client()
-            stop = getattr(client, "stop_supply_history_data2", None)
-            if callable(stop):
-                stop()
-                return
-        except Exception:
-            logger.debug("xtdata.get_client().stop_supply_history_data2 failed", exc_info=True)
-        stop = getattr(xtdata, "stop_supply_history_data2", None)
-        if callable(stop):
-            try:
-                stop()
-            except Exception:
-                logger.debug("xtdata.stop_supply_history_data2 failed", exc_info=True)
+_download_jobs: _DownloadJobManager | None = None
 
 
-_download_jobs = _DownloadJobManager()
+def start_download_jobs(*, state_dir: str | None = None) -> _DownloadJobManager:
+    """Start resumable work only after the BigQMT runtime is ready."""
+    global _download_jobs
+    if _download_jobs is None:
+        _download_jobs = _DownloadJobManager(state_dir=state_dir)
+    return _download_jobs
+
+
+def close_download_jobs() -> None:
+    """Stop the worker and release its local state ownership when safe."""
+    global _download_jobs
+    manager = _download_jobs
+    if manager is None:
+        return
+    manager.close()
+    _download_jobs = None
+
+
+def _require_download_jobs() -> _DownloadJobManager:
+    if _download_jobs is None:
+        raise HTTPException(
+            status_code=503,
+            detail="BigQMT download runtime is not ready",
+        )
+    return _download_jobs
 _sector_download_lock = threading.RLock()
 _sector_download_active: dict[str, object] = {
     "thread": None,
@@ -587,8 +855,12 @@ _sector_download_active: dict[str, object] = {
 
 
 def reset_download_job_manager_for_tests() -> None:
+    global _download_jobs
     _reset_xtdata_transport_for_tests()
-    _download_jobs.reset_for_tests()
+    if _download_jobs is None:
+        _download_jobs = _DownloadJobManager(state_dir="", defer_market_hours=False)
+    else:
+        _download_jobs.reset_for_tests()
     with _sector_download_lock:
         _sector_download_active.update(
             {
@@ -604,7 +876,7 @@ def reset_download_job_manager_for_tests() -> None:
 
 def _safe_sector_count() -> int | None:
     try:
-        return len(_call_xtdata_serialized(xtdata.get_sector_list) or [])
+        return len(_call_xtdata_serialized(market_data.get_sector_list) or [])
     except Exception:
         logger.debug("Unable to read QMT sector list during sector download", exc_info=True)
         return None
@@ -666,6 +938,9 @@ def _sector_download_env() -> dict[str, str]:
     if current_pythonpath:
         path_entries.append(current_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(path_entries))
+    for key, value in current_context().items():
+        if key in {"trace_id", "span_id", "parent_span_id", "http_request_id"}:
+            env["QMT_BRIDGE_TRACE_" + key.upper()] = str(value)
     return env
 
 
@@ -685,6 +960,8 @@ def _parse_sector_download_payload(stdout: str) -> dict | None:
 
 def _execute_sector_download_process(timeout_seconds: float) -> tuple[str, dict]:
     started = time.time()
+    _emit_download("sector_download_subprocess_started", critical=True,
+                   timeout_seconds=timeout_seconds)
     command = [sys.executable, "-u", "-c", _sector_download_child_code()]
     try:
         completed = subprocess.run(
@@ -698,6 +975,8 @@ def _execute_sector_download_process(timeout_seconds: float) -> tuple[str, dict]
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
+        _emit_download("sector_download_subprocess_timeout", critical=True,
+                       timeout_seconds=timeout_seconds)
         return (
             "timeout",
             {
@@ -725,10 +1004,14 @@ def _execute_sector_download_process(timeout_seconds: float) -> tuple[str, dict]
     payload["child_process_killed"] = False
     payload.setdefault("elapsed_seconds", round(time.time() - started, 3))
     if completed.returncode != 0:
+        _emit_download("sector_download_subprocess_failed", critical=True,
+                       returncode=completed.returncode)
         payload.setdefault("error", f"sector download child exited with {completed.returncode}")
         return "error", payload
     status = str(payload.get("status") or "ok")
     if status == "ok":
+        _emit_download("sector_download_subprocess_completed", critical=True,
+                       elapsed_ms=int((time.time() - started) * 1000))
         return "ok", payload
     if status == "timeout":
         return "timeout", payload
@@ -736,22 +1019,9 @@ def _execute_sector_download_process(timeout_seconds: float) -> tuple[str, dict]
 
 
 def _execute_sector_download_in_process(on_progress) -> dict:
-    downloader = getattr(xtdata, "download_history_data2", None)
-    if callable(downloader):
-        result = _call_xtdata_serialized(
-            downloader,
-            [],
-            SECTOR_DOWNLOAD_PERIOD,
-            callback=on_progress,
-        )
-        return {
-            "method": "xtdata.download_history_data2",
-            "result": result,
-            "child_process_isolated": False,
-        }
     return {
         "method": "xtdata.download_sector_data",
-        "result": _call_xtdata_serialized(xtdata.download_sector_data),
+        "result": _call_xtdata_serialized(market_data.download_sector_data),
         "child_process_isolated": False,
     }
 
@@ -844,7 +1114,7 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
                 "last_progress": None,
                 "method": SECTOR_DOWNLOAD_METHOD
                 if SECTOR_DOWNLOAD_USE_SUBPROCESS
-                else "xtdata.download_history_data2",
+                else "xtdata.download_sector_data",
             }
         )
     thread.start()
@@ -855,7 +1125,8 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
         if SECTOR_DOWNLOAD_USE_SUBPROCESS:
             guard_timeout += SECTOR_DOWNLOAD_STOP_GRACE_SECONDS
         if elapsed > guard_timeout:
-            _DownloadJobManager._stop_xtdata_download()
+            # Big QMT provides no supported cancellation hook for this native
+            # work.  Report timeout without calling MiniQMT-only control APIs.
             thread.join(SECTOR_DOWNLOAD_STOP_GRACE_SECONDS)
             thread_alive = thread.is_alive()
             if thread_alive:
@@ -961,23 +1232,23 @@ def _run_sector_download(timeout_seconds: float = SECTOR_DOWNLOAD_TIMEOUT_SECOND
 
 @router.post("/jobs")
 def create_history_download_job(req: HistoryDownloadJobRequest):
-    return _download_jobs.submit(req)
+    return _require_download_jobs().submit(req)
 
 
 @router.get("/jobs/{job_id}")
 def get_history_download_job(job_id: str):
-    return _download_jobs.get(job_id)
+    return _require_download_jobs().get(job_id)
 
 
 @router.post("/jobs/{job_id}/cancel")
 def cancel_history_download_job(job_id: str):
-    return _download_jobs.cancel(job_id)
+    return _require_download_jobs().cancel(job_id)
 
 
 @router.post("/financial")
 def download_financial(req: FinancialDownloadRequest):
     _call_xtdata_serialized(
-        xtdata.download_financial_data,
+        market_data.download_financial_data,
         req.stocks,
         table_list=req.tables,
         start_time=req.start_time,
@@ -1001,45 +1272,33 @@ def download_sector_data(
 
 @router.post("/index_weight")
 def download_index_weight():
-    _call_xtdata_serialized(xtdata.download_index_weight)
+    _call_xtdata_serialized(market_data.download_index_weight)
     return {"status": "ok"}
 
 
 @router.post("/etf_info")
 def download_etf_info():
-    _call_xtdata_serialized(xtdata.download_etf_info)
+    _call_xtdata_serialized(market_data.download_etf_info)
     return {"status": "ok"}
 
 
 @router.post("/cb_data")
 def download_cb_data():
-    _call_xtdata_serialized(xtdata.download_cb_data)
+    _call_xtdata_serialized(market_data.download_cb_data)
     return {"status": "ok"}
 
 
 @router.post("/history_contracts")
 def download_history_contracts():
-    _call_xtdata_serialized(xtdata.download_history_contracts)
+    _call_xtdata_serialized(market_data.download_history_contracts)
     return {"status": "ok"}
-
-
-@router.post("/ipo_data")
-def download_ipo_data():
-    """Trigger IPO data download."""
-    return _call_xtdata_optional(xtdata, "download_ipo_data")
-
-
-@router.post("/option_data")
-def download_option_data():
-    """Trigger option data download."""
-    return _call_xtdata_optional(xtdata, "download_option_data")
 
 
 @router.post("/financial2")
 def download_financial_data2(req: FinancialDownload2Request):
     """Synchronous financial data download (blocks until complete)."""
     _call_xtdata_serialized(
-        xtdata.download_financial_data2,
+        market_data.download_financial_data2,
         req.stocks,
         table_list=req.tables,
     )
@@ -1049,5 +1308,5 @@ def download_financial_data2(req: FinancialDownload2Request):
 @router.post("/holiday")
 def download_holiday_data():
     """Download holiday calendar data."""
-    _call_xtdata_serialized(xtdata.download_holiday_data)
+    _call_xtdata_serialized(market_data.download_holiday_data)
     return {"status": "ok"}

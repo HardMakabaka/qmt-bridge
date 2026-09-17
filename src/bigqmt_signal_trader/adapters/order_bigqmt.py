@@ -7,6 +7,7 @@ import hashlib
 
 from ..code_utils import normalize_stock_code
 from ..models import CancelResult, OrderSnapshot, OrderSubmitResult, SignalAction, TradeSnapshot
+from ..telemetry import emit, span
 from .position_bigqmt import _attr, _full_code
 
 
@@ -90,19 +91,26 @@ class BigQmtOrderGateway:
 
         user_order_id = str(request.remark or "").strip() or self.build_user_order_id(request.signal_id)
         account_id = request.account_id or self.account_id
-        passorder(
-            op_type,
-            self.combo_type,
-            account_id,
-            normalize_stock_code(request.stock_code),
-            _price_type_value(request.price_type, self.price_type),
-            float(request.price),
-            int(request.volume),
-            request.strategy_name,
-            self.quick_trade,
-            user_order_id,
-            self.context_info,
-        )
+        fields = {
+            "critical": True, "client_submit_id": user_order_id,
+            "account_id": account_id, "stock_code": normalize_stock_code(request.stock_code),
+            "action": action, "volume": int(request.volume), "price": float(request.price),
+            "strategy_name": request.strategy_name,
+        }
+        emit("qmt.passorder.begin", outcome="started", **fields)
+        try:
+            with span("qmt.passorder", **fields) as trace:
+                passorder(
+                    op_type, self.combo_type, account_id, normalize_stock_code(request.stock_code),
+                    _price_type_value(request.price_type, self.price_type), float(request.price),
+                    int(request.volume), request.strategy_name, self.quick_trade, user_order_id,
+                    self.context_info,
+                )
+                trace["outcome"] = "success"
+        except Exception as exc:
+            emit("qmt.passorder.return", outcome="unknown", error_type=type(exc).__name__, **fields)
+            raise
+        emit("qmt.passorder.return", outcome="success", **fields)
         return OrderSubmitResult(
             status="SUBMITTED",
             user_order_id=user_order_id,
@@ -112,7 +120,16 @@ class BigQmtOrderGateway:
 
     def cancel(self, order_ref):
         cancel_func = self._require_cancel()
-        ok = cancel_func(order_ref.order_sys_id, self.account_id, self.account_type, self.context_info)
+        fields = {"critical": True, "account_id": self.account_id,
+                  "order_sys_id": order_ref.order_sys_id,
+                  "client_submit_id": order_ref.user_order_id}
+        emit("qmt.cancel.begin", outcome="started", **fields)
+        try:
+            ok = cancel_func(order_ref.order_sys_id, self.account_id, self.account_type, self.context_info)
+        except Exception as exc:
+            emit("qmt.cancel.return", outcome="unknown", error_type=type(exc).__name__, **fields)
+            raise
+        emit("qmt.cancel.return", outcome="success" if ok else "rejected", **fields)
         return CancelResult(success=bool(ok), message="" if ok else "cancel returned false")
 
     def query_orders(self, account_id, strategy_name):
@@ -123,6 +140,8 @@ class BigQmtOrderGateway:
 
     def query_orders_strict(self, account_id, strategy_name):
         query = self._require_query_func()
+        emit("qmt.orders.strict_query", account_id=account_id, strategy_name=strategy_name,
+             outcome="started")
         rows = query(account_id, self.account_type, "ORDER", strategy_name) or []
         result = []
         for row in rows:
@@ -143,6 +162,8 @@ class BigQmtOrderGateway:
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
                 )
             )
+        emit("qmt.orders.strict_query", account_id=account_id, strategy_name=strategy_name,
+             outcome="empty" if not result else "success", count=len(result))
         return result
 
     def query_trades(self, account_id, strategy_name):
@@ -184,6 +205,9 @@ class BigQmtOrderGateway:
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                 )
             )
+        emit("qmt.trades.strict_query", critical=True, account_id=account_id,
+             strategy_name=strategy_name, outcome="empty" if not result else "success",
+             count=len(result))
         return result
 
     def query_submission_identities_strict(self, account_id, strategy_name):

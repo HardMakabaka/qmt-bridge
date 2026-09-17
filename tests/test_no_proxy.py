@@ -50,7 +50,8 @@ def test_base_client_uses_direct_urlopen(monkeypatch):
         def read(self):
             return json.dumps({"status": "ok"}).encode()
 
-    def fake_urlopen_direct(request):
+    def fake_urlopen_direct(request, *, timeout):
+        assert timeout == 30.0
         calls.append(request.full_url)
         return FakeResponse()
 
@@ -76,7 +77,8 @@ def test_base_client_encodes_get_query_parameters(monkeypatch):
         def read(self):
             return b"{}"
 
-    def fake_urlopen_direct(request):
+    def fake_urlopen_direct(request, *, timeout):
+        assert timeout == 30.0
         calls.append(request.full_url)
         return FakeResponse()
 

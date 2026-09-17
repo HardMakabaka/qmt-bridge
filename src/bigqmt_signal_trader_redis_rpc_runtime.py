@@ -110,7 +110,7 @@ DOWNLOAD_JOB_CHUNK_SIZE = 10
 DOWNLOAD_JOB_MAX_WALL_SECONDS = 0.5
 DOWNLOAD_JOB_TTL_SECONDS = 3600
 # Push order_callback/deal_callback details to Redis so clients get real-time
-# on_stock_order/on_stock_trade callbacks (MiniQMT style) instead of polling.
+# Native order/trade events are delivered through the bridge instead of polling.
 EXEC_EVENTS_ENABLED = True
 EXEC_EVENTS_TRANSPORT = ""
 EXEC_EVENTS_ZMQ_CONFIG = {

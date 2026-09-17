@@ -2,6 +2,11 @@
 
 import datetime as _dt
 import json
+from ..telemetry import emit
+
+
+def _emit(name, critical=False, **fields):
+    emit(name, critical=critical, **fields)
 
 
 class RedisPositionSyncSink:
@@ -34,7 +39,7 @@ class RedisPositionSyncSink:
                 "cash": snapshot.asset.cash,
                 "total_asset": snapshot.asset.total_asset,
                 # Carried so the client's cached-asset fallback exposes the same
-                # fields as a live query_stock_asset.
+                # fields as a native account snapshot.
                 "frozen_cash": getattr(snapshot.asset, "frozen_cash", None),
                 "market_value": getattr(snapshot.asset, "market_value", None),
             },
@@ -51,6 +56,8 @@ class RedisPositionSyncSink:
         }
 
     def publish(self, snapshot):
+        _emit("position_snapshot_publish_started", account_id=str(snapshot.account_id or ""),
+              reason=str(snapshot.reason or ""))
         payload = json.dumps(self._snapshot_to_dict(snapshot), ensure_ascii=False)
         key = self.key_template.format(account_id=snapshot.account_id)
         if self.ttl_seconds > 0:
@@ -63,3 +70,7 @@ class RedisPositionSyncSink:
             # events already use maxlen=2000; position events were missing it,
             # causing 4.2GB+ streams in production (issue #21).
             self.redis.xadd(stream_key, {"payload": payload}, maxlen=2000, approximate=True)
+        _emit("position_snapshot_published", critical=True,
+              account_id=str(snapshot.account_id or ""),
+              position_count=len(snapshot.positions or {}),
+              publish_events=self.publish_events)

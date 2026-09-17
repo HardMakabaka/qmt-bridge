@@ -44,3 +44,33 @@ jobs:
 
       - name: Build distributions
         run: uv run --frozen python -m build
+
+      - name: Verify wheel and sdist install with embedded assets
+        run: |
+          uv run --frozen python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          import venv
+
+          archives = sorted(Path("dist").glob("qmt_bridge-*"))
+          assert len(archives) == 2, archives
+          for archive in archives:
+              with tempfile.TemporaryDirectory() as temp:
+                  env = Path(temp) / "venv"
+                  venv.EnvBuilder(with_pip=True).create(env)
+                  python = env / "bin" / "python"
+                  subprocess.run([str(python), "-m", "pip", "install", str(archive)], check=True)
+                  probe = (
+                      "from qmt_bridge.install_runtime import resolve_asset_root\n"
+                      "root = resolve_asset_root(None)\n"
+                      "required = [\n"
+                      "  root / 'src' / 'BIGQMT_REDIS_DRYRUN.py',\n"
+                      "  root / 'src' / 'MECOSTOCK_BIGQMT_ZMQ.py',\n"
+                      "  root / 'src' / 'mecostock_bigqmt_mode_overlay.py',\n"
+                      "  root / 'third_party' / 'xtquant_big_convert.UPSTREAM.json',\n"
+                      "]\n"
+                      "assert all(path.is_file() for path in required), required\n"
+                  )
+                  subprocess.run([str(python), "-c", probe], check=True)
+          PY

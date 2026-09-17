@@ -16,7 +16,7 @@ render_sidebar()
 st.title("QMT Bridge 可视化仪表盘")
 
 st.markdown("""
-**QMT Bridge** 是 miniQMT (xtquant) 的 HTTP/WebSocket API 桥接服务，
+**QMT Bridge** 是大 QMT 的 HTTP/WebSocket API 桥接服务，通过本机 ZMQ 连接内置原生适配器，
 让任意设备（Mac、Linux、手机）通过网络访问实时行情、历史数据和交易功能。
 
 本仪表盘提供可视化界面，方便浏览行情数据、管理交易、查看系统状态。
@@ -46,7 +46,7 @@ with col2:
 
 with col3:
     st.subheader("数据下载")
-    st.markdown("批量下载、快捷下载")
+    st.markdown("历史下载任务与状态查询")
     st.page_link("pages/5_数据下载.py", label="前往 →")
 
     st.subheader("交易管理")
@@ -54,7 +54,7 @@ with col3:
     st.page_link("pages/6_交易管理.py", label="前往 →")
 
 st.subheader("系统状态")
-st.markdown("健康检查、版本信息、连接状态")
+st.markdown("健康检查、Big QMT 就绪与恢复状态")
 st.page_link("pages/7_系统状态.py", label="前往 →")
 
 # ── 快速状态概览 ──────────────────────────────────────────────────
@@ -69,11 +69,10 @@ if st.session_state.get("connected"):
             version = client.get_server_version()
             st.metric("服务端版本", version)
         with c2:
-            xtdata_ver = client.get_xtdata_version()
-            st.metric("xtquant 版本", xtdata_ver)
+            readiness = client.get_readiness()
+            st.metric("Big QMT 就绪", "是" if readiness.get("ready") else "否")
         with c3:
-            status = client.get_connection_status()
-            connected = status.get("connected", False) if isinstance(status, dict) else False
-            st.metric("数据连接", "已连接" if connected else "未连接")
+            recovery = client.get_recovery_status()
+            st.metric("恢复可重启", "是" if recovery.get("restart_safe") else "否")
     except Exception as e:
         st.warning(f"获取概览信息失败: {e}")

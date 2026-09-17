@@ -1,5 +1,5 @@
 site_name: QMT Bridge 文档
-site_description: miniQMT 行情与交易 HTTP/WebSocket 桥接
+site_description: Big QMT 内嵌策略与本机 ZMQ 的行情和受控交易 HTTP/WebSocket 桥接
 repo_url: https://github.com/qmt-bridge/qmt-bridge
 
 theme:
@@ -33,6 +33,9 @@ nav:
   - 首页: index.md
   - 快速开始: getting-started.md
   - 配置参考: configuration.md
+  - 3.0 迁移: MIGRATION_3.md
+  - 自动化官方合同: AUTOMATION_OFFICIAL_CONTRACTS.md
+  - 自动化审计与恢复: AUTOMATION_AUDIT.md
   - REST API 速查: rest-api.md
   - WebSocket: websocket.md
   - Python 客户端 API:
@@ -56,7 +59,6 @@ nav:
       - 融资融券: api/credit.md
       - 资金划转: api/fund.md
       - 约定式交易: api/smt.md
-      - 银证转账: api/bank.md
       - WebSocket 客户端: api/websocket-client.md
 
 extra_css:
